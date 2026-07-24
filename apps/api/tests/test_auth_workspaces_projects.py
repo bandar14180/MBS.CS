@@ -1,19 +1,9 @@
 import uuid
 
-import pytest
 from fastapi.testclient import TestClient
 
-from apps.api.main import app
-
-
-@pytest.fixture(scope="module")
-def client():
-    # Must be a context manager: without it, TestClient spins up a fresh event
-    # loop per call, and asyncpg connections from our async engine can't hop
-    # across loops ("Future attached to a different loop"). Entering once here
-    # keeps every request in this module on the same loop.
-    with TestClient(app) as c:
-        yield c
+# `client` fixture (session-scoped TestClient) lives in conftest.py -- see
+# that file for why it must be shared across every test module.
 
 
 def _register(client: TestClient, full_name: str = "Test User") -> dict:

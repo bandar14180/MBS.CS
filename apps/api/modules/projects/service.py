@@ -81,3 +81,13 @@ async def list_targets(db: AsyncSession, workspace_id: uuid.UUID, project_id: uu
         select(Target).where(Target.project_id == project_id).order_by(Target.created_at)
     )
     return list(result)
+
+
+async def get_target(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, target_id: uuid.UUID
+) -> Target:
+    await get_project(db, workspace_id, project_id)  # 404s if project isn't in this workspace
+    target = await db.scalar(select(Target).where(Target.id == target_id, Target.project_id == project_id))
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Target not found")
+    return target
