@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+WORKDIR /srv
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY apps/api/requirements.txt ./apps/api/requirements.txt
+RUN pip install --no-cache-dir -r apps/api/requirements.txt
+
+COPY apps/__init__.py ./apps/__init__.py
+COPY apps/api ./apps/api
+
+CMD ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "--loglevel=info"]
