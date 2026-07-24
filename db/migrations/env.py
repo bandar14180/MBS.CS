@@ -12,9 +12,15 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# NOTE: target_metadata stays None until Phase 0 step 2 wires up the SQLAlchemy
-# models declared under apps/api/modules/*/models.py into a shared Base.metadata.
-target_metadata = None
+# Import every module that declares models so they register on Base.metadata
+# before Alembic diffs against it. Add new modules' models.py here as they're built.
+from apps.api.core.db import Base  # noqa: E402
+from apps.api.modules.auth import models as auth_models  # noqa: E402,F401
+from apps.api.modules.projects import models as projects_models  # noqa: E402,F401
+from apps.api.modules.users import models as users_models  # noqa: E402,F401
+from apps.api.modules.workspaces import models as workspaces_models  # noqa: E402,F401
+
+target_metadata = Base.metadata
 
 db_url = os.environ.get("DATABASE_URL")
 if db_url:

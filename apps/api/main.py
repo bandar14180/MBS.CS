@@ -2,6 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.core.config import get_settings
+from apps.api.modules.auth.router import router as auth_router
+from apps.api.modules.projects.router import router as projects_router
+from apps.api.modules.users.router import router as users_router
+from apps.api.modules.workspaces.router import roles_router as roles_router
+from apps.api.modules.workspaces.router import router as workspaces_router
 
 settings = get_settings()
 
@@ -14,6 +19,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router, prefix=settings.api_v1_prefix)
+app.include_router(users_router, prefix=settings.api_v1_prefix)
+app.include_router(workspaces_router, prefix=settings.api_v1_prefix)
+app.include_router(roles_router, prefix=settings.api_v1_prefix)
+app.include_router(projects_router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/health")
