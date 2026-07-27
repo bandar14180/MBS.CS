@@ -4,7 +4,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.assets.models import Asset
@@ -25,6 +25,17 @@ logger = logging.getLogger(__name__)
 class AuthorizationRevoked(Exception):
     """Raised when a scan's authorization scope is no longer valid at execution
     time (revoked/expired between queueing and running)."""
+
+
+def _resolve_scan_status(executed: int, failed: int) -> str:
+    """A scan's status must honestly reflect its tools. All executed tools failed
+    -> "failed"; some failed -> "completed_with_errors"; none failed -> "completed".
+    (skipped_unauthorized / skipped-not-applicable runs are not counted here.)"""
+    if executed and failed == executed:
+        return "failed"
+    if failed:
+        return "completed_with_errors"
+    return "completed"
 
 
 async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
@@ -154,7 +165,21 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             )
             discovered.extend(findings)
 
-        scan.status = "completed"
+        # The scan's status must honestly reflect its tools. A run where tools
+        # errored is NOT a success: if every executed tool failed -> "failed";
+        # if some failed -> "completed_with_errors"; otherwise "completed".
+        # (skipped_unauthorized runs are intentional, not failures.)
+        executed = await db.scalar(
+            select(func.count()).select_from(ToolRun).where(
+                ToolRun.scan_id == scan.id, ToolRun.status.in_(("completed", "failed"))
+            )
+        )
+        failed = await db.scalar(
+            select(func.count()).select_from(ToolRun).where(
+                ToolRun.scan_id == scan.id, ToolRun.status == "failed"
+            )
+        )
+        scan.status = _resolve_scan_status(executed or 0, failed or 0)
     except Exception as exc:
         scan.status = "failed"
         scan.completed_at = datetime.now(timezone.utc)
@@ -168,8 +193,8 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     scan.completed_at = datetime.now(timezone.utc)
     await db.commit()
     logger.info(
-        "scan.completed scan=%s duration=%.2fs tools_run=%d",
-        scan.id, time.monotonic() - scan_started, len(runners),
+        "scan.finished scan=%s status=%s duration=%.2fs tools_run=%d",
+        scan.id, scan.status, time.monotonic() - scan_started, len(runners),
     )
 
 
@@ -204,6 +229,7 @@ async def _run_single_tool(
     except Exception as exc:
         tool_run.status = "failed"
         tool_run.completed_at = datetime.now(timezone.utc)
+        tool_run.error_message = f"{type(exc).__name__}: {exc}"[:2000]
         await db.commit()
         logger.error(
             "tool.failed scan=%s tool=%s duration=%.2fs error=%s",
@@ -262,6 +288,11 @@ async def _run_single_tool(
         await sync_mappings(db, vuln.id, vuln.category)
 
     tool_run.status = "completed" if raw.exit_code == 0 else "failed"
+    if raw.exit_code != 0:
+        # Ran but returned a non-zero code: surface the tail of stderr as the
+        # error so it's visible without digging into the evidence blob.
+        stderr_tail = (raw.stderr or "").strip()[-1000:]
+        tool_run.error_message = f"exit code {raw.exit_code}" + (f": {stderr_tail}" if stderr_tail else "")
     tool_run.completed_at = datetime.now(timezone.utc)
     await db.commit()
 

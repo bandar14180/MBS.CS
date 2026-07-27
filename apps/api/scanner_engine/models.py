@@ -23,6 +23,9 @@ class ToolRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     raw_output_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Exact failure text (exception message, or a tail of the tool's stderr on a
+    # non-zero exit) so a failure is visible and debuggable, not just a status.
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Evidence(Base):

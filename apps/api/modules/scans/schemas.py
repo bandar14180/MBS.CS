@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 ScanType = Literal["web", "api", "network", "cloud"]
 
@@ -49,6 +49,14 @@ class ToolRunRead(BaseModel):
     completed_at: datetime | None
     exit_code: int | None
     raw_output_ref: str | None
+    error_message: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.completed_at is None:
+            return None
+        return round((self.completed_at - self.started_at).total_seconds(), 1)
 
 
 class EvidenceRead(BaseModel):

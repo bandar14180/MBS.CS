@@ -70,6 +70,7 @@ const STATUS_STYLES: Record<string, string> = {
   false_positive: "bg-white/5 text-slate-400 border-cyber-border",
   accepted_risk: "bg-white/5 text-slate-400 border-cyber-border",
   completed: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+  completed_with_errors: "bg-amber-500/15 text-amber-300 border-amber-500/40",
   running: "bg-sky-500/15 text-sky-300 border-sky-500/40",
   queued: "bg-white/5 text-slate-300 border-cyber-border",
   failed: "bg-rose-500/15 text-rose-300 border-rose-500/40",
