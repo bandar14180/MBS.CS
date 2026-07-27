@@ -11,6 +11,7 @@ from apps.api.modules.scans.models import Scan
 from apps.api.scanner_engine import evidence_store
 from apps.api.scanner_engine.models import Evidence, ToolRun
 from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
+from apps.api.scanner_engine.tool_runners.base import CommonFinding
 
 
 class AuthorizationRevoked(Exception):
@@ -53,11 +54,21 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             raise ValueError("Target disappeared")
 
         requested = scan.config.get("requested_modules", [])
-        for module_name in requested:
-            runner_cls = TOOL_REGISTRY.get(module_name)
-            if runner_cls is None:
+        runners = [TOOL_REGISTRY[m]() for m in requested if m in TOOL_REGISTRY]
+        # Deterministic recon pipeline: run in phase order regardless of the
+        # order they were requested (subfinder -> httpx -> naabu -> nmap).
+        runners.sort(key=lambda r: r.phase)
+
+        # Findings accumulate across the pipeline so later tools build on earlier
+        # ones (httpx probes subfinder's subdomains; nmap deep-scans naabu ports).
+        discovered: list[CommonFinding] = []
+        for runner in runners:
+            # Skip tools that don't apply to this target's type (e.g. subfinder
+            # on an ip_range) -- cleanly, without recording a failed run.
+            if runner.applicable_target_types is not None and target_row.type not in runner.applicable_target_types:
                 continue
-            await _run_single_tool(db, scan, runner_cls(), target_row.value)
+            findings = await _run_single_tool(db, scan, runner, target_row.value, discovered)
+            discovered.extend(findings)
 
         scan.status = "completed"
     except Exception:
@@ -70,7 +81,9 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     await db.commit()
 
 
-async def _run_single_tool(db: AsyncSession, scan: Scan, runner, target_value: str) -> None:
+async def _run_single_tool(
+    db: AsyncSession, scan: Scan, runner, target_value: str, prior_findings: list[CommonFinding]
+) -> list[CommonFinding]:
     config = scan.config or {}
     tool_run = ToolRun(
         scan_id=scan.id,
@@ -84,7 +97,7 @@ async def _run_single_tool(db: AsyncSession, scan: Scan, runner, target_value: s
     await db.refresh(tool_run)
 
     try:
-        raw = await runner.run(target_value, config)
+        raw = await runner.run(target_value, config, prior_findings)
     except Exception:
         tool_run.status = "failed"
         tool_run.completed_at = datetime.now(timezone.utc)
@@ -125,3 +138,4 @@ async def _run_single_tool(db: AsyncSession, scan: Scan, runner, target_value: s
     tool_run.status = "completed" if raw.exit_code == 0 else "failed"
     tool_run.completed_at = datetime.now(timezone.utc)
     await db.commit()
+    return findings

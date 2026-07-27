@@ -5,19 +5,25 @@ WORKDIR /srv
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Security tool binaries. Naabu is the first per the build order (§12) --
-# small, fast, structured JSON output. libpcap0.8 is only needed for SYN
-# scans; we default to connect scans (no root/raw sockets) but install it
-# so -scan-type syn is available later. Pinned to the version in
-# scanner_engine/tool_runners/naabu_runner.py (NaabuRunner.version).
+# Security tool binaries (recon phase per build order §12). Versions are pinned
+# to match each runner's `.version` in scanner_engine/tool_runners/. The three
+# ProjectDiscovery tools (naabu/subfinder/httpx) install the same way (release
+# zip). httpx is renamed to `httpx-pd` to avoid colliding with the Python httpx
+# library on PATH. nmap comes from apt. libpcap0.8 is only needed for naabu SYN
+# scans (we default to connect scans, no root) but is kept for future use.
 ARG NAABU_VERSION=2.6.1
+ARG SUBFINDER_VERSION=2.14.0
+ARG HTTPX_VERSION=1.10.0
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl unzip libpcap0.8 \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip libpcap0.8 nmap \
     && curl -sSfL "https://github.com/projectdiscovery/naabu/releases/download/v${NAABU_VERSION}/naabu_${NAABU_VERSION}_linux_amd64.zip" -o /tmp/naabu.zip \
-    && unzip -o /tmp/naabu.zip -d /tmp/naabu \
-    && mv /tmp/naabu/naabu /usr/local/bin/naabu \
-    && chmod +x /usr/local/bin/naabu \
-    && rm -rf /tmp/naabu /tmp/naabu.zip \
+    && unzip -o /tmp/naabu.zip -d /tmp/naabu && mv /tmp/naabu/naabu /usr/local/bin/naabu \
+    && curl -sSfL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/subfinder_${SUBFINDER_VERSION}_linux_amd64.zip" -o /tmp/subfinder.zip \
+    && unzip -o /tmp/subfinder.zip -d /tmp/subfinder && mv /tmp/subfinder/subfinder /usr/local/bin/subfinder \
+    && curl -sSfL "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VERSION}/httpx_${HTTPX_VERSION}_linux_amd64.zip" -o /tmp/httpx.zip \
+    && unzip -o /tmp/httpx.zip -d /tmp/httpx && mv /tmp/httpx/httpx /usr/local/bin/httpx-pd \
+    && chmod +x /usr/local/bin/naabu /usr/local/bin/subfinder /usr/local/bin/httpx-pd \
+    && rm -rf /tmp/naabu* /tmp/subfinder* /tmp/httpx* \
     && apt-get purge -y curl unzip \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
