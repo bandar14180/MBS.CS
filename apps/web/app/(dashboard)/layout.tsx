@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 
 import { useAuth } from "@/lib/auth";
+import { useTranslation } from "@/lib/i18n";
 import { Button, Spinner } from "@/components/ui";
 import { AssistantProvider } from "@/components/assistant/AssistantWidget";
 import { LanguageSelector } from "@/components/LanguageSelector";
@@ -12,6 +13,7 @@ import { Logo } from "@/components/landing/Logo";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const { user, workspaceName, loading, logout } = useAuth();
+  const { t } = useTranslation();
   const router = useRouter();
 
   useEffect(() => {
@@ -38,21 +40,21 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           </Link>
           <nav className="flex-1 space-y-1">
             <Link href="/dashboard" className="block rounded-lg px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5">
-              Projects
+              {t("dashboard.projects")}
             </Link>
             <Link href="/" className="block rounded-lg px-3 py-2 text-sm text-slate-400 transition hover:bg-white/5">
-              Home
+              {t("dashboard.home")}
             </Link>
           </nav>
           <div className="space-y-3 border-t border-cyber-border/60 pt-4">
             <LanguageSelector />
             <div>
-              <div className="mb-1 px-1 text-xs text-slate-500">Workspace</div>
+              <div className="mb-1 px-1 text-xs text-slate-500">{t("dashboard.workspace")}</div>
               <div className="truncate px-1 text-sm text-slate-300">{workspaceName}</div>
               <div className="truncate px-1 text-xs text-slate-500">{user.email}</div>
             </div>
             <Button variant="ghost" className="w-full justify-start" onClick={logout}>
-              Sign out
+              {t("dashboard.signOut")}
             </Button>
           </div>
         </aside>
