@@ -134,3 +134,15 @@ async def list_evidence(
         select(Evidence).where(Evidence.tool_run_id == tool_run_id).order_by(Evidence.created_at)
     )
     return list(result)
+
+
+async def get_ai_plan(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, scan_id: uuid.UUID):
+    from apps.api.ai_agent.models import AIPlan
+
+    await get_scan(db, workspace_id, project_id, scan_id)
+    plan = await db.scalar(
+        select(AIPlan).where(AIPlan.scan_id == scan_id).order_by(AIPlan.created_at.desc()).limit(1)
+    )
+    if plan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No AI plan for this scan (AI planning may be disabled)")
+    return plan

@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     jwt_refresh_token_ttl_days: int = 7
 
     anthropic_api_key: str = ""
+    # AI Agent Service model (blueprint locked decision: Anthropic Claude).
+    # Opus 4.8 is the current default; overridable per environment.
+    ai_model: str = "claude-opus-4-8"
+    ai_max_tokens: int = 4096
 
     cors_allow_origins: list[str] = ["http://localhost:3000"]
 

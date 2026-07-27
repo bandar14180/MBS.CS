@@ -5,6 +5,7 @@ Celery worker, or Alembic's env.py -- must import this first, or foreign keys
 across modules fail to resolve (NoReferencedTableError).
 """
 
+from apps.api.ai_agent import models as ai_agent_models  # noqa: F401
 from apps.api.modules.assets import models as assets_models  # noqa: F401
 from apps.api.modules.auth import models as auth_models  # noqa: F401
 from apps.api.modules.authorization_scope import models as authorization_scope_models  # noqa: F401

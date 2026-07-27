@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, status
 
 from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
 from apps.api.modules.scans import service
-from apps.api.modules.scans.schemas import EvidenceRead, ScanCreate, ScanRead, ToolRunRead
+from apps.api.modules.scans.schemas import AIPlanRead, EvidenceRead, ScanCreate, ScanRead, ToolRunRead
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/projects/{project_id}/scans", tags=["scans"])
 
@@ -78,3 +78,13 @@ async def list_evidence(
 ) -> list[EvidenceRead]:
     evidence = await service.list_evidence(db, ctx.workspace_id, project_id, scan_id, tool_run_id)
     return [EvidenceRead.model_validate(e) for e in evidence]
+
+
+@router.get(
+    "/{scan_id}/ai-plan",
+    response_model=AIPlanRead,
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_ai_plan(project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> AIPlanRead:
+    plan = await service.get_ai_plan(db, ctx.workspace_id, project_id, scan_id)
+    return AIPlanRead.model_validate(plan)

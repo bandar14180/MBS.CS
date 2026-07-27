@@ -55,3 +55,15 @@ class EvidenceRead(BaseModel):
     storage_uri: str
     checksum: str
     created_at: datetime
+
+
+class AIPlanRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    scan_id: uuid.UUID
+    tool_sequence: list
+    reasoning_summary: str | None
+    model_version: str
+    prompt_version: str
+    created_at: datetime

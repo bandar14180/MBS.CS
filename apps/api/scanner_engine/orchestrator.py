@@ -58,9 +58,31 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             raise ValueError("Target disappeared")
 
         requested = scan.config.get("requested_modules", [])
+
+        # Opt-in AI planning (blueprint §7 step 2). When enabled, the AI Planner
+        # proposes which of the requested tools to run and in what order; its
+        # output is allowlist-enforced in code (planner._sanitize) so it can only
+        # re-order/prune, never introduce a tool. Default off -> deterministic
+        # phase order, unchanged behavior for every existing scan.
+        if scan.config.get("use_ai_planner"):
+            from apps.api.ai_agent.planner import AIPlanner
+
+            plan = await AIPlanner().plan(
+                db,
+                scan_id=scan.id,
+                target_type=target_row.type,
+                target_value=target_row.value,
+                requested_modules=requested,
+                active_testing_allowed=scope.active_testing_allowed,
+            )
+            requested = plan.tool_sequence
+            await db.commit()
+
         runners = [TOOL_REGISTRY[m]() for m in requested if m in TOOL_REGISTRY]
         # Deterministic recon pipeline: run in phase order regardless of the
         # order they were requested (subfinder -> httpx -> naabu -> nmap -> nuclei).
+        # The AI planner (above) may prune/reorder, but phase order still governs
+        # the actual pipeline dependencies.
         runners.sort(key=lambda r: r.phase)
 
         # Findings accumulate across the pipeline so later tools build on earlier
