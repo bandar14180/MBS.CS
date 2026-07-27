@@ -87,5 +87,21 @@
     "suggest1": "ماذا يعني هذا؟",
     "suggest2": "ما مدى خطورته؟",
     "suggest3": "كيف أصلحه؟"
+  },
+  "auth": {
+    "signInTitle": "مرحباً بعودتك",
+    "signInSubtitle": "سجّل الدخول إلى مساحة عملك في MBS.SC.",
+    "registerTitle": "أنشئ حسابك",
+    "registerSubtitle": "ابدأ بأتمتة التقييمات الأمنية.",
+    "fullName": "الاسم الكامل",
+    "email": "البريد الإلكتروني",
+    "password": "كلمة المرور",
+    "passwordHint": "كلمة المرور (8 أحرف على الأقل)",
+    "signIn": "تسجيل الدخول",
+    "createAccount": "إنشاء حساب",
+    "noAccount": "ليس لديك حساب؟",
+    "haveAccount": "لديك حساب؟",
+    "register": "سجّل",
+    "backHome": "العودة للرئيسية"
   }
 }

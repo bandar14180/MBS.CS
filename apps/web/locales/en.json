@@ -87,5 +87,21 @@
     "suggest1": "What does this mean?",
     "suggest2": "How dangerous is it?",
     "suggest3": "How do I fix it?"
+  },
+  "auth": {
+    "signInTitle": "Welcome back",
+    "signInSubtitle": "Sign in to your MBS.SC workspace.",
+    "registerTitle": "Create your account",
+    "registerSubtitle": "Start automating security assessments.",
+    "fullName": "Full name",
+    "email": "Email",
+    "password": "Password",
+    "passwordHint": "Password (min 8 characters)",
+    "signIn": "Sign in",
+    "createAccount": "Create account",
+    "noAccount": "No account?",
+    "haveAccount": "Have an account?",
+    "register": "Register",
+    "backHome": "Back to home"
   }
 }

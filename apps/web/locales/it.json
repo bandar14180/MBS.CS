@@ -87,5 +87,21 @@
     "suggest1": "Cosa significa?",
     "suggest2": "Quanto è pericoloso?",
     "suggest3": "Come lo correggo?"
+  },
+  "auth": {
+    "signInTitle": "Bentornato",
+    "signInSubtitle": "Accedi al tuo spazio di lavoro MBS.SC.",
+    "registerTitle": "Crea il tuo account",
+    "registerSubtitle": "Inizia ad automatizzare le tue valutazioni di sicurezza.",
+    "fullName": "Nome completo",
+    "email": "E-mail",
+    "password": "Password",
+    "passwordHint": "Password (minimo 8 caratteri)",
+    "signIn": "Accedi",
+    "createAccount": "Crea account",
+    "noAccount": "Non hai un account?",
+    "haveAccount": "Hai già un account?",
+    "register": "Registrati",
+    "backHome": "Torna alla home"
   }
 }

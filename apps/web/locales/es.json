@@ -87,5 +87,21 @@
     "suggest1": "¿Qué significa esto?",
     "suggest2": "¿Qué tan peligroso es?",
     "suggest3": "¿Cómo lo soluciono?"
+  },
+  "auth": {
+    "signInTitle": "Bienvenido de nuevo",
+    "signInSubtitle": "Inicia sesión en tu espacio de trabajo de MBS.SC.",
+    "registerTitle": "Crea tu cuenta",
+    "registerSubtitle": "Empieza a automatizar tus evaluaciones de seguridad.",
+    "fullName": "Nombre completo",
+    "email": "Correo electrónico",
+    "password": "Contraseña",
+    "passwordHint": "Contraseña (mínimo 8 caracteres)",
+    "signIn": "Iniciar sesión",
+    "createAccount": "Crear cuenta",
+    "noAccount": "¿No tienes cuenta?",
+    "haveAccount": "¿Ya tienes cuenta?",
+    "register": "Regístrate",
+    "backHome": "Volver al inicio"
   }
 }

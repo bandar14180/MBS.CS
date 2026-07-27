@@ -87,5 +87,21 @@
     "suggest1": "Apakah maksudnya?",
     "suggest2": "Sejauh mana bahayanya?",
     "suggest3": "Bagaimana saya membaikinya?"
+  },
+  "auth": {
+    "signInTitle": "Selamat kembali",
+    "signInSubtitle": "Log masuk ke ruang kerja MBS.SC anda.",
+    "registerTitle": "Cipta akaun anda",
+    "registerSubtitle": "Mula mengautomasikan penilaian keselamatan.",
+    "fullName": "Nama penuh",
+    "email": "E-mel",
+    "password": "Kata laluan",
+    "passwordHint": "Kata laluan (minimum 8 aksara)",
+    "signIn": "Log masuk",
+    "createAccount": "Cipta akaun",
+    "noAccount": "Tiada akaun?",
+    "haveAccount": "Sudah ada akaun?",
+    "register": "Daftar",
+    "backHome": "Kembali ke laman utama"
   }
 }

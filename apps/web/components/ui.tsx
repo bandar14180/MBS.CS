@@ -9,14 +9,14 @@ export function Button({
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "danger" | "ghost" }) {
   const styles: Record<string, string> = {
-    primary: "bg-indigo-600 hover:bg-indigo-500 text-white",
-    secondary: "bg-slate-700 hover:bg-slate-600 text-slate-100",
-    danger: "bg-red-700 hover:bg-red-600 text-white",
-    ghost: "bg-transparent hover:bg-slate-800 text-slate-300",
+    primary: "btn-gradient text-white shadow-glow",
+    secondary: "border border-cyber-border bg-white/5 text-slate-100 hover:border-accent-cyan/40 hover:bg-white/10",
+    danger: "bg-rose-600 hover:bg-rose-500 text-white",
+    ghost: "bg-transparent text-slate-300 hover:bg-white/5",
   };
   return (
     <button
-      className={`inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed ${styles[variant]} ${className}`}
+      className={`inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${styles[variant]} ${className}`}
       {...props}
     >
       {children}
@@ -29,7 +29,7 @@ export const Input = forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTML
     return (
       <input
         ref={ref}
-        className={`w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none ${className}`}
+        className={`w-full rounded-lg border border-cyber-border bg-white/5 px-3 py-2 text-sm text-slate-100 placeholder-slate-500 outline-none transition focus:border-accent-cyan/50 ${className}`}
         {...props}
       />
     );
@@ -39,7 +39,7 @@ export const Input = forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTML
 export function Select({ className = "", children, ...props }: React.SelectHTMLAttributes<HTMLSelectElement>) {
   return (
     <select
-      className={`rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none ${className}`}
+      className={`rounded-lg border border-cyber-border bg-cyber-panel px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-accent-cyan/50 ${className}`}
       {...props}
     >
       {children}
@@ -48,7 +48,7 @@ export function Select({ className = "", children, ...props }: React.SelectHTMLA
 }
 
 export function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return <div className={`rounded-lg border border-slate-800 bg-slate-900/60 p-5 ${className}`}>{children}</div>;
+  return <div className={`rounded-2xl border border-cyber-border/60 bg-cyber-panel/50 p-5 ${className}`}>{children}</div>;
 }
 
 export function Label({ children }: { children: React.ReactNode }) {
@@ -56,31 +56,31 @@ export function Label({ children }: { children: React.ReactNode }) {
 }
 
 const SEVERITY_STYLES: Record<string, string> = {
-  critical: "bg-red-950 text-red-300 border-red-800",
-  high: "bg-orange-950 text-orange-300 border-orange-800",
-  medium: "bg-amber-950 text-amber-300 border-amber-800",
-  low: "bg-blue-950 text-blue-300 border-blue-800",
-  info: "bg-slate-800 text-slate-300 border-slate-700",
+  critical: "bg-rose-500/15 text-rose-300 border-rose-500/40",
+  high: "bg-orange-500/15 text-orange-300 border-orange-500/40",
+  medium: "bg-amber-400/15 text-amber-300 border-amber-400/40",
+  low: "bg-sky-500/15 text-sky-300 border-sky-500/40",
+  info: "bg-white/5 text-slate-300 border-cyber-border",
 };
 const STATUS_STYLES: Record<string, string> = {
-  open: "bg-red-950 text-red-300 border-red-800",
-  confirmed: "bg-orange-950 text-orange-300 border-orange-800",
-  reopened: "bg-amber-950 text-amber-300 border-amber-800",
-  fixed: "bg-emerald-950 text-emerald-300 border-emerald-800",
-  false_positive: "bg-slate-800 text-slate-400 border-slate-700",
-  accepted_risk: "bg-slate-800 text-slate-400 border-slate-700",
-  completed: "bg-emerald-950 text-emerald-300 border-emerald-800",
-  running: "bg-blue-950 text-blue-300 border-blue-800",
-  queued: "bg-slate-800 text-slate-300 border-slate-700",
-  failed: "bg-red-950 text-red-300 border-red-800",
-  verified: "bg-emerald-950 text-emerald-300 border-emerald-800",
+  open: "bg-rose-500/15 text-rose-300 border-rose-500/40",
+  confirmed: "bg-orange-500/15 text-orange-300 border-orange-500/40",
+  reopened: "bg-amber-400/15 text-amber-300 border-amber-400/40",
+  fixed: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+  false_positive: "bg-white/5 text-slate-400 border-cyber-border",
+  accepted_risk: "bg-white/5 text-slate-400 border-cyber-border",
+  completed: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+  running: "bg-sky-500/15 text-sky-300 border-sky-500/40",
+  queued: "bg-white/5 text-slate-300 border-cyber-border",
+  failed: "bg-rose-500/15 text-rose-300 border-rose-500/40",
+  verified: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
 };
 
 export function Badge({ kind, value }: { kind: "severity" | "status"; value: string }) {
   const map = kind === "severity" ? SEVERITY_STYLES : STATUS_STYLES;
-  const style = map[value] || "bg-slate-800 text-slate-300 border-slate-700";
+  const style = map[value] || "bg-white/5 text-slate-300 border-cyber-border";
   return (
-    <span className={`inline-block rounded border px-2 py-0.5 text-xs font-medium ${style}`}>
+    <span className={`inline-block rounded-md border px-2 py-0.5 text-xs font-medium ${style}`}>
       {value.replace(/_/g, " ")}
     </span>
   );
@@ -89,14 +89,14 @@ export function Badge({ kind, value }: { kind: "severity" | "status"; value: str
 export function Spinner({ className = "" }: { className?: string }) {
   return (
     <span
-      className={`inline-block h-4 w-4 animate-spin rounded-full border-2 border-slate-600 border-t-indigo-400 ${className}`}
+      className={`inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyber-border border-t-accent-cyan ${className}`}
     />
   );
 }
 
 export function ErrorText({ children }: { children: React.ReactNode }) {
   if (!children) return null;
-  return <p className="text-sm text-red-400">{children}</p>;
+  return <p className="text-sm text-rose-400">{children}</p>;
 }
 
 export function Empty({ children }: { children: React.ReactNode }) {

@@ -4,10 +4,14 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { useAuth } from "@/lib/auth";
+import { useTranslation } from "@/lib/i18n";
 import { Button, Card, ErrorText, Input, Label } from "@/components/ui";
+import { LanguageSelector } from "@/components/LanguageSelector";
+import { Logo } from "@/components/landing/Logo";
 
 export default function RegisterPage() {
   const { register } = useAuth();
+  const { t } = useTranslation();
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -27,32 +31,44 @@ export default function RegisterPage() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center p-4">
-      <Card className="w-full max-w-sm">
-        <h1 className="mb-1 text-2xl font-semibold text-indigo-400">Create your account</h1>
-        <p className="mb-6 text-sm text-slate-400">MBS.SC — Smart Security.</p>
+    <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-cyber-bg p-4">
+      <div className="pointer-events-none absolute inset-0 bg-grid mask-fade-b" />
+      <div className="pointer-events-none absolute inset-0 bg-radial-glow" />
+      <div className="absolute end-4 top-4 z-10">
+        <LanguageSelector />
+      </div>
+
+      <Card className="relative w-full max-w-sm glass-strong">
+        <Link href="/" className="mb-6 flex items-center gap-2.5">
+          <Logo className="h-9 w-9" />
+          <span className="text-xl font-semibold text-white">
+            MBS<span className="text-accent-cyan">.SC</span>
+          </span>
+        </Link>
+        <h1 className="text-2xl font-bold text-white">{t("auth.registerTitle")}</h1>
+        <p className="mb-6 mt-1 text-sm text-slate-400">{t("auth.registerSubtitle")}</p>
         <form onSubmit={submit} className="space-y-4">
           <div>
-            <Label>Full name</Label>
+            <Label>{t("auth.fullName")}</Label>
             <Input value={fullName} onChange={(e) => setFullName(e.target.value)} required autoFocus />
           </div>
           <div>
-            <Label>Email</Label>
+            <Label>{t("auth.email")}</Label>
             <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
           </div>
           <div>
-            <Label>Password (min 8 chars)</Label>
+            <Label>{t("auth.passwordHint")}</Label>
             <Input type="password" minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} required />
           </div>
           <ErrorText>{error}</ErrorText>
           <Button type="submit" disabled={busy} className="w-full">
-            {busy ? "Creating…" : "Create account"}
+            {busy ? `${t("auth.createAccount")}…` : t("auth.createAccount")}
           </Button>
         </form>
-        <p className="mt-4 text-center text-sm text-slate-500">
-          Have an account?{" "}
-          <Link href="/login" className="text-indigo-400 hover:underline">
-            Sign in
+        <p className="mt-5 text-center text-sm text-slate-500">
+          {t("auth.haveAccount")}{" "}
+          <Link href="/login" className="text-accent-cyan hover:underline">
+            {t("auth.signIn")}
           </Link>
         </p>
       </Card>
