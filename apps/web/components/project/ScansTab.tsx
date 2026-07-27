@@ -9,6 +9,16 @@ const MODULES = ["subfinder", "httpx", "naabu", "nmap", "nuclei"];
 const ACTIVE_MODULES = new Set(["nuclei"]);
 const RUNNING = new Set(["queued", "pending", "running"]);
 
+// Backend scan_type is Literal["web","api","network","cloud"] — derive it from the
+// selected target's type rather than sending a fixed value.
+const TARGET_SCAN_TYPE: Record<string, string> = {
+  domain: "web",
+  api: "api",
+  ip_range: "network",
+  cloud_account: "cloud",
+  repo: "web",
+};
+
 export function ScansTab({ projectId, targets }: { projectId: string; targets: Target[] }) {
   const [scans, setScans] = useState<Scan[] | null>(null);
   const [error, setError] = useState("");
@@ -53,9 +63,11 @@ export function ScansTab({ projectId, targets }: { projectId: string; targets: T
     setBusy(true);
     setError("");
     try {
-      // ordering is deterministic server-side; scan_type "standard"
+      // ordering is deterministic server-side; scan_type is derived from the target type
       const ordered = MODULES.filter((m) => modules.includes(m));
-      await scanApi.create(projectId, targetId, "standard", ordered, useAi);
+      const target = targets.find((t) => t.id === targetId);
+      const scanType = TARGET_SCAN_TYPE[target?.type ?? ""] ?? "web";
+      await scanApi.create(projectId, targetId, scanType, ordered, useAi);
       await load();
     } catch (e: any) {
       setError(e.message);
