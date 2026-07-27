@@ -29,7 +29,17 @@ class Settings(BaseSettings):
     ai_model: str = "claude-opus-4-8"
     ai_max_tokens: int = 4096
 
-    cors_allow_origins: list[str] = ["http://localhost:3000"]
+    # Browser origins allowed to call the API. The web app calls the API at
+    # http://localhost:8000 regardless of where the page itself is served, so
+    # every host the page can be opened from must be listed here or the browser
+    # blocks the request ("Failed to fetch"): :3000 (next dev directly) and
+    # :80/plain localhost (via nginx), plus the 127.0.0.1 equivalents.
+    cors_allow_origins: list[str] = [
+        "http://localhost:3000",
+        "http://localhost",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1",
+    ]
 
 
 @lru_cache
