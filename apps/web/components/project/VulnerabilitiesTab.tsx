@@ -10,6 +10,7 @@ import {
   type Vulnerability,
 } from "@/lib/api";
 import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@/components/ui";
+import { useAssistant } from "@/components/assistant/AssistantWidget";
 
 const SEVERITIES = ["", "critical", "high", "medium", "low", "info"];
 const STATUSES = ["", "open", "confirmed", "false_positive", "remediated", "accepted_risk"];
@@ -113,6 +114,7 @@ function VulnDetail({
   const [busy, setBusy] = useState(false);
   const [genBusy, setGenBusy] = useState(false);
   const [err, setErr] = useState("");
+  const { open: openAssistant } = useAssistant();
 
   useEffect(() => {
     vulnApi.risk(projectId, vuln.id).then(setRisk).catch(() => {});
@@ -147,6 +149,14 @@ function VulnDetail({
 
   return (
     <div className="mt-4 space-y-4 border-t border-slate-800 pt-4 text-sm">
+      <div className="flex justify-end">
+        <Button
+          variant="secondary"
+          onClick={() => openAssistant({ projectId, vulnerabilityId: vuln.id, label: vuln.title })}
+        >
+          ✨ Ask AI about this
+        </Button>
+      </div>
       {vuln.description && <p className="text-slate-300">{vuln.description}</p>}
 
       <div className="grid gap-4 sm:grid-cols-2">

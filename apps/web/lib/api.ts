@@ -188,6 +188,15 @@ export const vulnApi = {
     api<Remediation>(ws(`/projects/${pid}/vulnerabilities/${vid}/remediation`), { method: "POST" }),
 };
 
+// ---- AI Security Assistant ----
+export const assistantApi = {
+  ask: (question: string, opts: { projectId?: string; vulnerabilityId?: string } = {}) =>
+    api<AssistantAnswer>(ws("/assistant/ask"), {
+      method: "POST",
+      body: { question, project_id: opts.projectId, vulnerability_id: opts.vulnerabilityId },
+    }),
+};
+
 // ---- Reports ----
 export const reportApi = {
   list: (pid: string) => api<Report[]>(ws(`/projects/${pid}/reports`)),
@@ -227,6 +236,9 @@ export interface Remediation {
   summary: string | null; steps: string[]; references: { title: string; url: string }[]; generated_by: string;
 }
 export interface Report { id: string; type: string; format: string; generated_at: string; }
+export interface AssistantAnswer {
+  answer: string; model_version: string; prompt_version: string; grounded_in_vulnerability: boolean;
+}
 export interface SeverityCounts { critical: number; high: number; medium: number; low: number; info: number; }
 export interface RecentScan {
   id: string; project_id: string; project_name: string; target_value: string;

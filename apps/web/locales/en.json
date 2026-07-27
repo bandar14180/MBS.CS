@@ -74,5 +74,18 @@
     "contact": "Contact",
     "docs": "Documentation",
     "security": "Security"
+  },
+  "assistant": {
+    "title": "Security Assistant",
+    "subtitle": "Ask about any finding",
+    "placeholder": "Ask a security question…",
+    "send": "Send",
+    "empty": "Ask me to explain a vulnerability, its risk, or how to fix it.",
+    "unavailable": "The AI assistant needs an ANTHROPIC_API_KEY configured. Everything else works without it.",
+    "error": "Something went wrong. Please try again.",
+    "grounded": "About: {title}",
+    "suggest1": "What does this mean?",
+    "suggest2": "How dangerous is it?",
+    "suggest3": "How do I fix it?"
   }
 }

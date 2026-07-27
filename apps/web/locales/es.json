@@ -74,5 +74,18 @@
     "contact": "Contacto",
     "docs": "Documentación",
     "security": "Seguridad"
+  },
+  "assistant": {
+    "title": "Asistente de seguridad",
+    "subtitle": "Pregunta sobre cualquier hallazgo",
+    "placeholder": "Haz una pregunta de seguridad…",
+    "send": "Enviar",
+    "empty": "Pídeme que explique una vulnerabilidad, su riesgo o cómo solucionarla.",
+    "unavailable": "El asistente de IA necesita una ANTHROPIC_API_KEY configurada. Todo lo demás funciona sin ella.",
+    "error": "Algo salió mal. Inténtalo de nuevo.",
+    "grounded": "Acerca de: {title}",
+    "suggest1": "¿Qué significa esto?",
+    "suggest2": "¿Qué tan peligroso es?",
+    "suggest3": "¿Cómo lo soluciono?"
   }
 }

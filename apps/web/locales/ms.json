@@ -74,5 +74,18 @@
     "contact": "Hubungi",
     "docs": "Dokumentasi",
     "security": "Keselamatan"
+  },
+  "assistant": {
+    "title": "Pembantu Keselamatan",
+    "subtitle": "Tanya tentang mana-mana penemuan",
+    "placeholder": "Tanya soalan keselamatan…",
+    "send": "Hantar",
+    "empty": "Minta saya jelaskan kerentanan, risikonya, atau cara membaikinya.",
+    "unavailable": "Pembantu AI memerlukan ANTHROPIC_API_KEY dikonfigurasi. Segala-galanya berfungsi tanpanya.",
+    "error": "Sesuatu tidak kena. Sila cuba lagi.",
+    "grounded": "Mengenai: {title}",
+    "suggest1": "Apakah maksudnya?",
+    "suggest2": "Sejauh mana bahayanya?",
+    "suggest3": "Bagaimana saya membaikinya?"
   }
 }

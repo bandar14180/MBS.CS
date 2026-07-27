@@ -74,5 +74,18 @@
     "contact": "Contact",
     "docs": "Documentation",
     "security": "Sécurité"
+  },
+  "assistant": {
+    "title": "Assistant de sécurité",
+    "subtitle": "Posez une question sur un résultat",
+    "placeholder": "Posez une question de sécurité…",
+    "send": "Envoyer",
+    "empty": "Demandez-moi d'expliquer une vulnérabilité, son risque ou comment la corriger.",
+    "unavailable": "L'assistant IA nécessite une clé ANTHROPIC_API_KEY configurée. Tout le reste fonctionne sans elle.",
+    "error": "Une erreur s'est produite. Veuillez réessayer.",
+    "grounded": "À propos de : {title}",
+    "suggest1": "Qu'est-ce que cela signifie ?",
+    "suggest2": "Quel est le niveau de danger ?",
+    "suggest3": "Comment corriger cela ?"
   }
 }
