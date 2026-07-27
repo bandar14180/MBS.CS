@@ -4,7 +4,14 @@ from fastapi import APIRouter, Depends, status
 
 from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
 from apps.api.modules.projects import service
-from apps.api.modules.projects.schemas import ProjectCreate, ProjectRead, ProjectUpdate, TargetCreate, TargetRead
+from apps.api.modules.projects.schemas import (
+    ProjectCreate,
+    ProjectRead,
+    ProjectUpdate,
+    TargetCreate,
+    TargetRead,
+    TargetUpdate,
+)
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/projects", tags=["projects"])
 
@@ -69,7 +76,21 @@ async def delete_project(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContext
 )
 async def create_target(project_id: uuid.UUID, payload: TargetCreate, db: DbDep, ctx: WorkspaceContextDep) -> TargetRead:
     target = await service.create_target(
-        db, ctx.workspace_id, project_id, ctx.member.user_id, payload.type, payload.value
+        db, ctx.workspace_id, project_id, ctx.member.user_id, payload.type, payload.value, payload.criticality
+    )
+    return TargetRead.model_validate(target)
+
+
+@router.patch(
+    "/{project_id}/targets/{target_id}",
+    response_model=TargetRead,
+    dependencies=[Depends(require_permission("target:update"))],
+)
+async def update_target(
+    project_id: uuid.UUID, target_id: uuid.UUID, payload: TargetUpdate, db: DbDep, ctx: WorkspaceContextDep
+) -> TargetRead:
+    target = await service.update_target_criticality(
+        db, ctx.workspace_id, project_id, target_id, payload.criticality
     )
     return TargetRead.model_validate(target)
 

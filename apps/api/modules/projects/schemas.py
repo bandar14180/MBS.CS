@@ -30,9 +30,17 @@ class ProjectRead(BaseModel):
     created_at: datetime
 
 
+Criticality = Literal["low", "medium", "high", "critical"]
+
+
 class TargetCreate(BaseModel):
     type: TargetType
     value: str = Field(min_length=1, max_length=512)
+    criticality: Criticality = "medium"
+
+
+class TargetUpdate(BaseModel):
+    criticality: Criticality
 
 
 class TargetRead(BaseModel):
@@ -42,5 +50,6 @@ class TargetRead(BaseModel):
     project_id: uuid.UUID
     type: str
     value: str
+    criticality: str
     added_by: uuid.UUID
     created_at: datetime

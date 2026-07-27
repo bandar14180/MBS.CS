@@ -33,6 +33,10 @@ class Target(Base):
     )
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     value: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Business context the customer sets (blueprint §7 step 7 / Risk Engine):
+    # how important this asset is, which weights technical CVSS into a business
+    # risk score. low | medium | high | critical.
+    criticality: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
     added_by: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )

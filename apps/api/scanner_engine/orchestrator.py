@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.modules.assets.models import Asset
 from apps.api.modules.assets.service import upsert_asset
 from apps.api.modules.authorization_scope.service import require_verified_target
+from apps.api.modules.compliance.service import sync_mappings
+from apps.api.modules.risk.service import upsert_risk_score
 from apps.api.modules.scans.models import Scan
 from apps.api.modules.vulnerabilities.service import ingest_finding
 from apps.api.scanner_engine import evidence_store
@@ -111,7 +113,9 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
                 )
                 await db.commit()
                 continue
-            findings = await _run_single_tool(db, scan, runner, target_row.value, discovered)
+            findings = await _run_single_tool(
+                db, scan, runner, target_row.value, discovered, target_row.criticality
+            )
             discovered.extend(findings)
 
         scan.status = "completed"
@@ -126,7 +130,12 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
 
 
 async def _run_single_tool(
-    db: AsyncSession, scan: Scan, runner, target_value: str, prior_findings: list[CommonFinding]
+    db: AsyncSession,
+    scan: Scan,
+    runner,
+    target_value: str,
+    prior_findings: list[CommonFinding],
+    criticality: str,
 ) -> list[CommonFinding]:
     config = scan.config or {}
     tool_run = ToolRun(
@@ -180,10 +189,12 @@ async def _run_single_tool(
         )
 
     # Vulnerability findings go through the Vulnerability Engine (dedup +
-    # lifecycle), each linked to this run's evidence.
+    # lifecycle), each linked to this run's evidence. Then the Risk Engine
+    # weights CVSS by asset criticality, and the Compliance Engine maps the
+    # finding's category to framework controls (blueprint §7 steps 7 & later).
     for vuln_finding in runner.parse_vulnerabilities(raw):
         asset_id = await _resolve_asset_id(db, scan, vuln_finding.matched_at)
-        await ingest_finding(
+        vuln = await ingest_finding(
             db,
             project_id=scan.project_id,
             scan_id=scan.id,
@@ -192,6 +203,8 @@ async def _run_single_tool(
             evidence_id=evidence.id,
             asset_id=asset_id,
         )
+        await upsert_risk_score(db, vuln.id, vuln.cvss_score, criticality)
+        await sync_mappings(db, vuln.id, vuln.category)
 
     tool_run.status = "completed" if raw.exit_code == 0 else "failed"
     tool_run.completed_at = datetime.now(timezone.utc)

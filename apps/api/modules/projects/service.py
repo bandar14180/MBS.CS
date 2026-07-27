@@ -66,10 +66,23 @@ async def create_target(
     added_by: uuid.UUID,
     target_type: str,
     value: str,
+    criticality: str = "medium",
 ) -> Target:
     await get_project(db, workspace_id, project_id)  # 404s if project isn't in this workspace
-    target = Target(project_id=project_id, type=target_type, value=value, added_by=added_by)
+    target = Target(
+        project_id=project_id, type=target_type, value=value, added_by=added_by, criticality=criticality
+    )
     db.add(target)
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+async def update_target_criticality(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, target_id: uuid.UUID, criticality: str
+) -> Target:
+    target = await get_target(db, workspace_id, project_id, target_id)
+    target.criticality = criticality
     await db.commit()
     await db.refresh(target)
     return target
