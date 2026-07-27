@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -47,6 +48,13 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     scan.status = "running"
     scan.started_at = datetime.now(timezone.utc)
     await db.commit()
+
+    scan_started = time.monotonic()
+    logger.info(
+        "scan.start scan=%s workspace=%s project=%s target=%s requested=%s ai_planner=%s",
+        scan.id, scan.workspace_id, scan.project_id, scan.target_id,
+        scan.config.get("requested_modules", []), bool(scan.config.get("use_ai_planner")),
+    )
 
     try:
         # Re-check the guardrail at execution time, not just at creation:
@@ -147,14 +155,22 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             discovered.extend(findings)
 
         scan.status = "completed"
-    except Exception:
+    except Exception as exc:
         scan.status = "failed"
         scan.completed_at = datetime.now(timezone.utc)
         await db.commit()
+        logger.error(
+            "scan.failed scan=%s duration=%.2fs error=%s",
+            scan.id, time.monotonic() - scan_started, exc, exc_info=True,
+        )
         raise
 
     scan.completed_at = datetime.now(timezone.utc)
     await db.commit()
+    logger.info(
+        "scan.completed scan=%s duration=%.2fs tools_run=%d",
+        scan.id, time.monotonic() - scan_started, len(runners),
+    )
 
 
 async def _run_single_tool(
@@ -177,12 +193,22 @@ async def _run_single_tool(
     await db.commit()
     await db.refresh(tool_run)
 
+    started = time.monotonic()
+    logger.info(
+        "tool.start scan=%s tool=%s version=%s target=%s prior_findings=%d",
+        scan.id, runner.name, runner.version, target_value, len(prior_findings),
+    )
+
     try:
         raw = await runner.run(target_value, config, prior_findings)
-    except Exception:
+    except Exception as exc:
         tool_run.status = "failed"
         tool_run.completed_at = datetime.now(timezone.utc)
         await db.commit()
+        logger.error(
+            "tool.failed scan=%s tool=%s duration=%.2fs error=%s",
+            scan.id, runner.name, time.monotonic() - started, exc, exc_info=True,
+        )
         raise
 
     tool_run.command_hash = hashlib.sha256(raw.command.encode()).hexdigest()
@@ -220,7 +246,8 @@ async def _run_single_tool(
     # lifecycle), each linked to this run's evidence. Then the Risk Engine
     # weights CVSS by asset criticality, and the Compliance Engine maps the
     # finding's category to framework controls (blueprint §7 steps 7 & later).
-    for vuln_finding in runner.parse_vulnerabilities(raw):
+    vuln_findings = list(runner.parse_vulnerabilities(raw))
+    for vuln_finding in vuln_findings:
         asset_id = await _resolve_asset_id(db, scan, vuln_finding.matched_at)
         vuln = await ingest_finding(
             db,
@@ -237,6 +264,13 @@ async def _run_single_tool(
     tool_run.status = "completed" if raw.exit_code == 0 else "failed"
     tool_run.completed_at = datetime.now(timezone.utc)
     await db.commit()
+
+    logger.info(
+        "tool.done scan=%s tool=%s status=%s exit=%s duration=%.2fs "
+        "assets=%d vulnerabilities=%d evidence=%s",
+        scan.id, runner.name, tool_run.status, raw.exit_code, time.monotonic() - started,
+        len(findings), len(vuln_findings), storage_uri,
+    )
     return findings
 
 
