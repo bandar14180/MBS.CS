@@ -29,7 +29,19 @@ async def create_scan(
 
     # The guardrail: no verified authorization scope, no scan. See
     # authorization_scope.service.require_verified_target.
-    await require_verified_target(db, workspace_id, project_id, target_id)
+    scope = await require_verified_target(db, workspace_id, project_id, target_id)
+
+    # Active-testing tools (nuclei/...) may only be requested when the scope
+    # explicitly permits active testing -- block at the API layer, not just at
+    # execution (blueprint §7). The orchestrator re-checks in case authorization
+    # is revoked before the scan runs.
+    if not scope.active_testing_allowed:
+        active = [m for m in requested_modules if TOOL_REGISTRY[m].requires_active_testing]
+        if active:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"Active testing not authorized for this target; requested active module(s): {', '.join(active)}",
+            )
 
     scan = Scan(
         workspace_id=workspace_id,

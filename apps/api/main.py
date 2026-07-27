@@ -8,6 +8,7 @@ from apps.api.modules.authorization_scope.router import router as authorization_
 from apps.api.modules.projects.router import router as projects_router
 from apps.api.modules.scans.router import router as scans_router
 from apps.api.modules.users.router import router as users_router
+from apps.api.modules.vulnerabilities.router import router as vulnerabilities_router
 from apps.api.modules.workspaces.router import roles_router as roles_router
 from apps.api.modules.workspaces.router import router as workspaces_router
 
@@ -31,6 +32,7 @@ app.include_router(projects_router, prefix=settings.api_v1_prefix)
 app.include_router(authorization_scope_router, prefix=settings.api_v1_prefix)
 app.include_router(scans_router, prefix=settings.api_v1_prefix)
 app.include_router(assets_router, prefix=settings.api_v1_prefix)
+app.include_router(vulnerabilities_router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/health")
