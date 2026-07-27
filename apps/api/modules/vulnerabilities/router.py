@@ -7,8 +7,13 @@ from apps.api.modules.compliance import service as compliance_service
 from apps.api.modules.compliance.schemas import ComplianceMappingRead
 from apps.api.modules.risk import service as risk_service
 from apps.api.modules.risk.schemas import RiskScoreRead
-from apps.api.modules.vulnerabilities import service
-from apps.api.modules.vulnerabilities.schemas import VulnerabilityRead, VulnerabilityStatusUpdate
+from apps.api.modules.vulnerabilities import ai_service, service
+from apps.api.modules.vulnerabilities.schemas import (
+    FPAnalysisRead,
+    RemediationRead,
+    VulnerabilityRead,
+    VulnerabilityStatusUpdate,
+)
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/projects/{project_id}", tags=["vulnerabilities"])
 
@@ -84,3 +89,50 @@ async def get_compliance_mappings(
     await service.get_vulnerability(db, ctx.workspace_id, project_id, vuln_id)
     mappings = await compliance_service.list_mappings(db, vuln_id)
     return [ComplianceMappingRead.model_validate(m) for m in mappings]
+
+
+@router.get(
+    "/vulnerabilities/{vuln_id}/remediation",
+    response_model=RemediationRead,
+    dependencies=[Depends(require_permission("vulnerability:read"))],
+)
+async def get_remediation(
+    project_id: uuid.UUID, vuln_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> RemediationRead:
+    rem = await ai_service.get_remediation(db, ctx.workspace_id, project_id, vuln_id)
+    return RemediationRead.model_validate(rem)
+
+
+@router.post(
+    "/vulnerabilities/{vuln_id}/remediation",
+    response_model=RemediationRead,
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("vulnerability:manage"))],
+)
+async def generate_remediation(
+    project_id: uuid.UUID, vuln_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> RemediationRead:
+    rem = await ai_service.generate_remediation(db, ctx.workspace_id, project_id, vuln_id)
+    return RemediationRead.model_validate(rem)
+
+
+@router.post(
+    "/vulnerabilities/fp-analysis",
+    response_model=FPAnalysisRead,
+    dependencies=[Depends(require_permission("vulnerability:manage"))],
+)
+async def fp_analysis(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> FPAnalysisRead:
+    result = await ai_service.fp_analysis(db, ctx.workspace_id, project_id)
+    return FPAnalysisRead(
+        model_version=result.model_version,
+        prompt_version=result.prompt_version,
+        assessments=[
+            {
+                "finding_id": a.finding_id,
+                "likely_false_positive": a.likely_false_positive,
+                "confidence": a.confidence,
+                "reasoning": a.reasoning,
+            }
+            for a in result.assessments
+        ],
+    )
