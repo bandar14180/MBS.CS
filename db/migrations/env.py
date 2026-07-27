@@ -12,14 +12,11 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Import every module that declares models so they register on Base.metadata
-# before Alembic diffs against it. Add new modules' models.py here as they're built.
+# models_all imports every model module so the full set registers on
+# Base.metadata before Alembic diffs against it. New modules get added there,
+# in one place (shared with the Celery worker).
 from apps.api.core.db import Base  # noqa: E402
-from apps.api.modules.auth import models as auth_models  # noqa: E402,F401
-from apps.api.modules.authorization_scope import models as authorization_scope_models  # noqa: E402,F401
-from apps.api.modules.projects import models as projects_models  # noqa: E402,F401
-from apps.api.modules.users import models as users_models  # noqa: E402,F401
-from apps.api.modules.workspaces import models as workspaces_models  # noqa: E402,F401
+import apps.api.core.models_all  # noqa: E402,F401
 
 target_metadata = Base.metadata
 

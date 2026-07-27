@@ -1,0 +1,127 @@
+import hashlib
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from apps.api.modules.assets.service import upsert_asset
+from apps.api.modules.authorization_scope.service import require_verified_target
+from apps.api.modules.scans.models import Scan
+from apps.api.scanner_engine import evidence_store
+from apps.api.scanner_engine.models import Evidence, ToolRun
+from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
+
+
+class AuthorizationRevoked(Exception):
+    """Raised when a scan's authorization scope is no longer valid at execution
+    time (revoked/expired between queueing and running)."""
+
+
+async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
+    # scans is intentionally not RLS-protected; we read it by trusted id first,
+    # THEN set the workspace RLS var so every subsequent read/write on
+    # projects/targets/assets/authorization_scopes is correctly scoped.
+    scan = await db.get(Scan, scan_id)
+    if scan is None:
+        raise ValueError(f"Scan {scan_id} not found")
+    return scan
+
+
+async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
+    scan = await _load_scan(db, scan_id)
+
+    await db.execute(
+        text("SELECT set_config('app.current_workspace_id', :wid, false)"),
+        {"wid": str(scan.workspace_id)},
+    )
+
+    scan.status = "running"
+    scan.started_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    try:
+        # Re-check the guardrail at execution time, not just at creation:
+        # authorization can be revoked/expire between queueing and running
+        # (blueprint §7 -- gate again before active tools).
+        await require_verified_target(db, scan.workspace_id, scan.project_id, scan.target_id)
+
+        from apps.api.modules.projects.models import Target
+
+        target_row = await db.get(Target, scan.target_id)
+        if target_row is None:
+            raise ValueError("Target disappeared")
+
+        requested = scan.config.get("requested_modules", [])
+        for module_name in requested:
+            runner_cls = TOOL_REGISTRY.get(module_name)
+            if runner_cls is None:
+                continue
+            await _run_single_tool(db, scan, runner_cls(), target_row.value)
+
+        scan.status = "completed"
+    except Exception:
+        scan.status = "failed"
+        scan.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        raise
+
+    scan.completed_at = datetime.now(timezone.utc)
+    await db.commit()
+
+
+async def _run_single_tool(db: AsyncSession, scan: Scan, runner, target_value: str) -> None:
+    config = scan.config or {}
+    tool_run = ToolRun(
+        scan_id=scan.id,
+        tool_name=runner.name,
+        tool_version=runner.version,
+        status="running",
+        command_hash="",  # filled after we know the command
+    )
+    db.add(tool_run)
+    await db.commit()
+    await db.refresh(tool_run)
+
+    try:
+        raw = await runner.run(target_value, config)
+    except Exception:
+        tool_run.status = "failed"
+        tool_run.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        raise
+
+    tool_run.command_hash = hashlib.sha256(raw.command.encode()).hexdigest()
+    tool_run.exit_code = raw.exit_code
+
+    # Every finding must trace to raw evidence (blueprint §1) -- store the raw
+    # stdout/stderr blob in object storage and record an evidence row BEFORE
+    # turning any of it into assets.
+    blob = (
+        f"$ {raw.command}\n\n=== STDOUT ===\n{raw.stdout}\n\n=== STDERR ===\n{raw.stderr}\n"
+    ).encode()
+    storage_uri, checksum = evidence_store.store_raw_output(tool_run.id, blob)
+    tool_run.raw_output_ref = storage_uri
+    db.add(
+        Evidence(
+            tool_run_id=tool_run.id,
+            evidence_type="log_excerpt",
+            storage_uri=storage_uri,
+            checksum=checksum,
+        )
+    )
+
+    findings = runner.parse(raw)
+    for finding in findings:
+        await upsert_asset(
+            db,
+            project_id=scan.project_id,
+            target_id=scan.target_id,
+            asset_type=finding.asset_type,
+            value=finding.value,
+            metadata=finding.metadata,
+        )
+
+    tool_run.status = "completed" if raw.exit_code == 0 else "failed"
+    tool_run.completed_at = datetime.now(timezone.utc)
+    await db.commit()

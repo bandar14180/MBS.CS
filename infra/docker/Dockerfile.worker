@@ -5,6 +5,23 @@ WORKDIR /srv
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Security tool binaries. Naabu is the first per the build order (§12) --
+# small, fast, structured JSON output. libpcap0.8 is only needed for SYN
+# scans; we default to connect scans (no root/raw sockets) but install it
+# so -scan-type syn is available later. Pinned to the version in
+# scanner_engine/tool_runners/naabu_runner.py (NaabuRunner.version).
+ARG NAABU_VERSION=2.6.1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip libpcap0.8 \
+    && curl -sSfL "https://github.com/projectdiscovery/naabu/releases/download/v${NAABU_VERSION}/naabu_${NAABU_VERSION}_linux_amd64.zip" -o /tmp/naabu.zip \
+    && unzip -o /tmp/naabu.zip -d /tmp/naabu \
+    && mv /tmp/naabu/naabu /usr/local/bin/naabu \
+    && chmod +x /usr/local/bin/naabu \
+    && rm -rf /tmp/naabu /tmp/naabu.zip \
+    && apt-get purge -y curl unzip \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
 RUN pip install --no-cache-dir -r apps/api/requirements.txt
 

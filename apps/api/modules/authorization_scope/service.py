@@ -53,6 +53,33 @@ async def get_current_scope(
     return scope
 
 
+async def require_verified_target(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, target_id: uuid.UUID
+) -> AuthorizationScope:
+    """The guardrail from blueprint §7 step 1: 'Orchestrator confirms
+    authorization_scope.verified == true -- if not verified: scan creation is
+    blocked at the API layer (403), not just a warning.' Called both at scan
+    creation (HTTP request) and again at execution time (orchestrator, right
+    before a tool actually runs) since authorization can be revoked in between.
+    """
+    try:
+        scope = await get_current_scope(db, workspace_id, project_id, target_id)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "No authorization scope has been submitted for this target"
+            )
+        raise
+
+    if not scope.verified:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This target's authorization scope is not verified")
+
+    if scope.expires_at is not None and scope.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This target's authorization scope has expired")
+
+    return scope
+
+
 async def verify_scope(
     db: AsyncSession,
     workspace_id: uuid.UUID,
