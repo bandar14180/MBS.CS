@@ -16,6 +16,7 @@ node_modules/
 apps/web/.next/
 apps/web/out/
 npm-debug.log*
+*.tsbuildinfo
 
 # Docker
 *.pid
