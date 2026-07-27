@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.core.config import get_settings
 from apps.api.modules.assets.router import router as assets_router
+from apps.api.modules.assistant.router import router as assistant_router
 from apps.api.modules.auth.router import router as auth_router
 from apps.api.modules.authorization_scope.router import router as authorization_scope_router
 from apps.api.modules.dashboard.router import router as dashboard_router
@@ -37,6 +38,7 @@ app.include_router(scans_router, prefix=settings.api_v1_prefix)
 app.include_router(assets_router, prefix=settings.api_v1_prefix)
 app.include_router(vulnerabilities_router, prefix=settings.api_v1_prefix)
 app.include_router(reports_router, prefix=settings.api_v1_prefix)
+app.include_router(assistant_router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/health")
