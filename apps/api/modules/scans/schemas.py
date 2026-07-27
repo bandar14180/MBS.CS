@@ -13,6 +13,11 @@ class ScanCreate(BaseModel):
     requested_modules: list[str] = Field(
         min_length=1, description="Tool keys from the scanner_engine tool registry, e.g. ['naabu']"
     )
+    use_ai_planner: bool = Field(
+        default=False,
+        description="Let the AI Planner order/prune the requested tools (needs ANTHROPIC_API_KEY; "
+        "falls back to deterministic order if it fails).",
+    )
 
 
 class ScanRead(BaseModel):

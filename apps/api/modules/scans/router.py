@@ -24,6 +24,7 @@ async def create_scan(project_id: uuid.UUID, payload: ScanCreate, db: DbDep, ctx
         payload.target_id,
         payload.scan_type,
         payload.requested_modules,
+        payload.use_ai_planner,
     )
     return ScanRead.model_validate(scan)
 

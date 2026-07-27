@@ -1,8 +1,9 @@
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.assets.models import Asset
@@ -16,7 +17,8 @@ from apps.api.scanner_engine import evidence_store
 from apps.api.scanner_engine.models import Evidence, ToolRun
 from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
 from apps.api.scanner_engine.tool_runners.base import CommonFinding
-from sqlalchemy import select
+
+logger = logging.getLogger(__name__)
 
 
 class AuthorizationRevoked(Exception):
@@ -66,19 +68,32 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # output is allowlist-enforced in code (planner._sanitize) so it can only
         # re-order/prune, never introduce a tool. Default off -> deterministic
         # phase order, unchanged behavior for every existing scan.
+        #
+        # AI planning is an enhancement, not a dependency: if it fails (no API
+        # key, a transient API error, a malformed response) we fall back to the
+        # deterministic phase order rather than failing the whole scan -- the
+        # user's requested tools still run.
         if scan.config.get("use_ai_planner"):
-            from apps.api.ai_agent.planner import AIPlanner
+            try:
+                from apps.api.ai_agent.planner import AIPlanner
 
-            plan = await AIPlanner().plan(
-                db,
-                scan_id=scan.id,
-                target_type=target_row.type,
-                target_value=target_row.value,
-                requested_modules=requested,
-                active_testing_allowed=scope.active_testing_allowed,
-            )
-            requested = plan.tool_sequence
-            await db.commit()
+                plan = await AIPlanner().plan(
+                    db,
+                    scan_id=scan.id,
+                    target_type=target_row.type,
+                    target_value=target_row.value,
+                    requested_modules=requested,
+                    active_testing_allowed=scope.active_testing_allowed,
+                )
+                requested = plan.tool_sequence
+                await db.commit()
+            except Exception:
+                # Fall back to the deterministic order. The planner calls Claude
+                # before it writes anything, so a failure here (no key, API/parse
+                # error) leaves no pending DB state -- `requested` is untouched and
+                # the session stays valid, so we must NOT rollback (that would
+                # expire scan/target_row and break the async session).
+                logger.warning("AI planning failed for scan %s; using deterministic order", scan.id, exc_info=True)
 
         runners = [TOOL_REGISTRY[m]() for m in requested if m in TOOL_REGISTRY]
         # Deterministic recon pipeline: run in phase order regardless of the

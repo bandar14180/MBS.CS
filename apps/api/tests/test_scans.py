@@ -113,12 +113,35 @@ def test_scan_created_when_target_verified(client: TestClient, no_celery_dispatc
     body = resp.json()
     assert body["status"] == "queued"
     assert body["config"]["requested_modules"] == ["naabu"]
+    # default: AI planning off
+    assert body["config"]["use_ai_planner"] is False
 
     listed = client.get(
         f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans", headers=_auth(owner)
     )
     assert listed.status_code == 200
     assert any(s["id"] == body["id"] for s in listed.json())
+
+
+def test_use_ai_planner_flag_persisted_to_config(client: TestClient, no_celery_dispatch) -> None:
+    # Regression: the use_ai_planner flag must reach scan.config, or the
+    # orchestrator's AI-planning branch is unreachable (dead code).
+    owner = _register(client, "Owner")
+    workspace_id, project_id, target_id = _make_target(client, _auth(owner))
+    _verify_target(client, _auth(owner), workspace_id, project_id, target_id)
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans",
+        headers=_auth(owner),
+        json={
+            "target_id": target_id,
+            "scan_type": "network",
+            "requested_modules": ["naabu"],
+            "use_ai_planner": True,
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["config"]["use_ai_planner"] is True
 
 
 def test_outsider_cannot_read_scans(client: TestClient, no_celery_dispatch) -> None:
