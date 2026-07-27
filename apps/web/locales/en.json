@@ -1,0 +1,78 @@
+{
+  "common": { "language": "Language" },
+  "nav": {
+    "services": "Services",
+    "agents": "AI Agents",
+    "why": "Why MBS.SC",
+    "signIn": "Sign in",
+    "getStarted": "Get Started"
+  },
+  "hero": {
+    "badge": "AI-Powered Penetration Testing Platform",
+    "title": "Autonomous AI Agents for Next-Generation Cybersecurity",
+    "subtitle": "MBS.SC helps organizations discover vulnerabilities, analyze risk, and automate penetration testing with autonomous AI agents — faster, smarter, and continuously.",
+    "ctaPrimary": "Start Security Assessment",
+    "ctaSecondary": "Request Demo",
+    "stats": {
+      "agents": "Autonomous AI agents",
+      "frameworks": "Compliance frameworks",
+      "evidence": "Evidence-backed findings"
+    }
+  },
+  "services": {
+    "title": "Enterprise Security, Automated",
+    "subtitle": "A full-spectrum assessment platform driven by AI — across web, API, cloud, and network.",
+    "aiPentest": { "title": "AI Penetration Testing", "desc": "Autonomous agents plan, execute, and validate assessments from end to end." },
+    "web": { "title": "Web Application Security", "desc": "Detect OWASP Top 10 and business-logic flaws across your web applications." },
+    "api": { "title": "API Security Assessment", "desc": "Discover and test REST endpoints for authentication, exposure, and injection risks." },
+    "cloud": { "title": "Cloud Security Assessment", "desc": "Assess cloud accounts for misconfiguration and exposure across AWS." },
+    "network": { "title": "Network Security Testing", "desc": "Port, service, and version discovery with deep network reconnaissance." },
+    "vuln": { "title": "Vulnerability Analysis", "desc": "AI correlates, prioritizes, and de-duplicates findings by real business risk." },
+    "reporting": { "title": "Security Reporting", "desc": "Executive and technical reports with CVSS, evidence, and remediation steps." }
+  },
+  "agents": {
+    "title": "Five Autonomous AI Agents. One Pipeline.",
+    "subtitle": "Every assessment runs through a coordinated chain of specialized AI agents — from discovery to a board-ready report.",
+    "recon": { "title": "Reconnaissance Agent", "desc": "Asset discovery, domain analysis, technology detection, and attack-surface mapping." },
+    "vulnAnalysis": { "title": "Vulnerability Analysis Agent", "desc": "Analyzes weaknesses, identifies vulnerabilities, and prioritizes by risk." },
+    "validation": { "title": "Security Validation Agent", "desc": "Validates findings and reduces false positives before they reach you." },
+    "risk": { "title": "Risk Assessment Agent", "desc": "Calculates risk and explains the business impact in plain language." },
+    "report": { "title": "Report Generation Agent", "desc": "Generates professional, framework-aligned security reports automatically." },
+    "flow": {
+      "target": "Target",
+      "recon": "Recon",
+      "analysis": "Analysis",
+      "discovery": "Discovery",
+      "validation": "Validation",
+      "risk": "Risk",
+      "report": "Report"
+    }
+  },
+  "trust": {
+    "title": "Built for Enterprises That Can't Afford to Get Security Wrong",
+    "subtitle": "Security and trust are engineered into the core — not bolted on afterward.",
+    "isolation": { "title": "Database-Level Isolation", "desc": "Row-level security enforces strict tenant isolation on every single record." },
+    "authorization": { "title": "Authorization-First", "desc": "No scan ever runs without verified proof of target ownership." },
+    "evidence": { "title": "Evidence-Backed", "desc": "Every finding traces to stored raw evidence secured with checksums." },
+    "frameworks": { "title": "Framework-Aligned", "desc": "Findings map to OWASP, NIST, ISO 27001, and PCI DSS controls." }
+  },
+  "cta": {
+    "title": "Ready to automate your security assessments?",
+    "subtitle": "Launch your first AI-driven penetration test in minutes.",
+    "button": "Start Security Assessment"
+  },
+  "footer": {
+    "tagline": "Autonomous AI agents for next-generation cybersecurity.",
+    "product": "Product",
+    "company": "Company",
+    "resources": "Resources",
+    "rights": "All rights reserved.",
+    "services": "Services",
+    "agents": "AI Agents",
+    "dashboard": "Dashboard",
+    "about": "About",
+    "contact": "Contact",
+    "docs": "Documentation",
+    "security": "Security"
+  }
+}

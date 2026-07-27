@@ -1,0 +1,78 @@
+{
+  "common": { "language": "Lingua" },
+  "nav": {
+    "services": "Servizi",
+    "agents": "Agenti IA",
+    "why": "Perché MBS.SC",
+    "signIn": "Accedi",
+    "getStarted": "Inizia ora"
+  },
+  "hero": {
+    "badge": "Piattaforma di penetration testing basata sull'IA",
+    "title": "Agenti IA autonomi per la cybersicurezza di nuova generazione",
+    "subtitle": "MBS.SC aiuta le organizzazioni a individuare vulnerabilità, analizzare i rischi e automatizzare i penetration test con agenti IA autonomi — più veloce, più intelligente e in modo continuo.",
+    "ctaPrimary": "Avvia una valutazione di sicurezza",
+    "ctaSecondary": "Richiedi una demo",
+    "stats": {
+      "agents": "Agenti IA autonomi",
+      "frameworks": "Framework di conformità",
+      "evidence": "Risultati supportati da prove"
+    }
+  },
+  "services": {
+    "title": "Sicurezza aziendale, automatizzata",
+    "subtitle": "Una piattaforma di valutazione a spettro completo guidata dall'IA — su web, API, cloud e rete.",
+    "aiPentest": { "title": "Penetration testing con IA", "desc": "Agenti autonomi pianificano, eseguono e validano le valutazioni end-to-end." },
+    "web": { "title": "Sicurezza delle applicazioni web", "desc": "Rileva l'OWASP Top 10 e i difetti di logica di business nelle tue applicazioni web." },
+    "api": { "title": "Valutazione della sicurezza delle API", "desc": "Individua e testa gli endpoint REST per rischi di autenticazione, esposizione e injection." },
+    "cloud": { "title": "Valutazione della sicurezza cloud", "desc": "Valuta gli account cloud per configurazioni errate ed esposizioni su AWS." },
+    "network": { "title": "Test di sicurezza di rete", "desc": "Scoperta di porte, servizi e versioni con una ricognizione di rete approfondita." },
+    "vuln": { "title": "Analisi delle vulnerabilità", "desc": "L'IA correla, assegna priorità e deduplica i risultati in base al rischio reale di business." },
+    "reporting": { "title": "Reportistica di sicurezza", "desc": "Report esecutivi e tecnici con CVSS, prove e passaggi di remediation." }
+  },
+  "agents": {
+    "title": "Cinque agenti IA autonomi. Un'unica pipeline.",
+    "subtitle": "Ogni valutazione attraversa una catena coordinata di agenti IA specializzati — dalla scoperta a un report pronto per il consiglio.",
+    "recon": { "title": "Agente di ricognizione", "desc": "Scoperta degli asset, analisi del dominio, rilevamento tecnologico e mappatura della superficie d'attacco." },
+    "vulnAnalysis": { "title": "Agente di analisi delle vulnerabilità", "desc": "Analizza le debolezze, identifica le vulnerabilità e le classifica per rischio." },
+    "validation": { "title": "Agente di validazione della sicurezza", "desc": "Valida i risultati e riduce i falsi positivi prima che arrivino a te." },
+    "risk": { "title": "Agente di valutazione del rischio", "desc": "Calcola il rischio e spiega l'impatto sul business in linguaggio chiaro." },
+    "report": { "title": "Agente di generazione dei report", "desc": "Genera automaticamente report di sicurezza professionali allineati ai framework." },
+    "flow": {
+      "target": "Bersaglio",
+      "recon": "Ricognizione",
+      "analysis": "Analisi",
+      "discovery": "Scoperta",
+      "validation": "Validazione",
+      "risk": "Rischio",
+      "report": "Report"
+    }
+  },
+  "trust": {
+    "title": "Progettato per le aziende che non possono sbagliare sulla sicurezza",
+    "subtitle": "Sicurezza e fiducia sono progettate nel cuore del prodotto — non aggiunte in seguito.",
+    "isolation": { "title": "Isolamento a livello di database", "desc": "La sicurezza a livello di riga impone un rigoroso isolamento dei tenant su ogni record." },
+    "authorization": { "title": "Autorizzazione prima di tutto", "desc": "Nessuna scansione viene eseguita senza una prova verificata di proprietà del bersaglio." },
+    "evidence": { "title": "Supportato da prove", "desc": "Ogni risultato è tracciabile a prove grezze archiviate e protette da checksum." },
+    "frameworks": { "title": "Allineato ai framework", "desc": "I risultati sono mappati ai controlli OWASP, NIST, ISO 27001 e PCI DSS." }
+  },
+  "cta": {
+    "title": "Pronto ad automatizzare le tue valutazioni di sicurezza?",
+    "subtitle": "Avvia il tuo primo penetration test guidato dall'IA in pochi minuti.",
+    "button": "Avvia una valutazione di sicurezza"
+  },
+  "footer": {
+    "tagline": "Agenti IA autonomi per la cybersicurezza di nuova generazione.",
+    "product": "Prodotto",
+    "company": "Azienda",
+    "resources": "Risorse",
+    "rights": "Tutti i diritti riservati.",
+    "services": "Servizi",
+    "agents": "Agenti IA",
+    "dashboard": "Dashboard",
+    "about": "Chi siamo",
+    "contact": "Contatti",
+    "docs": "Documentazione",
+    "security": "Sicurezza"
+  }
+}

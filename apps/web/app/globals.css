@@ -1,3 +1,69 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  /* Logical-property helpers so RTL mirrors automatically. Tailwind's ms-/me-
+     already use logical props; this keeps any raw usage consistent. */
+  [dir="rtl"] .flip-rtl {
+    transform: scaleX(-1);
+  }
+}
+
+@layer components {
+  /* Frosted glass surface for premium cards/nav. */
+  .glass {
+    background: rgba(13, 20, 38, 0.55);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(63, 82, 130, 0.28);
+  }
+  .glass-strong {
+    background: rgba(11, 16, 32, 0.8);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(63, 82, 130, 0.35);
+  }
+  /* Cyan→violet gradient text for headlines. */
+  .text-gradient {
+    background: linear-gradient(100deg, #eaf2ff 0%, #7cc4ff 45%, #22d3ee 75%, #7c5cff 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .btn-gradient {
+    background-image: linear-gradient(100deg, #0e8bff, #22d3ee 55%, #7c5cff);
+    background-size: 160% 100%;
+    background-position: 0% 50%;
+    transition: background-position 0.5s ease, box-shadow 0.3s ease, transform 0.2s ease;
+  }
+  .btn-gradient:hover {
+    background-position: 100% 50%;
+    box-shadow: 0 0 40px -8px rgba(34, 211, 238, 0.6);
+  }
+}
+
+@layer utilities {
+  /* Futuristic grid + radial glow backdrop for hero/sections. */
+  .bg-grid {
+    background-image: linear-gradient(rgba(56, 168, 255, 0.06) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(56, 168, 255, 0.06) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+  .bg-radial-glow {
+    background: radial-gradient(60% 50% at 50% 0%, rgba(34, 211, 238, 0.18) 0%, rgba(6, 9, 19, 0) 70%);
+  }
+  .mask-fade-b {
+    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+  }
+}

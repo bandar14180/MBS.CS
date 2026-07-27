@@ -691,3 +691,13 @@ First slice of §12 step 13: a workspace-wide rollup so the landing page isn't a
 - **Frontend:** the dashboard home (`app/(dashboard)/dashboard/page.tsx`) now shows a guided 4-step empty state when there are no projects, and otherwise stat cards + an active-findings-by-severity strip + recent scans + the projects grid (`dashboardApi.summary()` in `lib/api.ts`).
 - **Tests:** `apps/api/tests/test_dashboard.py` — empty-vs-seeded counts and per-workspace isolation (a non-member gets 403; A can't see B's projects). Full suite green (68 passed).
 - **Deferred (rest of step 13):** notifications (email/webhook on scan completion / new critical), scheduled/recurring scans (Celery beat), and trend-over-time charts.
+
+## Commercialization Phase 1 — Landing page + i18n + design system (2026-07-27)
+
+First slice of the "graduation project → commercial product" push. Public marketing surface + global-ready multilingual foundation, all client-side (no route restructure, no new npm deps).
+
+- **i18n (`apps/web/lib/i18n.tsx`)**: dependency-free `I18nProvider` + `useTranslation()` (`t(key, vars)`) + `useDict()`. Dictionaries are plain JSON under `apps/web/locales/{en,ar,ms,fr,pt,it,es}.json` — **7 languages**, English default. Locale persists in localStorage and drives `<html lang/dir>`; **Arabic renders full RTL**. Missing keys fall back en → raw key (never crash). Adding a language = drop a JSON file + one row in `LOCALES`. Parity enforced by `apps/web/scripts/check-i18n.js` (all 7 locales = 74 keys, no missing/extra/empty).
+- **Design system**: Tailwind theme extended (cyber ink palette, cyan/violet AI accent, glow shadows, fade-up/float/flow-dash keyframes) + `globals.css` utilities (`.glass`, `.text-gradient`, `.btn-gradient`, `.bg-grid`, `.bg-radial-glow`). Dark cybersecurity aesthetic with glassmorphism.
+- **Landing page (`app/page.tsx`, was a login redirect)**: `LandingNav` (sticky, glass-on-scroll, language selector), `Hero` (headline/subtitle/CTAs + CSS dashboard-preview visual), `Services` (7 cards), `AgentsWorkflow` (the 5 AI agents + the Target→Recon→Analysis→Discovery→Validation→Risk→Report pipeline, RTL-aware arrows), `TrustSection` (RLS isolation / authorization-first / evidence-backed / OWASP·NIST·ISO 27001·PCI DSS), `CTASection`, `Footer`. Root layout now wraps `<I18nProvider>`.
+- **Verified**: `tsc --noEmit` clean; `/`, `/login`, `/register`, `/dashboard` all 200; English SSR strings present in HTML; 7-locale parity green. (Pixel-level RTL/locale switching is client-side — verify in a browser.)
+- **Deferred (later phases):** AI Security Assistant chat + visible agent runs (Phase 2), plan/billing enforcement + org/team UI (Phase 3), continuous security (Phase 4), SSO/audit/API keys + ISO/PCI mapping (Phase 5).
