@@ -74,26 +74,39 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # deterministic phase order rather than failing the whole scan -- the
         # user's requested tools still run.
         if scan.config.get("use_ai_planner"):
-            try:
-                from apps.api.ai_agent.planner import AIPlanner
+            from apps.api.core.config import get_settings
 
-                plan = await AIPlanner().plan(
-                    db,
-                    scan_id=scan.id,
-                    target_type=target_row.type,
-                    target_value=target_row.value,
-                    requested_modules=requested,
-                    active_testing_allowed=scope.active_testing_allowed,
+            if not get_settings().anthropic_api_key:
+                # Expected, user-controllable state -- NOT an error. A missing key
+                # just means "run without AI"; log it concisely (no traceback) and
+                # fall back to the deterministic phase order.
+                logger.info(
+                    "AI planning requested for scan %s but ANTHROPIC_API_KEY is unset; using deterministic order",
+                    scan.id,
                 )
-                requested = plan.tool_sequence
-                await db.commit()
-            except Exception:
-                # Fall back to the deterministic order. The planner calls Claude
-                # before it writes anything, so a failure here (no key, API/parse
-                # error) leaves no pending DB state -- `requested` is untouched and
-                # the session stays valid, so we must NOT rollback (that would
-                # expire scan/target_row and break the async session).
-                logger.warning("AI planning failed for scan %s; using deterministic order", scan.id, exc_info=True)
+            else:
+                try:
+                    from apps.api.ai_agent.planner import AIPlanner
+
+                    plan = await AIPlanner().plan(
+                        db,
+                        scan_id=scan.id,
+                        target_type=target_row.type,
+                        target_value=target_row.value,
+                        requested_modules=requested,
+                        active_testing_allowed=scope.active_testing_allowed,
+                    )
+                    requested = plan.tool_sequence
+                    await db.commit()
+                except Exception:
+                    # A genuine, unexpected planner failure (API/parse error) --
+                    # keep the traceback. Fall back to the deterministic order.
+                    # The planner calls Claude before it writes anything, so a
+                    # failure here leaves no pending DB state -- `requested` is
+                    # untouched and the session stays valid, so we must NOT
+                    # rollback (that would expire scan/target_row and break the
+                    # async session).
+                    logger.warning("AI planning failed for scan %s; using deterministic order", scan.id, exc_info=True)
 
         runners = [TOOL_REGISTRY[m]() for m in requested if m in TOOL_REGISTRY]
         # Deterministic recon pipeline: run in phase order regardless of the
