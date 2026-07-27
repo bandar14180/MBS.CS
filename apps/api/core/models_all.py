@@ -11,6 +11,7 @@ from apps.api.modules.auth import models as auth_models  # noqa: F401
 from apps.api.modules.authorization_scope import models as authorization_scope_models  # noqa: F401
 from apps.api.modules.compliance import models as compliance_models  # noqa: F401
 from apps.api.modules.projects import models as projects_models  # noqa: F401
+from apps.api.modules.reports import models as reports_models  # noqa: F401
 from apps.api.modules.risk import models as risk_models  # noqa: F401
 from apps.api.modules.scans import models as scans_models  # noqa: F401
 from apps.api.modules.users import models as users_models  # noqa: F401
