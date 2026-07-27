@@ -5,6 +5,7 @@ from apps.api.core.config import get_settings
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.auth.router import router as auth_router
 from apps.api.modules.authorization_scope.router import router as authorization_scope_router
+from apps.api.modules.dashboard.router import router as dashboard_router
 from apps.api.modules.projects.router import router as projects_router
 from apps.api.modules.reports.router import router as reports_router
 from apps.api.modules.scans.router import router as scans_router
@@ -30,6 +31,7 @@ app.include_router(users_router, prefix=settings.api_v1_prefix)
 app.include_router(workspaces_router, prefix=settings.api_v1_prefix)
 app.include_router(roles_router, prefix=settings.api_v1_prefix)
 app.include_router(projects_router, prefix=settings.api_v1_prefix)
+app.include_router(dashboard_router, prefix=settings.api_v1_prefix)
 app.include_router(authorization_scope_router, prefix=settings.api_v1_prefix)
 app.include_router(scans_router, prefix=settings.api_v1_prefix)
 app.include_router(assets_router, prefix=settings.api_v1_prefix)

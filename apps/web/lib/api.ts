@@ -122,6 +122,11 @@ export const workspaceApi = {
   create: (name: string) => api<Workspace>("/workspaces", { method: "POST", body: { name } }),
 };
 
+// ---- Dashboard ----
+export const dashboardApi = {
+  summary: () => api<DashboardSummary>(ws("/dashboard/summary")),
+};
+
 // ---- Projects / targets / scope ----
 export const projectApi = {
   list: () => api<Project[]>(ws("/projects")),
@@ -222,3 +227,15 @@ export interface Remediation {
   summary: string | null; steps: string[]; references: { title: string; url: string }[]; generated_by: string;
 }
 export interface Report { id: string; type: string; format: string; generated_at: string; }
+export interface SeverityCounts { critical: number; high: number; medium: number; low: number; info: number; }
+export interface RecentScan {
+  id: string; project_id: string; project_name: string; target_value: string;
+  scan_type: string; status: string; created_at: string;
+}
+export interface DashboardSummary {
+  projects: number;
+  targets: number;
+  scans: { total: number; queued: number; running: number; completed: number; failed: number };
+  vulnerabilities: { total: number; active: number; by_severity: SeverityCounts };
+  recent_scans: RecentScan[];
+}

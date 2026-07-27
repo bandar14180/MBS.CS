@@ -676,3 +676,18 @@ Two more AI Agent components (§3), both **mockable-first** like the planner/cor
 - **Deferred:** live AI verification (needs a key); auto-running the FP reducer during a scan and persisting a suppression log (kept it on-demand + routed through the audited status flow instead); human-authored remediation edits (`generated_by="human"` is supported by the column but no edit endpoint yet).
 
 With this, **all §12 build-order items are done except step 12 (active-testing tools: SQLMap/FFUF/Gobuster/Metasploit), step 13 (dashboard/notifications/scheduled scans), and step 14 (SSO/audit/API keys hardening)** — plus the still-outstanding cross-cutting deferrals (live AI verification, a real frontend).
+
+## Frontend v1 — Functional Dashboard (2026-07-27)
+
+Full Next.js 14 (App Router, TypeScript, Tailwind) UI over the existing API — closes the "real frontend" deferral. Client-side auth (localStorage access+refresh, silent refresh-on-401 in `apps/web/lib/api.ts`), workspace bootstrap in `lib/auth.tsx` (`ensureWorkspace`: list → create-if-empty → select first). Screens: login/register, dashboard home, and a per-project workspace with 4 tabs — **Targets** (add, edit criticality, submit + verify authorization scope), **Scans** (module selection + AI-planner toggle, create, live status poll, tool-run tables), **Vulnerabilities** (severity/status filters, detail with risk/compliance/remediation-generate/triage), **Reports** (generate executive/technical, list, download blob). Verified: all routes serve 200 via `:3000` and nginx `:80`; every endpoint the UI calls round-trips end-to-end.
+
+- **Web-container gotcha:** the dev server (`next dev`) misses new-file events on Windows Docker bind mounts, so newly-added routes 404 until `docker compose restart web` forces a route-manifest rescan. Restart after adding pages.
+- **scan_type fix:** the backend `ScanCreate.scan_type` is `Literal["web","api","network","cloud"]`; the UI derives it from the selected target's `type` (`domain→web`, `api→api`, `ip_range→network`, `cloud_account→cloud`, fallback `web`) rather than sending a fixed value.
+
+## Step 13 (partial) Implementation Notes — Dashboard aggregation (2026-07-27)
+
+First slice of §12 step 13: a workspace-wide rollup so the landing page isn't an empty void for a new user. New module `apps/api/modules/dashboard/` (`service.py` + `schemas.py` + `router.py`), registered in `main.py`. `GET /workspaces/{workspace_id}/dashboard/summary` (gated `project:read`) returns: project/target counts, scan status breakdown (`total/queued/running/completed/failed`), vulnerability totals + active-by-severity counts, and the 5 most-recent scans (joined to project name + target value). Every count is filtered by `workspace_id` **explicitly** (belt-and-braces with RLS): scans via their denormalized `workspace_id`, targets/vulns via a `→ projects.workspace_id` join. Active = `open|confirmed|reopened`.
+
+- **Frontend:** the dashboard home (`app/(dashboard)/dashboard/page.tsx`) now shows a guided 4-step empty state when there are no projects, and otherwise stat cards + an active-findings-by-severity strip + recent scans + the projects grid (`dashboardApi.summary()` in `lib/api.ts`).
+- **Tests:** `apps/api/tests/test_dashboard.py` — empty-vs-seeded counts and per-workspace isolation (a non-member gets 403; A can't see B's projects). Full suite green (68 passed).
+- **Deferred (rest of step 13):** notifications (email/webhook on scan completion / new critical), scheduled/recurring scans (Celery beat), and trend-over-time charts.
