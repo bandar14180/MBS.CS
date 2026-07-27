@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import { scanApi, type Scan, type Target, type ToolRun } from "@/lib/api";
+import { scanApi, type Scan, type Target } from "@/lib/api";
 import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@/components/ui";
+import { ScanProgress } from "@/components/project/ScanProgress";
 
 const MODULES = ["subfinder", "httpx", "naabu", "nmap", "nuclei"];
 const ACTIVE_MODULES = new Set(["nuclei"]);
@@ -146,64 +147,15 @@ export function ScansTab({ projectId, targets }: { projectId: string; targets: T
                 <div className="flex items-center gap-2">
                   {RUNNING.has(s.status) && <Spinner />}
                   <Button variant="ghost" onClick={() => setOpenScan(openScan === s.id ? null : s.id)}>
-                    {openScan === s.id ? "Hide" : "Tool runs"}
+                    {openScan === s.id ? "Hide" : "Progress"}
                   </Button>
                 </div>
               </div>
-              {openScan === s.id && <ToolRuns projectId={projectId} scanId={s.id} live={RUNNING.has(s.status)} />}
+              {(openScan === s.id || RUNNING.has(s.status)) && <ScanProgress projectId={projectId} scan={s} />}
             </Card>
           ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function ToolRuns({ projectId, scanId, live }: { projectId: string; scanId: string; live: boolean }) {
-  const [runs, setRuns] = useState<ToolRun[] | null>(null);
-  const liveRef = useRef(live);
-  liveRef.current = live;
-
-  const load = useCallback(async () => {
-    try {
-      setRuns(await scanApi.toolRuns(projectId, scanId));
-    } catch {}
-  }, [projectId, scanId]);
-
-  useEffect(() => {
-    load();
-    if (!live) return;
-    const t = setInterval(load, 4000);
-    return () => clearInterval(t);
-  }, [load, live]);
-
-  if (runs === null) return <div className="mt-4"><Spinner /></div>;
-  if (runs.length === 0) return <div className="mt-4 text-sm text-slate-500">No tool runs recorded yet.</div>;
-
-  return (
-    <div className="mt-4 border-t border-slate-800 pt-4">
-      <table className="w-full text-sm">
-        <thead className="text-left text-xs uppercase text-slate-500">
-          <tr>
-            <th className="pb-2">Tool</th>
-            <th className="pb-2">Version</th>
-            <th className="pb-2">Status</th>
-            <th className="pb-2">Exit</th>
-          </tr>
-        </thead>
-        <tbody>
-          {runs.map((r) => (
-            <tr key={r.id} className="border-t border-slate-800/60">
-              <td className="py-2 font-mono text-slate-200">{r.tool_name}</td>
-              <td className="py-2 text-slate-400">{r.tool_version || "—"}</td>
-              <td className="py-2">
-                <Badge kind="status" value={r.status} />
-              </td>
-              <td className="py-2 text-slate-400">{r.exit_code ?? "—"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
     </div>
   );
 }

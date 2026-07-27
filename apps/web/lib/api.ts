@@ -222,7 +222,9 @@ export interface Scan {
   started_at: string | null; completed_at: string | null;
 }
 export interface ToolRun {
-  id: string; tool_name: string; tool_version: string; status: string; exit_code: number | null; raw_output_ref: string | null;
+  id: string; tool_name: string; tool_version: string; status: string; exit_code: number | null;
+  raw_output_ref: string | null; started_at: string; completed_at: string | null;
+  error_message: string | null; duration_seconds: number | null;
 }
 export interface Vulnerability {
   id: string; title: string; severity: string; status: string; category: string | null;
