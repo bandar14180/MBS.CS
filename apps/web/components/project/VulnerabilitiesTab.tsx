@@ -9,6 +9,7 @@ import {
   type RiskScore,
   type Vulnerability,
 } from "@/lib/api";
+import { useTranslation } from "@/lib/i18n";
 import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@/components/ui";
 import { useAssistant } from "@/components/assistant/AssistantWidget";
 
@@ -17,6 +18,7 @@ const STATUSES = ["", "open", "confirmed", "false_positive", "remediated", "acce
 const STATUS_CHOICES = ["confirmed", "false_positive", "remediated", "accepted_risk"];
 
 export function VulnerabilitiesTab({ projectId }: { projectId: string }) {
+  const { t } = useTranslation();
   const [vulns, setVulns] = useState<Vulnerability[] | null>(null);
   const [error, setError] = useState("");
   const [severity, setSeverity] = useState("");
@@ -40,21 +42,21 @@ export function VulnerabilitiesTab({ projectId }: { projectId: string }) {
       <Card>
         <div className="flex flex-wrap items-end gap-3">
           <div>
-            <Label>Severity</Label>
+            <Label>{t("vulns.severity")}</Label>
             <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
               {SEVERITIES.map((s) => (
                 <option key={s} value={s}>
-                  {s || "all"}
+                  {s || t("vulns.all")}
                 </option>
               ))}
             </Select>
           </div>
           <div>
-            <Label>Status</Label>
+            <Label>{t("vulns.status")}</Label>
             <Select value={status} onChange={(e) => setStatus(e.target.value)}>
               {STATUSES.map((s) => (
                 <option key={s} value={s}>
-                  {s ? s.replace("_", " ") : "all"}
+                  {s ? s.replace("_", " ") : t("vulns.all")}
                 </option>
               ))}
             </Select>
@@ -67,7 +69,7 @@ export function VulnerabilitiesTab({ projectId }: { projectId: string }) {
       {vulns === null ? (
         <Spinner />
       ) : vulns.length === 0 ? (
-        <Empty>No vulnerabilities match. Run a scan to populate findings.</Empty>
+        <Empty>{t("vulns.empty")}</Empty>
       ) : (
         <div className="space-y-3">
           {vulns.map((v) => (
@@ -81,7 +83,7 @@ export function VulnerabilitiesTab({ projectId }: { projectId: string }) {
                   <div>
                     <div className="font-medium text-slate-100">{v.title}</div>
                     <div className="text-xs text-slate-500">
-                      {v.category || "uncategorized"}
+                      {v.category || t("vulns.uncategorized")}
                       {v.cvss_score != null && ` · CVSS ${v.cvss_score}`}
                     </div>
                   </div>
@@ -115,6 +117,7 @@ function VulnDetail({
   const [genBusy, setGenBusy] = useState(false);
   const [err, setErr] = useState("");
   const { open: openAssistant } = useAssistant();
+  const { t } = useTranslation();
 
   useEffect(() => {
     vulnApi.risk(projectId, vuln.id).then(setRisk).catch(() => {});
@@ -154,28 +157,28 @@ function VulnDetail({
           variant="secondary"
           onClick={() => openAssistant({ projectId, vulnerabilityId: vuln.id, label: vuln.title })}
         >
-          ✨ Ask AI about this
+          ✨ {t("vulns.askAi")}
         </Button>
       </div>
       {vuln.description && <p className="text-slate-300">{vuln.description}</p>}
 
       <div className="grid gap-4 sm:grid-cols-2">
         <div>
-          <div className="mb-1 text-xs uppercase text-slate-500">Risk</div>
+          <div className="mb-1 text-xs uppercase text-slate-500">{t("vulns.risk")}</div>
           {risk ? (
             <div className="text-slate-300">
               <div className="text-2xl font-semibold text-slate-100">{risk.final_risk_score ?? "—"}</div>
-              <div className="text-xs text-slate-500">criticality weight ×{risk.asset_criticality_weight}</div>
+              <div className="text-xs text-slate-500">{t("vulns.criticalityWeight")} ×{risk.asset_criticality_weight}</div>
               {risk.rationale && <p className="mt-1 text-xs text-slate-400">{risk.rationale}</p>}
             </div>
           ) : (
-            <span className="text-slate-500">no score</span>
+            <span className="text-slate-500">{t("vulns.noScore")}</span>
           )}
         </div>
         <div>
-          <div className="mb-1 text-xs uppercase text-slate-500">Compliance</div>
+          <div className="mb-1 text-xs uppercase text-slate-500">{t("vulns.compliance")}</div>
           {compliance.length === 0 ? (
-            <span className="text-slate-500">no mappings</span>
+            <span className="text-slate-500">{t("vulns.noMappings")}</span>
           ) : (
             <ul className="space-y-1">
               {compliance.map((c, i) => (
@@ -191,9 +194,9 @@ function VulnDetail({
 
       <div>
         <div className="mb-1 flex items-center justify-between">
-          <span className="text-xs uppercase text-slate-500">Remediation</span>
+          <span className="text-xs uppercase text-slate-500">{t("vulns.remediation")}</span>
           <Button variant="ghost" onClick={genRemediation} disabled={genBusy}>
-            {genBusy ? "Generating…" : remediation ? "Regenerate" : "Generate"}
+            {genBusy ? t("vulns.generating") : remediation ? t("vulns.regenerate") : t("vulns.generate")}
           </Button>
         </div>
         {remediation ? (
@@ -215,18 +218,18 @@ function VulnDetail({
                 ))}
               </div>
             )}
-            <div className="mt-2 text-xs text-slate-500">generated by {remediation.generated_by}</div>
+            <div className="mt-2 text-xs text-slate-500">{t("vulns.generatedBy")} {remediation.generated_by}</div>
           </div>
         ) : (
-          <span className="text-slate-500">none yet</span>
+          <span className="text-slate-500">{t("vulns.noneYet")}</span>
         )}
       </div>
 
       <div className="border-t border-slate-800 pt-4">
-        <div className="mb-2 text-xs uppercase text-slate-500">Triage</div>
+        <div className="mb-2 text-xs uppercase text-slate-500">{t("vulns.triage")}</div>
         <div className="flex flex-wrap items-end gap-3">
           <div>
-            <Label>Set status</Label>
+            <Label>{t("vulns.setStatus")}</Label>
             <Select value={newStatus} onChange={(e) => setNewStatus(e.target.value)}>
               {STATUS_CHOICES.map((s) => (
                 <option key={s} value={s}>
@@ -236,16 +239,15 @@ function VulnDetail({
             </Select>
           </div>
           <div className="min-w-[14rem] flex-1">
-            <Label>Justification</Label>
+            <Label>{t("vulns.justification")}</Label>
             <input
-              className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-600"
+              className="w-full rounded-lg border border-cyber-border bg-white/5 px-3 py-2 text-sm text-slate-100 outline-none focus:border-accent-cyan/50"
               value={justification}
               onChange={(e) => setJustification(e.target.value)}
-              placeholder="why"
             />
           </div>
           <Button onClick={applyStatus} disabled={busy}>
-            Apply
+            {t("vulns.apply")}
           </Button>
         </div>
         <ErrorText>{err}</ErrorText>

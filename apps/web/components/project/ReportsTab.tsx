@@ -3,14 +3,16 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { reportApi, type Report } from "@/lib/api";
+import { useTranslation } from "@/lib/i18n";
 import { Button, Card, Empty, ErrorText, Spinner } from "@/components/ui";
 
 const TYPES = [
-  { value: "executive", label: "Executive summary" },
-  { value: "technical", label: "Technical detail" },
+  { value: "executive", labelKey: "reports.executive" },
+  { value: "technical", labelKey: "reports.technical" },
 ];
 
 export function ReportsTab({ projectId }: { projectId: string }) {
+  const { t } = useTranslation();
   const [reports, setReports] = useState<Report[] | null>(null);
   const [error, setError] = useState("");
   const [busyType, setBusyType] = useState<string | null>(null);
@@ -64,11 +66,11 @@ export function ReportsTab({ projectId }: { projectId: string }) {
   return (
     <div className="space-y-6">
       <Card>
-        <h3 className="mb-3 font-medium">Generate report</h3>
+        <h3 className="mb-3 font-medium">{t("reports.generateReport")}</h3>
         <div className="flex flex-wrap gap-3">
-          {TYPES.map((t) => (
-            <Button key={t.value} variant="secondary" onClick={() => generate(t.value)} disabled={busyType !== null}>
-              {busyType === t.value ? "Generating…" : t.label}
+          {TYPES.map((ty) => (
+            <Button key={ty.value} variant="secondary" onClick={() => generate(ty.value)} disabled={busyType !== null}>
+              {busyType === ty.value ? t("reports.generating") : t(ty.labelKey)}
             </Button>
           ))}
         </div>
@@ -79,20 +81,23 @@ export function ReportsTab({ projectId }: { projectId: string }) {
       {reports === null ? (
         <Spinner />
       ) : reports.length === 0 ? (
-        <Empty>No reports yet. Generate one from the current findings.</Empty>
+        <Empty>{t("reports.empty")}</Empty>
       ) : (
         <div className="space-y-3">
           {reports.map((r) => (
             <Card key={r.id}>
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <div className="font-medium capitalize text-slate-100">{r.type} report</div>
+                  <div className="font-medium text-slate-100">
+                    {t(`reports.${r.type}`)} · {t("reports.report")}
+                  </div>
                   <div className="text-xs text-slate-500">
-                    {(r.format || "pdf").toUpperCase()} · {new Date(r.generated_at).toLocaleString()}
+                    <span dir="ltr">{(r.format || "pdf").toUpperCase()}</span> ·{" "}
+                    {new Date(r.generated_at).toLocaleString()}
                   </div>
                 </div>
                 <Button onClick={() => download(r)} disabled={downloading === r.id}>
-                  {downloading === r.id ? "Downloading…" : "Download"}
+                  {downloading === r.id ? t("reports.downloading") : t("reports.download")}
                 </Button>
               </div>
             </Card>

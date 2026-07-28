@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { scanApi, type Scan, type Target } from "@/lib/api";
+import { useTranslation } from "@/lib/i18n";
 import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@/components/ui";
 import { ScanProgress } from "@/components/project/ScanProgress";
 
@@ -21,6 +22,7 @@ const TARGET_SCAN_TYPE: Record<string, string> = {
 };
 
 export function ScansTab({ projectId, targets }: { projectId: string; targets: Target[] }) {
+  const { t } = useTranslation();
   const [scans, setScans] = useState<Scan[] | null>(null);
   const [error, setError] = useState("");
 
@@ -82,13 +84,13 @@ export function ScansTab({ projectId, targets }: { projectId: string; targets: T
   return (
     <div className="space-y-6">
       <Card>
-        <h3 className="mb-3 font-medium">New scan</h3>
+        <h3 className="mb-3 font-medium">{t("scans.newScan")}</h3>
         {targets.length === 0 ? (
-          <Empty>Add and verify a target first.</Empty>
+          <Empty>{t("scans.addVerifyFirst")}</Empty>
         ) : (
           <form onSubmit={createScan} className="space-y-4">
             <div className="max-w-sm">
-              <Label>Target</Label>
+              <Label>{t("scans.target")}</Label>
               <Select value={targetId} onChange={(e) => setTargetId(e.target.value)}>
                 {targets.map((t) => (
                   <option key={t.id} value={t.id}>
@@ -98,26 +100,25 @@ export function ScansTab({ projectId, targets }: { projectId: string; targets: T
               </Select>
             </div>
             <div>
-              <Label>Modules</Label>
+              <Label>{t("scans.modules")}</Label>
               <div className="flex flex-wrap gap-3">
                 {MODULES.map((m) => (
                   <label key={m} className="flex items-center gap-2 text-sm text-slate-300">
                     <input type="checkbox" checked={modules.includes(m)} onChange={() => toggleModule(m)} />
-                    {m}
-                    {ACTIVE_MODULES.has(m) && <span className="text-xs text-amber-400">(active)</span>}
+                    <span dir="ltr">{m}</span>
+                    {ACTIVE_MODULES.has(m) && <span className="text-xs text-amber-400">({t("scans.active")})</span>}
                   </label>
                 ))}
               </div>
-              <p className="mt-1 text-xs text-slate-500">
-                Active modules require a target with active-testing authorization.
-              </p>
+              <p className="mt-1 text-xs text-slate-500">{t("scans.activeNote")}</p>
             </div>
             <label className="flex items-center gap-2 text-sm text-slate-300">
               <input type="checkbox" checked={useAi} onChange={(e) => setUseAi(e.target.checked)} />
-              Use AI planner (falls back to deterministic order if unavailable)
+              {t("scans.useAiPlanner")}
             </label>
+            {useAi && <p className="-mt-2 ms-6 text-xs text-amber-400/80">{t("scans.aiPlannerHint")}</p>}
             <Button type="submit" disabled={busy || !targetId || modules.length === 0}>
-              {busy ? "Starting…" : "Start scan"}
+              {busy ? t("scans.starting") : t("scans.startScan")}
             </Button>
           </form>
         )}
@@ -128,7 +129,7 @@ export function ScansTab({ projectId, targets }: { projectId: string; targets: T
       {scans === null ? (
         <Spinner />
       ) : scans.length === 0 ? (
-        <Empty>No scans yet.</Empty>
+        <Empty>{t("scans.noScans")}</Empty>
       ) : (
         <div className="space-y-3">
           {scans.map((s) => (
@@ -140,14 +141,14 @@ export function ScansTab({ projectId, targets }: { projectId: string; targets: T
                     <span className="font-mono text-sm text-slate-200">{targetLabel(s.target_id)}</span>
                   </div>
                   <div className="mt-1 text-xs text-slate-500">
-                    {(s.config?.requested_modules || []).join(", ") || s.scan_type} · started{" "}
-                    {new Date(s.created_at).toLocaleString()}
+                    <span dir="ltr">{(s.config?.requested_modules || []).join(", ") || s.scan_type}</span> ·{" "}
+                    {t("scans.started")} {new Date(s.created_at).toLocaleString()}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
                   {RUNNING.has(s.status) && <Spinner />}
                   <Button variant="ghost" onClick={() => setOpenScan(openScan === s.id ? null : s.id)}>
-                    {openScan === s.id ? "Hide" : "Progress"}
+                    {openScan === s.id ? t("scans.hide") : t("scans.progress")}
                   </Button>
                 </div>
               </div>

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { ApiError, projectApi, type AuthorizationScope, type Target } from "@/lib/api";
+import { useTranslation } from "@/lib/i18n";
 import { Badge, Button, Card, Empty, ErrorText, Input, Label, Select, Spinner } from "@/components/ui";
 
 const CRITICALITY = ["low", "medium", "high", "critical"];
@@ -10,6 +11,7 @@ const TARGET_TYPES = ["domain", "ip_range", "api", "cloud_account", "repo"];
 const PROOF_TYPES = ["dns_txt", "file_upload", "signed_letter", "cloud_iam_role"];
 
 export function TargetsTab({ projectId }: { projectId: string }) {
+  const { t: tr } = useTranslation();
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [scopes, setScopes] = useState<Record<string, AuthorizationScope | null>>({});
   const [error, setError] = useState("");
@@ -63,11 +65,11 @@ export function TargetsTab({ projectId }: { projectId: string }) {
   return (
     <div className="space-y-6">
       <Card>
-        <h3 className="mb-3 font-medium">Add target</h3>
+        <h3 className="mb-3 font-medium">{tr("targets.addTarget")}</h3>
         <form onSubmit={addTarget} className="flex flex-wrap items-end gap-3">
           <div>
-            <Label>Type</Label>
-            <Select value={type} onChange={(e) => setType(e.target.value)}>
+            <Label>{tr("targets.type")}</Label>
+            <Select value={type} onChange={(e) => setType(e.target.value)} dir="ltr">
               {TARGET_TYPES.map((t) => (
                 <option key={t} value={t}>
                   {t}
@@ -76,11 +78,11 @@ export function TargetsTab({ projectId }: { projectId: string }) {
             </Select>
           </div>
           <div className="min-w-[16rem] flex-1">
-            <Label>Value</Label>
-            <Input value={value} onChange={(e) => setValue(e.target.value)} placeholder="example.com" required />
+            <Label>{tr("targets.value")}</Label>
+            <Input value={value} onChange={(e) => setValue(e.target.value)} placeholder="example.com" required dir="ltr" />
           </div>
           <div>
-            <Label>Criticality</Label>
+            <Label>{tr("targets.criticality")}</Label>
             <Select value={criticality} onChange={(e) => setCriticality(e.target.value)}>
               {CRITICALITY.map((c) => (
                 <option key={c} value={c}>
@@ -90,7 +92,7 @@ export function TargetsTab({ projectId }: { projectId: string }) {
             </Select>
           </div>
           <Button type="submit" disabled={busy}>
-            Add
+            {tr("targets.add")}
           </Button>
         </form>
       </Card>
@@ -100,7 +102,7 @@ export function TargetsTab({ projectId }: { projectId: string }) {
       {targets === null ? (
         <Spinner />
       ) : targets.length === 0 ? (
-        <Empty>No targets yet. Add one, then verify ownership before scanning.</Empty>
+        <Empty>{tr("targets.empty")}</Empty>
       ) : (
         <div className="space-y-3">
           {targets.map((t) => (
@@ -132,6 +134,7 @@ function TargetRow({
   scope: AuthorizationScope | null | undefined;
   onChange: () => void;
 }) {
+  const { t: tr } = useTranslation();
   const [proofType, setProofType] = useState("dns_txt");
   const [proofRef, setProofRef] = useState("");
   const [activeAllowed, setActiveAllowed] = useState(false);
@@ -173,12 +176,12 @@ function TargetRow({
     <Card>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <div className="font-mono text-sm text-slate-100">{target.value}</div>
-          <div className="text-xs text-slate-500">{target.type}</div>
+          <div className="font-mono text-sm text-slate-100" dir="ltr">{target.value}</div>
+          <div className="text-xs text-slate-500" dir="ltr">{target.type}</div>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-500">criticality</span>
+            <span className="text-xs text-slate-500">{tr("targets.criticality")}</span>
             <Select value={target.criticality} onChange={(e) => setCrit(e.target.value)}>
               {CRITICALITY.map((c) => (
                 <option key={c} value={c}>
@@ -190,16 +193,16 @@ function TargetRow({
           {scope === undefined ? (
             <Spinner />
           ) : scope === null ? (
-            <span className="text-xs text-slate-500">no scope</span>
+            <span className="text-xs text-slate-500">{tr("targets.noScope")}</span>
           ) : scope.verified ? (
             <span className="flex items-center gap-2">
               <Badge kind="status" value="verified" />
               <span className="text-xs text-slate-500">
-                active testing: {scope.active_testing_allowed ? "yes" : "no"}
+                {tr("targets.activeTesting")}: {scope.active_testing_allowed ? tr("targets.yes") : tr("targets.no")}
               </span>
             </span>
           ) : (
-            <span className="text-xs text-amber-400">submitted, not verified</span>
+            <span className="text-xs text-amber-400">{tr("targets.submittedNotVerified")}</span>
           )}
         </div>
       </div>
@@ -209,8 +212,8 @@ function TargetRow({
           {scope === null ? (
             <div className="flex flex-wrap items-end gap-3">
               <div>
-                <Label>Proof type</Label>
-                <Select value={proofType} onChange={(e) => setProofType(e.target.value)}>
+                <Label>{tr("targets.proofType")}</Label>
+                <Select value={proofType} onChange={(e) => setProofType(e.target.value)} dir="ltr">
                   {PROOF_TYPES.map((p) => (
                     <option key={p} value={p}>
                       {p}
@@ -219,21 +222,21 @@ function TargetRow({
                 </Select>
               </div>
               <div className="min-w-[14rem] flex-1">
-                <Label>Proof reference</Label>
-                <Input value={proofRef} onChange={(e) => setProofRef(e.target.value)} placeholder="mbs-verify=..." />
+                <Label>{tr("targets.proofReference")}</Label>
+                <Input value={proofRef} onChange={(e) => setProofRef(e.target.value)} placeholder="mbs-verify=..." dir="ltr" />
               </div>
               <Button variant="secondary" onClick={submitProof} disabled={busy}>
-                Submit ownership proof
+                {tr("targets.submitProof")}
               </Button>
             </div>
           ) : (
             <div className="flex flex-wrap items-center gap-4">
               <label className="flex items-center gap-2 text-sm text-slate-300">
                 <input type="checkbox" checked={activeAllowed} onChange={(e) => setActiveAllowed(e.target.checked)} />
-                Allow active testing (nuclei, etc.)
+                {tr("targets.allowActive")}
               </label>
               <Button onClick={verify} disabled={busy}>
-                Verify ownership
+                {tr("targets.verify")}
               </Button>
             </div>
           )}
