@@ -17,7 +17,14 @@ const STAGES: Record<string, { key: string; tool: string }> = {
 const PHASE_ORDER = ["subfinder", "httpx", "naabu", "nmap", "nuclei"];
 const TERMINAL = new Set(["completed", "failed", "completed_with_errors", "cancelled"]);
 
-type StageState = "waiting" | "running" | "completed" | "failed" | "skipped";
+type StageState =
+  | "waiting"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skippedUnauth"
+  | "notApplicable"
+  | "notRun";
 
 function scanDuration(scan: Scan): string | null {
   if (!scan.started_at || !scan.completed_at) return null;
@@ -71,10 +78,14 @@ export function ScanProgress({ projectId, scan }: { projectId: string; scan: Sca
     if (run) {
       if (run.status === "completed") return { state: "completed", run };
       if (run.status === "running") return { state: "running", run };
-      if (run.status === "skipped_unauthorized") return { state: "skipped", run };
+      if (run.status === "skipped_unauthorized") return { state: "skippedUnauth", run };
       return { state: "failed", run };
     }
-    return { state: live ? "waiting" : "skipped" };
+    // No tool-run row: it's still pending (live), or the scan ended. A finished
+    // "failed" scan means later stages didn't run; a "completed" scan means the
+    // tool simply doesn't apply to this target type (e.g. subfinder needs a domain).
+    if (live) return { state: "waiting" };
+    return { state: scan.status === "failed" ? "notRun" : "notApplicable" };
   }
 
   const total = scanDuration(scan);
@@ -143,7 +154,9 @@ function StageRow({ tool, state, run }: { tool: string; state: StageState; run?:
     running: <Spinner />,
     failed: <span className="text-rose-400">✕</span>,
     waiting: <span className="text-slate-600">○</span>,
-    skipped: <span className="text-slate-600">—</span>,
+    skippedUnauth: <span className="text-slate-600">—</span>,
+    notApplicable: <span className="text-slate-600">—</span>,
+    notRun: <span className="text-slate-600">—</span>,
   };
   const labelColor =
     state === "completed" ? "text-slate-100"
@@ -156,7 +169,9 @@ function StageRow({ tool, state, run }: { tool: string; state: StageState; run?:
     running: t("scans.sRunning"),
     failed: t("scans.sFailed") + dur,
     waiting: t("scans.sWaiting"),
-    skipped: t("scans.sSkipped"),
+    skippedUnauth: t("scans.sSkippedUnauth"),
+    notApplicable: t("scans.sNotApplicable"),
+    notRun: t("scans.sNotRun"),
   };
   const statusColor =
     state === "completed" ? "text-emerald-400"
