@@ -49,6 +49,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <Link href="/audit" className="block rounded-lg px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5">
               {t("audit.title")}
             </Link>
+            <Link href="/api-keys" className="block rounded-lg px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5">
+              {t("apiKeys.title")}
+            </Link>
             <Link href="/" className="block rounded-lg px-3 py-2 text-sm text-slate-400 transition hover:bg-white/5">
               {t("dashboard.home")}
             </Link>

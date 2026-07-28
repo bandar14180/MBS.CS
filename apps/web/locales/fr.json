@@ -272,5 +272,21 @@
     "actor": "Acteur",
     "detail": "Détail",
     "when": "Quand"
+  },
+  "apiKeys": {
+    "title": "Clés API",
+    "subtitle": "Accès programmatique à cet espace de travail. Envoyez la clé comme jeton bearer.",
+    "denied": "Vous avez besoin de la permission de gestion de l'espace de travail pour gérer les clés API.",
+    "name": "Nom",
+    "create": "Créer une clé",
+    "empty": "Aucune clé API pour l'instant.",
+    "revoke": "Révoquer",
+    "revoked": "révoquée",
+    "lastUsed": "dernière utilisation",
+    "neverUsed": "jamais utilisée",
+    "secretOnce": "Copiez votre clé maintenant — elle ne sera plus affichée.",
+    "copy": "Copier",
+    "copied": "Copié",
+    "dismiss": "Fermer"
   }
 }

@@ -272,5 +272,21 @@
     "actor": "Autor",
     "detail": "Detalle",
     "when": "Cuándo"
+  },
+  "apiKeys": {
+    "title": "Claves de API",
+    "subtitle": "Acceso programático a este espacio de trabajo. Envía la clave como token bearer.",
+    "denied": "Necesitas permiso de gestión del espacio de trabajo para gestionar claves de API.",
+    "name": "Nombre",
+    "create": "Crear clave",
+    "empty": "Aún no hay claves de API.",
+    "revoke": "Revocar",
+    "revoked": "revocada",
+    "lastUsed": "último uso",
+    "neverUsed": "nunca usada",
+    "secretOnce": "Copia tu clave ahora — no se mostrará de nuevo.",
+    "copy": "Copiar",
+    "copied": "Copiado",
+    "dismiss": "Descartar"
   }
 }

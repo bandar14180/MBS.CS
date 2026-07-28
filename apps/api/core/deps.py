@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,13 +20,31 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
+    request: Request,
     db: DbDep,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> User:
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token")
+    token = credentials.credentials
+
+    # API-key path: keys carry a distinct prefix so they never collide with a JWT.
+    # A key authenticates AS its creator, bound to its workspace (enforced in
+    # get_workspace_context via request.state).
+    if token.startswith("mbsk_"):
+        from apps.api.modules.api_keys.service import authenticate_key
+
+        key = await authenticate_key(db, token)
+        if key is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or revoked API key")
+        user = await db.get(User, key.created_by)
+        if user is None or user.status != "active":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "API key owner not found or inactive")
+        request.state.api_key_workspace_id = key.workspace_id
+        return user
+
     try:
-        payload = decode_access_token(credentials.credentials)
+        payload = decode_access_token(token)
     except jwt.PyJWTError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
 
@@ -48,6 +66,7 @@ class WorkspaceContext:
 
 
 async def get_workspace_context(
+    request: Request,
     workspace_id: uuid.UUID,
     db: DbDep,
     current_user: CurrentUserDep,
@@ -55,6 +74,11 @@ async def get_workspace_context(
     """Resolves the workspace from the `{workspace_id}` path segment. Every
     workspace-scoped router is mounted under `/workspaces/{workspace_id}/...`
     so this binds automatically as a sub-dependency."""
+    # An API key may only be used for the workspace it was issued for.
+    key_ws = getattr(request.state, "api_key_workspace_id", None)
+    if key_ws is not None and key_ws != workspace_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "API key is not valid for this workspace")
+
     member = await db.scalar(
         select(WorkspaceMember).where(
             WorkspaceMember.workspace_id == workspace_id,

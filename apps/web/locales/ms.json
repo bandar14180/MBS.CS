@@ -272,5 +272,21 @@
     "actor": "Pelaku",
     "detail": "Butiran",
     "when": "Bila"
+  },
+  "apiKeys": {
+    "title": "Kunci API",
+    "subtitle": "Akses berprogram ke ruang kerja ini. Hantar kunci sebagai token bearer.",
+    "denied": "Anda memerlukan kebenaran urus-ruang-kerja untuk mengurus kunci API.",
+    "name": "Nama",
+    "create": "Cipta kunci",
+    "empty": "Belum ada kunci API.",
+    "revoke": "Batalkan",
+    "revoked": "dibatalkan",
+    "lastUsed": "kali terakhir digunakan",
+    "neverUsed": "tidak pernah digunakan",
+    "secretOnce": "Salin kunci anda sekarang — ia tidak akan ditunjukkan lagi.",
+    "copy": "Salin",
+    "copied": "Disalin",
+    "dismiss": "Tolak"
   }
 }

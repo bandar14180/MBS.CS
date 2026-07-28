@@ -132,6 +132,13 @@ export const auditApi = {
   list: () => api<AuditEvent[]>(ws("/audit")),
 };
 
+// ---- API keys ----
+export const apiKeyApi = {
+  list: () => api<ApiKey[]>(ws("/api-keys")),
+  create: (name: string) => api<ApiKeyCreated>(ws("/api-keys"), { method: "POST", body: { name } }),
+  revoke: (id: string) => api<Response>(ws(`/api-keys/${id}`), { method: "DELETE", raw: true }),
+};
+
 // ---- Notifications ----
 export const notificationApi = {
   list: (unread = false) => api<AppNotification[]>(ws(`/notifications${unread ? "?unread=true" : ""}`)),
@@ -300,6 +307,12 @@ export interface DashboardSummary {
   scans: { total: number; queued: number; running: number; completed: number; failed: number };
   vulnerabilities: { total: number; active: number; by_severity: SeverityCounts };
   recent_scans: RecentScan[];
+}
+export interface ApiKey {
+  id: string; name: string; prefix: string; revoked: boolean; last_used_at: string | null; created_at: string;
+}
+export interface ApiKeyCreated extends ApiKey {
+  secret: string;
 }
 export interface AuditEvent {
   id: string; actor_user_id: string | null; actor_email: string | null; action: string;

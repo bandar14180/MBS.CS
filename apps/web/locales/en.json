@@ -272,5 +272,21 @@
     "actor": "Actor",
     "detail": "Detail",
     "when": "When"
+  },
+  "apiKeys": {
+    "title": "API keys",
+    "subtitle": "Programmatic access to this workspace. Send the key as a bearer token.",
+    "denied": "You need workspace-manage permission to manage API keys.",
+    "name": "Name",
+    "create": "Create key",
+    "empty": "No API keys yet.",
+    "revoke": "Revoke",
+    "revoked": "revoked",
+    "lastUsed": "last used",
+    "neverUsed": "never used",
+    "secretOnce": "Copy your key now — it won't be shown again.",
+    "copy": "Copy",
+    "copied": "Copied",
+    "dismiss": "Dismiss"
   }
 }
