@@ -722,3 +722,13 @@ Driven by a production-readiness audit. Every change proven by live execution (s
 ## Compliance — full framework alignment (2026-07-28)
 
 Closed the gap between what the landing page advertises (OWASP · NIST · ISO 27001 · PCI DSS) and what the engine actually maps. `modules/compliance/catalog.py` expanded from 8 to **18 CWEs**, and every entry now maps across all four frameworks where sensible — **ISO/IEC 27001:2022 Annex A** (A.8.28 secure coding, A.8.24 cryptography, A.8.5 authentication, A.8.3 access, A.8.9 configuration, A.5.14 transfer) and **PCI DSS v4.0** now have broad coverage (≥10 CWEs each), alongside the existing OWASP/NIST/CIS. Added common nuclei CWEs (319 cleartext, 311/327 crypto, 918 SSRF, 22 path traversal, 94 code injection, 16/548 misconfig, 306 missing auth, 538 file exposure). New `framework_name()` humanizes keys (`iso27001` → `ISO/IEC 27001`), surfaced via a `framework_label` computed field on `ComplianceMappingRead` and used in the vuln UI + PDF reports. Tests assert 4-framework coverage, ≥10 ISO/PCI mappings, and no blank controls. Suite **79 passed**.
+
+## Phase 3 — Subscription plans + usage limits (2026-07-28)
+
+Monetization *architecture* (no payment processor yet — it plugs in behind this). `modules/billing/`:
+- **Plan catalog** (`plans.py`): static, keyed by `workspace.plan_tier` — `free` (2 projects / 5 targets / 10 scans-per-month, $0), `pro` (25 / 200 / 500, $99), `enterprise` (unlimited). **`pilot` is the default/existing tier and is intentionally UNLIMITED**, so existing + test workspaces are never retroactively capped — limits only bite when a workspace opts into free/pro. Unknown/legacy tiers fall back to unlimited (never accidentally block).
+- **Enforcement** wired into `create_project` / `create_target` / `create_scan` → **HTTP 402 Payment Required** when a quota is hit (scan quota counts the current calendar month).
+- **Endpoints**: `GET /plans` (public pricing catalog, no auth), `GET /workspaces/{id}/billing/usage` (`workspace:view`), `PATCH /workspaces/{id}/billing/plan` (`workspace:manage`).
+- **Frontend**: `PlanUsage` widget on the dashboard — plan name + price, per-quota usage bars (amber near limit, rose at limit), and a plan selector to upgrade. 7-language i18n (223 keys).
+- **Tests** (`test_billing.py`): pure plan/`_over` logic, public catalog, default-unlimited, tier validation (400), and live **402** enforcement on project + target limits. Full suite **86 passed**.
+- **Deferred**: real payment processor (Stripe) + invoices/webhooks; per-plan feature gating (e.g. active-testing or AI only on paid); annual pricing. The enforcement seam is ready for all of these.
