@@ -5,6 +5,7 @@ require reportlab to be installed."""
 import html
 from datetime import datetime, timezone
 
+from apps.api.modules.compliance.catalog import framework_name
 from apps.api.modules.reports.data import ReportData, VulnRow
 
 _SEVERITY_COLORS = {
@@ -97,7 +98,7 @@ def render_executive(data: ReportData) -> bytes:
     story.append(Paragraph("Compliance coverage", styles["H2"]))
     story.append(
         Paragraph(
-            "Findings mapped to controls in: " + (", ".join(fw.upper() for fw in frameworks) or "none")
+            "Findings mapped to controls in: " + (", ".join(framework_name(fw) for fw in frameworks) or "none")
             + ". See the technical report for per-finding control mappings.",
             styles["Body"],
         )
@@ -162,7 +163,7 @@ def _finding_block(idx, v: VulnRow, styles, colors, Paragraph, Table, TableStyle
     if v.risk_rationale:
         parts.append(Paragraph(f"Risk: {_esc(v.risk_rationale)}", styles["Small"]))
     if v.compliance:
-        controls = "; ".join(f"{fw.upper()} {cid}" for (fw, cid, _) in v.compliance)
+        controls = "; ".join(f"{framework_name(fw)} {cid}" for (fw, cid, _) in v.compliance)
         parts.append(Paragraph(f"Compliance: {_esc(controls)}", styles["Small"]))
     if v.evidence_uris:
         parts.append(Paragraph("Evidence:", styles["Small"]))

@@ -183,7 +183,8 @@ function VulnDetail({
             <ul className="space-y-1">
               {compliance.map((c, i) => (
                 <li key={i} className="text-slate-300">
-                  <span className="font-mono text-indigo-300">{c.framework}</span> {c.control_id}
+                  <span className="font-medium text-accent-cyan">{c.framework_label}</span>{" "}
+                  <span dir="ltr">{c.control_id}</span>
                   {c.control_description && <span className="text-slate-500"> — {c.control_description}</span>}
                 </li>
               ))}

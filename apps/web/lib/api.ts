@@ -233,7 +233,9 @@ export interface Vulnerability {
 export interface RiskScore {
   final_risk_score: number | null; asset_criticality_weight: number; business_impact_score: number | null; rationale: string | null;
 }
-export interface ComplianceMapping { framework: string; control_id: string; control_description: string | null; }
+export interface ComplianceMapping {
+  framework: string; framework_label: string; control_id: string; control_description: string | null;
+}
 export interface Remediation {
   summary: string | null; steps: string[]; references: { title: string; url: string }[]; generated_by: string;
 }
