@@ -123,9 +123,15 @@ def test_scan_created_when_target_verified(client: TestClient, no_celery_dispatc
     assert any(s["id"] == body["id"] for s in listed.json())
 
 
-def test_use_ai_planner_flag_persisted_to_config(client: TestClient, no_celery_dispatch) -> None:
+def test_use_ai_planner_flag_persisted_to_config(client: TestClient, no_celery_dispatch, monkeypatch) -> None:
     # Regression: the use_ai_planner flag must reach scan.config, or the
     # orchestrator's AI-planning branch is unreachable (dead code).
+    # AI planning now requires a configured key at creation time, so provide a
+    # dummy one (the scan is never dispatched here, so Claude is never called).
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "anthropic_api_key", "sk-test-dummy")
+
     owner = _register(client, "Owner")
     workspace_id, project_id, target_id = _make_target(client, _auth(owner))
     _verify_target(client, _auth(owner), workspace_id, project_id, target_id)
@@ -142,6 +148,31 @@ def test_use_ai_planner_flag_persisted_to_config(client: TestClient, no_celery_d
     )
     assert resp.status_code == 202, resp.text
     assert resp.json()["config"]["use_ai_planner"] is True
+
+
+def test_use_ai_planner_without_key_is_rejected(client: TestClient, no_celery_dispatch, monkeypatch) -> None:
+    # With no ANTHROPIC_API_KEY, requesting the AI planner must be rejected at
+    # creation (clear 400) rather than creating a scan that instantly fail-fasts.
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "anthropic_api_key", "")
+
+    owner = _register(client, "Owner")
+    workspace_id, project_id, target_id = _make_target(client, _auth(owner))
+    _verify_target(client, _auth(owner), workspace_id, project_id, target_id)
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans",
+        headers=_auth(owner),
+        json={
+            "target_id": target_id,
+            "scan_type": "network",
+            "requested_modules": ["naabu"],
+            "use_ai_planner": True,
+        },
+    )
+    assert resp.status_code == 400
+    assert "ANTHROPIC_API_KEY" in resp.json()["detail"]
 
 
 def test_outsider_cannot_read_scans(client: TestClient, no_celery_dispatch) -> None:
