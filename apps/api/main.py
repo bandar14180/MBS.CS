@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from apps.api.core.config import get_settings
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.assistant.router import router as assistant_router
+from apps.api.modules.audit.router import router as audit_router
 from apps.api.modules.auth.router import router as auth_router
 from apps.api.modules.billing.router import public_router as plans_public_router
 from apps.api.modules.billing.router import router as billing_router
@@ -47,6 +48,7 @@ app.include_router(assistant_router, prefix=settings.api_v1_prefix)
 app.include_router(billing_router, prefix=settings.api_v1_prefix)
 app.include_router(plans_public_router, prefix=settings.api_v1_prefix)
 app.include_router(notifications_router, prefix=settings.api_v1_prefix)
+app.include_router(audit_router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/health")

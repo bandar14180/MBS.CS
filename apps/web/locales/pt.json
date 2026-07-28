@@ -262,5 +262,15 @@
     "title": "Notificações",
     "markAllRead": "Marcar todas como lidas",
     "empty": "Nenhuma notificação ainda."
+  },
+  "audit": {
+    "title": "Registro de auditoria",
+    "subtitle": "Atividade relevante para a segurança neste espaço de trabalho.",
+    "empty": "Nenhum evento de auditoria ainda.",
+    "denied": "Você precisa de permissão de gerenciamento do espaço de trabalho para ver o registro de auditoria.",
+    "action": "Ação",
+    "actor": "Autor",
+    "detail": "Detalhe",
+    "when": "Quando"
   }
 }

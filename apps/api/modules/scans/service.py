@@ -82,6 +82,13 @@ async def create_scan(
 
     async_result = run_scan_task.delay(str(scan.id))
     scan.celery_task_id = async_result.id
+
+    from apps.api.modules.audit import service as audit
+
+    await audit.record(
+        db, workspace_id, initiated_by, "scan.created", "scan",
+        resource_id=scan.id, detail=f"{scan_type}: {', '.join(requested_modules)}",
+    )
     await db.commit()
     await db.refresh(scan)
 

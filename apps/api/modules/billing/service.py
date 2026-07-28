@@ -95,7 +95,9 @@ async def get_usage(db: AsyncSession, workspace_id: uuid.UUID) -> dict:
     }
 
 
-async def set_plan(db: AsyncSession, workspace_id: uuid.UUID, tier: str) -> dict:
+async def set_plan(
+    db: AsyncSession, workspace_id: uuid.UUID, tier: str, actor_user_id: uuid.UUID | None = None
+) -> dict:
     if tier not in SELECTABLE_TIERS:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -104,7 +106,15 @@ async def set_plan(db: AsyncSession, workspace_id: uuid.UUID, tier: str) -> dict
     workspace = await db.get(Workspace, workspace_id)
     if workspace is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
+    previous = workspace.plan_tier
     workspace.plan_tier = tier
+
+    from apps.api.modules.audit import service as audit
+
+    await audit.record(
+        db, workspace_id, actor_user_id, "plan.changed", "workspace",
+        resource_id=workspace_id, detail=f"{previous} -> {tier}",
+    )
     await db.commit()
     return await get_usage(db, workspace_id)
 

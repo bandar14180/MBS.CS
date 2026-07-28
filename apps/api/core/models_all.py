@@ -7,6 +7,7 @@ across modules fail to resolve (NoReferencedTableError).
 
 from apps.api.ai_agent import models as ai_agent_models  # noqa: F401
 from apps.api.modules.assets import models as assets_models  # noqa: F401
+from apps.api.modules.audit import models as audit_models  # noqa: F401
 from apps.api.modules.auth import models as auth_models  # noqa: F401
 from apps.api.modules.authorization_scope import models as authorization_scope_models  # noqa: F401
 from apps.api.modules.compliance import models as compliance_models  # noqa: F401

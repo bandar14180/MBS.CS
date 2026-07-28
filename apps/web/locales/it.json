@@ -262,5 +262,15 @@
     "title": "Notifiche",
     "markAllRead": "Segna tutte come lette",
     "empty": "Ancora nessuna notifica."
+  },
+  "audit": {
+    "title": "Registro di audit",
+    "subtitle": "Attività rilevante per la sicurezza in questo spazio di lavoro.",
+    "empty": "Ancora nessun evento di audit.",
+    "denied": "Serve il permesso di gestione dello spazio di lavoro per vedere il registro di audit.",
+    "action": "Azione",
+    "actor": "Autore",
+    "detail": "Dettaglio",
+    "when": "Quando"
   }
 }

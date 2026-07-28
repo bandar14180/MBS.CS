@@ -262,5 +262,15 @@
     "title": "Notifications",
     "markAllRead": "Mark all read",
     "empty": "No notifications yet."
+  },
+  "audit": {
+    "title": "Audit log",
+    "subtitle": "Security-relevant activity in this workspace.",
+    "empty": "No audit events yet.",
+    "denied": "You need workspace-manage permission to view the audit log.",
+    "action": "Action",
+    "actor": "Actor",
+    "detail": "Detail",
+    "when": "When"
   }
 }

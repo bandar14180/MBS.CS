@@ -262,5 +262,15 @@
     "title": "Notifications",
     "markAllRead": "Tout marquer comme lu",
     "empty": "Aucune notification pour l'instant."
+  },
+  "audit": {
+    "title": "Journal d'audit",
+    "subtitle": "Activité liée à la sécurité dans cet espace de travail.",
+    "empty": "Aucun événement d'audit pour l'instant.",
+    "denied": "Vous avez besoin de la permission de gestion de l'espace de travail pour voir le journal d'audit.",
+    "action": "Action",
+    "actor": "Acteur",
+    "detail": "Détail",
+    "when": "Quand"
   }
 }

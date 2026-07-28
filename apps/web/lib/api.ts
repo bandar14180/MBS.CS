@@ -127,6 +127,11 @@ export const dashboardApi = {
   summary: () => api<DashboardSummary>(ws("/dashboard/summary")),
 };
 
+// ---- Audit log ----
+export const auditApi = {
+  list: () => api<AuditEvent[]>(ws("/audit")),
+};
+
 // ---- Notifications ----
 export const notificationApi = {
   list: (unread = false) => api<AppNotification[]>(ws(`/notifications${unread ? "?unread=true" : ""}`)),
@@ -295,6 +300,10 @@ export interface DashboardSummary {
   scans: { total: number; queued: number; running: number; completed: number; failed: number };
   vulnerabilities: { total: number; active: number; by_severity: SeverityCounts };
   recent_scans: RecentScan[];
+}
+export interface AuditEvent {
+  id: string; actor_user_id: string | null; actor_email: string | null; action: string;
+  resource_type: string; resource_id: string | null; detail: string | null; created_at: string;
 }
 export interface AppNotification {
   id: string; project_id: string | null; scan_id: string | null; type: string;

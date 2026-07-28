@@ -262,5 +262,15 @@
     "title": "Pemberitahuan",
     "markAllRead": "Tanda semua dibaca",
     "empty": "Belum ada pemberitahuan."
+  },
+  "audit": {
+    "title": "Log audit",
+    "subtitle": "Aktiviti berkaitan keselamatan dalam ruang kerja ini.",
+    "empty": "Belum ada peristiwa audit.",
+    "denied": "Anda memerlukan kebenaran urus-ruang-kerja untuk melihat log audit.",
+    "action": "Tindakan",
+    "actor": "Pelaku",
+    "detail": "Butiran",
+    "when": "Bila"
   }
 }

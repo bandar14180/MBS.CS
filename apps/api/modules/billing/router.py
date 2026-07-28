@@ -24,4 +24,4 @@ async def get_usage(db: DbDep, ctx: WorkspaceContextDep) -> UsageRead:
 
 @router.patch("/plan", response_model=UsageRead, dependencies=[Depends(require_permission("workspace:manage"))])
 async def set_plan(payload: PlanUpdate, db: DbDep, ctx: WorkspaceContextDep) -> UsageRead:
-    return UsageRead(**await service.set_plan(db, ctx.workspace_id, payload.tier))
+    return UsageRead(**await service.set_plan(db, ctx.workspace_id, payload.tier, ctx.member.user_id))

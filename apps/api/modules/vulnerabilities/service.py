@@ -133,6 +133,13 @@ async def set_status(
     vuln.status_justification = justification
     vuln.status_changed_by = changed_by
     vuln.status_changed_at = datetime.now(timezone.utc)
+
+    from apps.api.modules.audit import service as audit
+
+    await audit.record(
+        db, workspace_id, changed_by, "vulnerability.status_changed", "vulnerability",
+        resource_id=vuln_id, detail=f"{new_status}: {justification}",
+    )
     await db.commit()
     await db.refresh(vuln)
     return vuln
