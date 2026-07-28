@@ -28,6 +28,19 @@ async def create_scan(
     if unknown:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown tool module(s): {', '.join(unknown)}")
 
+    # AI planning needs a configured key. Reject at creation time with a clear
+    # message rather than letting the scan fail-fast at runtime with a confusing
+    # "all stages skipped" result. (Fail-fast, but at the right layer.)
+    if use_ai_planner:
+        from apps.api.core.config import get_settings
+
+        if not get_settings().anthropic_api_key:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "AI planner requires ANTHROPIC_API_KEY to be configured. Turn off "
+                "'Use AI planner' to run the scan without AI, or set a key in .env.",
+            )
+
     # The guardrail: no verified authorization scope, no scan. See
     # authorization_scope.service.require_verified_target.
     scope = await require_verified_target(db, workspace_id, project_id, target_id)
