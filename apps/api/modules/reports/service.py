@@ -8,6 +8,7 @@ from apps.api.modules.projects.service import get_project
 from apps.api.modules.reports import render, storage
 from apps.api.modules.reports.data import gather_report_data
 from apps.api.modules.reports.models import Report
+from apps.api.modules.scans.models import Scan
 
 
 async def create_report(
@@ -19,6 +20,20 @@ async def create_report(
     generated_by: uuid.UUID,
 ) -> Report:
     await get_project(db, workspace_id, project_id)  # 404s if project isn't in this workspace
+
+    # Report generation is gated on a real, successful assessment. Under the
+    # fail-fast pipeline a scan reaches "completed" only if EVERY tool succeeded,
+    # so requiring one completed scan means: never a report over a failed or
+    # non-existent assessment (blueprint: no report unless the pipeline passed).
+    completed = await db.scalar(
+        select(Scan.id).where(Scan.project_id == project_id, Scan.status == "completed").limit(1)
+    )
+    if completed is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No completed scan to report on. Run a scan that finishes successfully "
+            "before generating a report.",
+        )
 
     # Generate synchronously (fast for typical projects). If reports grow heavy
     # this can move to a Celery task like scans, without changing the API shape.

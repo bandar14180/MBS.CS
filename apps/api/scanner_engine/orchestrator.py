@@ -4,7 +4,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.assets.models import Asset
@@ -27,15 +27,10 @@ class AuthorizationRevoked(Exception):
     time (revoked/expired between queueing and running)."""
 
 
-def _resolve_scan_status(executed: int, failed: int) -> str:
-    """A scan's status must honestly reflect its tools. All executed tools failed
-    -> "failed"; some failed -> "completed_with_errors"; none failed -> "completed".
-    (skipped_unauthorized / skipped-not-applicable runs are not counted here.)"""
-    if executed and failed == executed:
-        return "failed"
-    if failed:
-        return "completed_with_errors"
-    return "completed"
+class ToolExecutionError(Exception):
+    """A pipeline tool failed (raised an error or returned a non-zero exit code).
+    Raising this aborts the scan fail-fast: no later tools run, no report is
+    generated, and the scan is marked failed with the exact error."""
 
 
 async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
@@ -88,44 +83,24 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # re-order/prune, never introduce a tool. Default off -> deterministic
         # phase order, unchanged behavior for every existing scan.
         #
-        # AI planning is an enhancement, not a dependency: if it fails (no API
-        # key, a transient API error, a malformed response) we fall back to the
-        # deterministic phase order rather than failing the whole scan -- the
-        # user's requested tools still run.
+        # FAIL-FAST: the user opted into AI planning, so if it cannot run (no key)
+        # or fails (API/parse error), the scan FAILS loudly -- we do NOT silently
+        # fall back and pretend AI was involved. The planner calls Claude before
+        # it writes anything, so a failure here leaves no pending DB state; the
+        # exception propagates to the outer handler which marks the scan failed.
         if scan.config.get("use_ai_planner"):
-            from apps.api.core.config import get_settings
+            from apps.api.ai_agent.planner import AIPlanner
 
-            if not get_settings().anthropic_api_key:
-                # Expected, user-controllable state -- NOT an error. A missing key
-                # just means "run without AI"; log it concisely (no traceback) and
-                # fall back to the deterministic phase order.
-                logger.info(
-                    "AI planning requested for scan %s but ANTHROPIC_API_KEY is unset; using deterministic order",
-                    scan.id,
-                )
-            else:
-                try:
-                    from apps.api.ai_agent.planner import AIPlanner
-
-                    plan = await AIPlanner().plan(
-                        db,
-                        scan_id=scan.id,
-                        target_type=target_row.type,
-                        target_value=target_row.value,
-                        requested_modules=requested,
-                        active_testing_allowed=scope.active_testing_allowed,
-                    )
-                    requested = plan.tool_sequence
-                    await db.commit()
-                except Exception:
-                    # A genuine, unexpected planner failure (API/parse error) --
-                    # keep the traceback. Fall back to the deterministic order.
-                    # The planner calls Claude before it writes anything, so a
-                    # failure here leaves no pending DB state -- `requested` is
-                    # untouched and the session stays valid, so we must NOT
-                    # rollback (that would expire scan/target_row and break the
-                    # async session).
-                    logger.warning("AI planning failed for scan %s; using deterministic order", scan.id, exc_info=True)
+            plan = await AIPlanner().plan(
+                db,
+                scan_id=scan.id,
+                target_type=target_row.type,
+                target_value=target_row.value,
+                requested_modules=requested,
+                active_testing_allowed=scope.active_testing_allowed,
+            )
+            requested = plan.tool_sequence
+            await db.commit()
 
         runners = [TOOL_REGISTRY[m]() for m in requested if m in TOOL_REGISTRY]
         # Deterministic recon pipeline: run in phase order regardless of the
@@ -169,17 +144,10 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # errored is NOT a success: if every executed tool failed -> "failed";
         # if some failed -> "completed_with_errors"; otherwise "completed".
         # (skipped_unauthorized runs are intentional, not failures.)
-        executed = await db.scalar(
-            select(func.count()).select_from(ToolRun).where(
-                ToolRun.scan_id == scan.id, ToolRun.status.in_(("completed", "failed"))
-            )
-        )
-        failed = await db.scalar(
-            select(func.count()).select_from(ToolRun).where(
-                ToolRun.scan_id == scan.id, ToolRun.status == "failed"
-            )
-        )
-        scan.status = _resolve_scan_status(executed or 0, failed or 0)
+        # Reached only if every tool ran cleanly -- any tool failure raised
+        # (fail-fast) and is handled below as a scan failure. There is no
+        # "partial success": a scan either fully completed or it failed.
+        scan.status = "completed"
     except Exception as exc:
         scan.status = "failed"
         scan.completed_at = datetime.now(timezone.utc)
@@ -257,6 +225,21 @@ async def _run_single_tool(
     db.add(evidence)
     await db.flush()  # need evidence.id to link vulnerabilities to it
 
+    # FAIL-FAST: a non-zero exit is a hard failure. Record it (with the exact
+    # error and the evidence we just stored for debugging), then abort -- do NOT
+    # parse partial findings, do NOT run later tools, do NOT generate a report.
+    if raw.exit_code != 0:
+        stderr_tail = (raw.stderr or "").strip()[-1000:]
+        tool_run.status = "failed"
+        tool_run.error_message = f"exit code {raw.exit_code}" + (f": {stderr_tail}" if stderr_tail else "")
+        tool_run.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        logger.error(
+            "tool.failed scan=%s tool=%s exit=%s duration=%.2fs error=%s",
+            scan.id, runner.name, raw.exit_code, time.monotonic() - started, tool_run.error_message,
+        )
+        raise ToolExecutionError(f"{runner.name} failed ({tool_run.error_message})")
+
     findings = runner.parse(raw)
     for finding in findings:
         await upsert_asset(
@@ -287,12 +270,8 @@ async def _run_single_tool(
         await upsert_risk_score(db, vuln.id, vuln.cvss_score, criticality)
         await sync_mappings(db, vuln.id, vuln.category)
 
-    tool_run.status = "completed" if raw.exit_code == 0 else "failed"
-    if raw.exit_code != 0:
-        # Ran but returned a non-zero code: surface the tail of stderr as the
-        # error so it's visible without digging into the evidence blob.
-        stderr_tail = (raw.stderr or "").strip()[-1000:]
-        tool_run.error_message = f"exit code {raw.exit_code}" + (f": {stderr_tail}" if stderr_tail else "")
+    # Reached only on a clean (exit 0) run -- failures raised above (fail-fast).
+    tool_run.status = "completed"
     tool_run.completed_at = datetime.now(timezone.utc)
     await db.commit()
 
