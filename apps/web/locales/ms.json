@@ -232,5 +232,14 @@
     "report": "laporan",
     "download": "Muat turun",
     "downloading": "Memuat turun…"
+  },
+  "billing": {
+    "planUsage": "Pelan & penggunaan",
+    "projects": "Projek",
+    "targets": "Sasaran",
+    "scansThisMonth": "Imbasan bulan ini",
+    "unlimited": "Tanpa had",
+    "changePlan": "Tukar pelan",
+    "perMonth": "/bln"
   }
 }

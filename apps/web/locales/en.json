@@ -232,5 +232,14 @@
     "report": "report",
     "download": "Download",
     "downloading": "Downloading…"
+  },
+  "billing": {
+    "planUsage": "Plan & usage",
+    "projects": "Projects",
+    "targets": "Targets",
+    "scansThisMonth": "Scans this month",
+    "unlimited": "Unlimited",
+    "changePlan": "Change plan",
+    "perMonth": "/mo"
   }
 }

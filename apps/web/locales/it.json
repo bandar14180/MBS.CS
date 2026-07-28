@@ -232,5 +232,14 @@
     "report": "report",
     "download": "Scarica",
     "downloading": "Download…"
+  },
+  "billing": {
+    "planUsage": "Piano e utilizzo",
+    "projects": "Progetti",
+    "targets": "Bersagli",
+    "scansThisMonth": "Scansioni questo mese",
+    "unlimited": "Illimitato",
+    "changePlan": "Cambia piano",
+    "perMonth": "/mese"
   }
 }

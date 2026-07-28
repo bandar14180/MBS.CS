@@ -232,5 +232,14 @@
     "report": "rapport",
     "download": "Télécharger",
     "downloading": "Téléchargement…"
+  },
+  "billing": {
+    "planUsage": "Forfait et utilisation",
+    "projects": "Projets",
+    "targets": "Cibles",
+    "scansThisMonth": "Analyses ce mois-ci",
+    "unlimited": "Illimité",
+    "changePlan": "Changer de forfait",
+    "perMonth": "/mois"
   }
 }

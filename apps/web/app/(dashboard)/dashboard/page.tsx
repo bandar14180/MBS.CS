@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { dashboardApi, projectApi, type DashboardSummary, type Project } from "@/lib/api";
 import { useTranslation } from "@/lib/i18n";
 import { Badge, Button, Card, ErrorText, Input, Label, Spinner } from "@/components/ui";
+import { PlanUsage } from "@/components/PlanUsage";
 
 export default function DashboardPage() {
   const { t } = useTranslation();
@@ -86,6 +87,7 @@ export default function DashboardPage() {
         <EmptyState onCreate={() => setShowNew(true)} />
       ) : (
         <>
+          <PlanUsage />
           <StatCards summary={summary!} />
           <RecentScans summary={summary!} />
           <ProjectsGrid projects={projects} />

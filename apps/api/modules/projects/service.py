@@ -10,6 +10,9 @@ from apps.api.modules.projects.models import Project, Target
 async def create_project(
     db: AsyncSession, workspace_id: uuid.UUID, creator_id: uuid.UUID, name: str, description: str | None
 ) -> Project:
+    from apps.api.modules.billing import service as billing
+
+    await billing.enforce_project_quota(db, workspace_id)
     project = Project(workspace_id=workspace_id, name=name, description=description, created_by=creator_id)
     db.add(project)
     await db.commit()
@@ -69,6 +72,10 @@ async def create_target(
     criticality: str = "medium",
 ) -> Target:
     await get_project(db, workspace_id, project_id)  # 404s if project isn't in this workspace
+
+    from apps.api.modules.billing import service as billing
+
+    await billing.enforce_target_quota(db, workspace_id)
     target = Target(
         project_id=project_id, type=target_type, value=value, added_by=added_by, criticality=criticality
     )

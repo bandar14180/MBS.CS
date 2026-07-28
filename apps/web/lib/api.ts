@@ -127,6 +127,13 @@ export const dashboardApi = {
   summary: () => api<DashboardSummary>(ws("/dashboard/summary")),
 };
 
+// ---- Billing / plans ----
+export const billingApi = {
+  usage: () => api<Usage>(ws("/billing/usage")),
+  setPlan: (tier: string) => api<Usage>(ws("/billing/plan"), { method: "PATCH", body: { tier } }),
+  plans: () => api<PlanCatalogItem[]>("/plans", { auth: false }),
+};
+
 // ---- Projects / targets / scope ----
 export const projectApi = {
   list: () => api<Project[]>(ws("/projects")),
@@ -254,4 +261,15 @@ export interface DashboardSummary {
   scans: { total: number; queued: number; running: number; completed: number; failed: number };
   vulnerabilities: { total: number; active: number; by_severity: SeverityCounts };
   recent_scans: RecentScan[];
+}
+export interface Usage {
+  plan_tier: string;
+  plan_name: string;
+  price_usd_month: number;
+  usage: { projects: number; targets: number; scans_this_month: number };
+  limits: { projects: number | null; targets: number | null; scans_per_month: number | null };
+}
+export interface PlanCatalogItem {
+  tier: string; name: string; price_usd_month: number;
+  max_projects: number | null; max_targets: number | null; max_scans_per_month: number | null;
 }

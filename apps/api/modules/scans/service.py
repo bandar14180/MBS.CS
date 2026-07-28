@@ -24,6 +24,10 @@ async def create_scan(
 ) -> Scan:
     await get_target(db, workspace_id, project_id, target_id)  # 404s if target isn't in this project/workspace
 
+    from apps.api.modules.billing import service as billing
+
+    await billing.enforce_scan_quota(db, workspace_id)
+
     unknown = [m for m in requested_modules if m not in TOOL_REGISTRY]
     if unknown:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown tool module(s): {', '.join(unknown)}")

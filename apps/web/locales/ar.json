@@ -232,5 +232,14 @@
     "report": "تقرير",
     "download": "تنزيل",
     "downloading": "جارٍ التنزيل…"
+  },
+  "billing": {
+    "planUsage": "الخطة والاستخدام",
+    "projects": "المشاريع",
+    "targets": "الأهداف",
+    "scansThisMonth": "الفحوصات هذا الشهر",
+    "unlimited": "غير محدود",
+    "changePlan": "تغيير الخطة",
+    "perMonth": "/شهرياً"
   }
 }

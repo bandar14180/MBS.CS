@@ -232,5 +232,14 @@
     "report": "relatório",
     "download": "Baixar",
     "downloading": "Baixando…"
+  },
+  "billing": {
+    "planUsage": "Plano e uso",
+    "projects": "Projetos",
+    "targets": "Alvos",
+    "scansThisMonth": "Varreduras este mês",
+    "unlimited": "Ilimitado",
+    "changePlan": "Alterar plano",
+    "perMonth": "/mês"
   }
 }
