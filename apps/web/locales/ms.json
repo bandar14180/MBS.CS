@@ -288,5 +288,27 @@
     "copy": "Salin",
     "copied": "Disalin",
     "dismiss": "Tolak"
+  },
+  "profile": {
+    "title": "Profil",
+    "email": "E-mel",
+    "fullName": "Nama penuh",
+    "save": "Simpan",
+    "saved": "Disimpan",
+    "changePassword": "Tukar kata laluan",
+    "currentPassword": "Kata laluan semasa",
+    "newPassword": "Kata laluan baharu (minimum 8 aksara)",
+    "updatePassword": "Kemas kini kata laluan",
+    "passwordChanged": "Kata laluan ditukar"
+  },
+  "team": {
+    "title": "Pasukan",
+    "subtitle": "Jemput rakan sepasukan dan urus peranan mereka.",
+    "denied": "Anda memerlukan kebenaran urus-ruang-kerja untuk mengurus pasukan.",
+    "inviteEmail": "E-mel",
+    "role": "Peranan",
+    "invite": "Jemput",
+    "empty": "Belum ada ahli pasukan.",
+    "remove": "Buang"
   }
 }

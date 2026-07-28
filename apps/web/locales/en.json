@@ -288,5 +288,27 @@
     "copy": "Copy",
     "copied": "Copied",
     "dismiss": "Dismiss"
+  },
+  "profile": {
+    "title": "Profile",
+    "email": "Email",
+    "fullName": "Full name",
+    "save": "Save",
+    "saved": "Saved",
+    "changePassword": "Change password",
+    "currentPassword": "Current password",
+    "newPassword": "New password (min 8 characters)",
+    "updatePassword": "Update password",
+    "passwordChanged": "Password changed"
+  },
+  "team": {
+    "title": "Team",
+    "subtitle": "Invite teammates and manage their roles.",
+    "denied": "You need workspace-manage permission to manage the team.",
+    "inviteEmail": "Email",
+    "role": "Role",
+    "invite": "Invite",
+    "empty": "No team members yet.",
+    "remove": "Remove"
   }
 }

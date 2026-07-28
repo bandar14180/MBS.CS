@@ -288,5 +288,27 @@
     "copy": "Copiar",
     "copied": "Copiado",
     "dismiss": "Dispensar"
+  },
+  "profile": {
+    "title": "Perfil",
+    "email": "E-mail",
+    "fullName": "Nome completo",
+    "save": "Salvar",
+    "saved": "Salvo",
+    "changePassword": "Alterar senha",
+    "currentPassword": "Senha atual",
+    "newPassword": "Nova senha (mínimo 8 caracteres)",
+    "updatePassword": "Atualizar senha",
+    "passwordChanged": "Senha alterada"
+  },
+  "team": {
+    "title": "Equipe",
+    "subtitle": "Convide colegas e gerencie suas funções.",
+    "denied": "Você precisa de permissão de gerenciamento do espaço de trabalho para gerenciar a equipe.",
+    "inviteEmail": "E-mail",
+    "role": "Função",
+    "invite": "Convidar",
+    "empty": "Nenhum membro da equipe ainda.",
+    "remove": "Remover"
   }
 }

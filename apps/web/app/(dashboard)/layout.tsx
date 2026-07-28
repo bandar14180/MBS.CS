@@ -46,6 +46,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <Link href="/dashboard" className="block rounded-lg px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5">
               {t("dashboard.projects")}
             </Link>
+            <Link href="/team" className="block rounded-lg px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5">
+              {t("team.title")}
+            </Link>
             <Link href="/audit" className="block rounded-lg px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5">
               {t("audit.title")}
             </Link>
@@ -61,7 +64,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <div>
               <div className="mb-1 px-1 text-xs text-slate-500">{t("dashboard.workspace")}</div>
               <div className="truncate px-1 text-sm text-slate-300">{workspaceName}</div>
-              <div className="truncate px-1 text-xs text-slate-500">{user.email}</div>
+              <Link href="/profile" className="block truncate px-1 text-xs text-slate-500 transition hover:text-accent-cyan">
+                {user.email}
+              </Link>
             </div>
             <Button variant="ghost" className="w-full justify-start" onClick={logout}>
               {t("dashboard.signOut")}

@@ -288,5 +288,27 @@
     "copy": "Copiar",
     "copied": "Copiado",
     "dismiss": "Descartar"
+  },
+  "profile": {
+    "title": "Perfil",
+    "email": "Correo electrónico",
+    "fullName": "Nombre completo",
+    "save": "Guardar",
+    "saved": "Guardado",
+    "changePassword": "Cambiar contraseña",
+    "currentPassword": "Contraseña actual",
+    "newPassword": "Nueva contraseña (mínimo 8 caracteres)",
+    "updatePassword": "Actualizar contraseña",
+    "passwordChanged": "Contraseña cambiada"
+  },
+  "team": {
+    "title": "Equipo",
+    "subtitle": "Invita a compañeros y gestiona sus roles.",
+    "denied": "Necesitas permiso de gestión del espacio de trabajo para gestionar el equipo.",
+    "inviteEmail": "Correo electrónico",
+    "role": "Rol",
+    "invite": "Invitar",
+    "empty": "Aún no hay miembros del equipo.",
+    "remove": "Eliminar"
   }
 }

@@ -116,6 +116,28 @@ export const authApi = {
   me: () => api<User>("/users/me"),
 };
 
+// ---- Profile ----
+export const profileApi = {
+  update: (full_name: string) => api<User>("/users/me", { method: "PATCH", body: { full_name } }),
+  changePassword: (current_password: string, new_password: string) =>
+    api<Response>("/users/me/change-password", {
+      method: "POST",
+      body: { current_password, new_password },
+      raw: true,
+    }),
+};
+
+// ---- Team / members ----
+export const memberApi = {
+  list: () => api<Member[]>(ws("/members")),
+  roles: () => api<Role[]>("/roles"),
+  invite: (email: string, role_name: string) =>
+    api<Member>(ws("/members/invite"), { method: "POST", body: { email, role_name } }),
+  updateRole: (userId: string, role_name: string) =>
+    api<Member>(ws(`/members/${userId}/role`), { method: "PATCH", body: { role_name } }),
+  remove: (userId: string) => api<Response>(ws(`/members/${userId}`), { method: "DELETE", raw: true }),
+};
+
 // ---- Workspaces ----
 export const workspaceApi = {
   list: () => api<Workspace[]>("/workspaces"),
@@ -259,6 +281,11 @@ export const reportApi = {
 
 // ---- Types ----
 export interface User { id: string; email: string; full_name: string; }
+export interface Member {
+  id: string; user_id: string; email: string; full_name: string; role_name: string;
+  invited_at: string; joined_at: string | null;
+}
+export interface Role { id: string; workspace_id: string | null; name: string; description: string | null; }
 export interface Workspace { id: string; name: string; plan_tier: string; }
 export interface Project { id: string; name: string; description: string | null; status: string; created_at: string; }
 export interface Target { id: string; type: string; value: string; criticality: string; created_at: string; }
