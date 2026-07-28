@@ -156,6 +156,7 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             "scan.failed scan=%s duration=%.2fs error=%s",
             scan.id, time.monotonic() - scan_started, exc, exc_info=True,
         )
+        await _emit_scan_notification(db, scan)
         raise
 
     scan.completed_at = datetime.now(timezone.utc)
@@ -164,6 +165,19 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         "scan.finished scan=%s status=%s duration=%.2fs tools_run=%d",
         scan.id, scan.status, time.monotonic() - scan_started, len(runners),
     )
+    await _emit_scan_notification(db, scan)
+
+
+async def _emit_scan_notification(db: AsyncSession, scan: Scan) -> None:
+    """Best-effort in-app notification for a finished scan -- a failure here must
+    never affect the scan outcome. Runs with the workspace RLS GUC already set."""
+    try:
+        from apps.api.modules.notifications.service import notify_scan_finished
+
+        await notify_scan_finished(db, scan)
+        await db.commit()
+    except Exception:
+        logger.warning("scan.notify_failed scan=%s", scan.id, exc_info=True)
 
 
 async def _run_single_tool(

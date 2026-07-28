@@ -7,6 +7,7 @@ from apps.api.modules.assistant.router import router as assistant_router
 from apps.api.modules.auth.router import router as auth_router
 from apps.api.modules.billing.router import public_router as plans_public_router
 from apps.api.modules.billing.router import router as billing_router
+from apps.api.modules.notifications.router import router as notifications_router
 from apps.api.modules.authorization_scope.router import router as authorization_scope_router
 from apps.api.modules.dashboard.router import router as dashboard_router
 from apps.api.modules.projects.router import router as projects_router
@@ -45,6 +46,7 @@ app.include_router(reports_router, prefix=settings.api_v1_prefix)
 app.include_router(assistant_router, prefix=settings.api_v1_prefix)
 app.include_router(billing_router, prefix=settings.api_v1_prefix)
 app.include_router(plans_public_router, prefix=settings.api_v1_prefix)
+app.include_router(notifications_router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/health")

@@ -127,6 +127,14 @@ export const dashboardApi = {
   summary: () => api<DashboardSummary>(ws("/dashboard/summary")),
 };
 
+// ---- Notifications ----
+export const notificationApi = {
+  list: (unread = false) => api<AppNotification[]>(ws(`/notifications${unread ? "?unread=true" : ""}`)),
+  unreadCount: () => api<{ count: number }>(ws("/notifications/unread-count")),
+  markRead: (id: string) => api<Response>(ws(`/notifications/${id}/read`), { method: "POST", raw: true }),
+  markAllRead: () => api<Response>(ws("/notifications/read-all"), { method: "POST", raw: true }),
+};
+
 // ---- Billing / plans ----
 export const billingApi = {
   usage: () => api<Usage>(ws("/billing/usage")),
@@ -287,6 +295,10 @@ export interface DashboardSummary {
   scans: { total: number; queued: number; running: number; completed: number; failed: number };
   vulnerabilities: { total: number; active: number; by_severity: SeverityCounts };
   recent_scans: RecentScan[];
+}
+export interface AppNotification {
+  id: string; project_id: string | null; scan_id: string | null; type: string;
+  severity: string; title: string; body: string | null; read: boolean; created_at: string;
 }
 export interface Usage {
   plan_tier: string;

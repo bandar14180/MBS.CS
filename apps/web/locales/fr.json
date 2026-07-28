@@ -257,5 +257,10 @@
     "disable": "Désactiver",
     "delete": "Supprimer",
     "lastError": "Dernière erreur"
+  },
+  "notifications": {
+    "title": "Notifications",
+    "markAllRead": "Tout marquer comme lu",
+    "empty": "Aucune notification pour l'instant."
   }
 }

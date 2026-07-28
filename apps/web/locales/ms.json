@@ -257,5 +257,10 @@
     "disable": "Lumpuhkan",
     "delete": "Padam",
     "lastError": "Ralat terakhir"
+  },
+  "notifications": {
+    "title": "Pemberitahuan",
+    "markAllRead": "Tanda semua dibaca",
+    "empty": "Belum ada pemberitahuan."
   }
 }

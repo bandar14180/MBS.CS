@@ -9,6 +9,7 @@ import { useTranslation } from "@/lib/i18n";
 import { Button, Spinner } from "@/components/ui";
 import { AssistantProvider } from "@/components/assistant/AssistantWidget";
 import { LanguageSelector } from "@/components/LanguageSelector";
+import { NotificationBell } from "@/components/NotificationBell";
 import { Logo } from "@/components/landing/Logo";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
@@ -32,12 +33,15 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     <AssistantProvider>
       <div className="flex min-h-screen">
         <aside className="flex w-60 flex-col border-e border-cyber-border/60 bg-cyber-panel/40 p-4">
-          <Link href="/dashboard" className="mb-8 flex items-center gap-2.5">
-            <Logo className="h-8 w-8" />
-            <span className="text-lg font-semibold text-white">
-              MBS<span className="text-accent-cyan">.SC</span>
-            </span>
-          </Link>
+          <div className="mb-8 flex items-center justify-between gap-2">
+            <Link href="/dashboard" className="flex items-center gap-2.5">
+              <Logo className="h-8 w-8" />
+              <span className="text-lg font-semibold text-white">
+                MBS<span className="text-accent-cyan">.SC</span>
+              </span>
+            </Link>
+            <NotificationBell />
+          </div>
           <nav className="flex-1 space-y-1">
             <Link href="/dashboard" className="block rounded-lg px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5">
               {t("dashboard.projects")}

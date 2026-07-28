@@ -257,5 +257,10 @@
     "disable": "تعطيل",
     "delete": "حذف",
     "lastError": "آخر خطأ"
+  },
+  "notifications": {
+    "title": "الإشعارات",
+    "markAllRead": "تعليم الكل كمقروء",
+    "empty": "لا إشعارات بعد."
   }
 }

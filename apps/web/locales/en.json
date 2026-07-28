@@ -257,5 +257,10 @@
     "disable": "Disable",
     "delete": "Delete",
     "lastError": "Last error"
+  },
+  "notifications": {
+    "title": "Notifications",
+    "markAllRead": "Mark all read",
+    "empty": "No notifications yet."
   }
 }

@@ -257,5 +257,10 @@
     "disable": "Desativar",
     "delete": "Excluir",
     "lastError": "Último erro"
+  },
+  "notifications": {
+    "title": "Notificações",
+    "markAllRead": "Marcar todas como lidas",
+    "empty": "Nenhuma notificação ainda."
   }
 }
