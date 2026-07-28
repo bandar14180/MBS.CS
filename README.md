@@ -18,7 +18,7 @@
 - **Professional reports** — executive & technical PDFs (CVSS, evidence, remediation, compliance coverage).
 - **Continuous security** — recurring **scheduled scans** (Celery beat) + in-app **notifications/alerts** on completion and new critical findings.
 - **Commercial SaaS** — Free / Professional / Enterprise **plans with usage limits** (402 enforcement), per-workspace usage dashboard.
-- **Enterprise** — shared-schema multi-tenancy with **Postgres row-level security (FORCE)** on every tenant table, RBAC (owner/admin/member), authorization-scope ownership gate, and an **append-only audit log**.
+- **Enterprise** — shared-schema multi-tenancy with **Postgres row-level security (FORCE)** on every tenant table, RBAC (owner/admin/member), authorization-scope ownership gate, an **append-only audit log**, and **workspace API keys** for programmatic access.
 - **Global** — premium landing page + full dashboard in **7 languages** (English, Arabic (RTL), Malay, French, Portuguese, Italian, Spanish).
 
 ## Security model (highlights)
@@ -88,4 +88,4 @@ docker compose -f infra/docker-compose.yml exec web node scripts/check-i18n.js  
 
 - Payment processor (Stripe) behind the existing plan-enforcement seam.
 - Webhook/email notification channels (in-app alerts are done).
-- SSO (SAML/OIDC) and workspace API keys.
+- SSO (SAML/OIDC). Workspace API keys are done.
