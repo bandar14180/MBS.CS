@@ -147,6 +147,7 @@ export const workspaceApi = {
 // ---- Dashboard ----
 export const dashboardApi = {
   summary: () => api<DashboardSummary>(ws("/dashboard/summary")),
+  recommendations: () => api<Recommendation[]>(ws("/dashboard/recommendations")),
 };
 
 // ---- Audit log ----
@@ -348,6 +349,10 @@ export interface AuditEvent {
 export interface AppNotification {
   id: string; project_id: string | null; scan_id: string | null; type: string;
   severity: string; title: string; body: string | null; read: boolean; created_at: string;
+}
+export interface Recommendation {
+  vulnerability_id: string; project_id: string; project_name: string; title: string;
+  severity: string; cvss_score: number | null; category: string | null;
 }
 export interface Usage {
   plan_tier: string;

@@ -43,3 +43,13 @@ class DashboardSummary(BaseModel):
     scans: ScanStats
     vulnerabilities: VulnerabilityStats
     recent_scans: list[RecentScan]
+
+
+class Recommendation(BaseModel):
+    vulnerability_id: uuid.UUID
+    project_id: uuid.UUID
+    project_name: str
+    title: str
+    severity: str
+    cvss_score: float | None
+    category: str | None

@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.projects.models import Project, Target
@@ -8,11 +8,16 @@ from apps.api.modules.scans.models import Scan
 from apps.api.modules.vulnerabilities.models import Vulnerability
 from apps.api.modules.dashboard.schemas import (
     DashboardSummary,
+    Recommendation,
     RecentScan,
     ScanStats,
     SeverityCounts,
     VulnerabilityStats,
 )
+
+# Highest-attention active statuses, ordered severity rank for prioritization.
+_ACTIVE = ("open", "confirmed", "reopened")
+_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
 # Vulnerability lifecycle states that still demand attention.
 _ACTIVE_STATUSES = ("open", "confirmed", "reopened")
@@ -98,3 +103,44 @@ async def get_summary(db: AsyncSession, workspace_id: uuid.UUID) -> DashboardSum
         vulnerabilities=vulnerabilities,
         recent_scans=recent_scans,
     )
+
+
+async def get_recommendations(
+    db: AsyncSession, workspace_id: uuid.UUID, limit: int = 6
+) -> list[Recommendation]:
+    """The highest-priority active findings to fix next, workspace-wide, ordered
+    by severity then CVSS. This is the dashboard's 'Recommendations' surface."""
+    severity_order = case(
+        (Vulnerability.severity == "critical", 0),
+        (Vulnerability.severity == "high", 1),
+        (Vulnerability.severity == "medium", 2),
+        (Vulnerability.severity == "low", 3),
+        else_=4,
+    )
+    rows = await db.execute(
+        select(
+            Vulnerability.id,
+            Vulnerability.project_id,
+            Project.name,
+            Vulnerability.title,
+            Vulnerability.severity,
+            Vulnerability.cvss_score,
+            Vulnerability.category,
+        )
+        .join(Project, Project.id == Vulnerability.project_id)
+        .where(Project.workspace_id == workspace_id, Vulnerability.status.in_(_ACTIVE))
+        .order_by(severity_order, Vulnerability.cvss_score.desc().nullslast())
+        .limit(limit)
+    )
+    return [
+        Recommendation(
+            vulnerability_id=r[0],
+            project_id=r[1],
+            project_name=r[2],
+            title=r[3],
+            severity=r[4],
+            cvss_score=r[5],
+            category=r[6],
+        )
+        for r in rows
+    ]

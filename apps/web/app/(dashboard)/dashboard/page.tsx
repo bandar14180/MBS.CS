@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
-import { dashboardApi, projectApi, type DashboardSummary, type Project } from "@/lib/api";
+import { dashboardApi, projectApi, type DashboardSummary, type Project, type Recommendation } from "@/lib/api";
 import { useTranslation } from "@/lib/i18n";
 import { Badge, Button, Card, ErrorText, Input, Label, Spinner } from "@/components/ui";
 import { PlanUsage } from "@/components/PlanUsage";
@@ -89,6 +89,7 @@ export default function DashboardPage() {
         <>
           <PlanUsage />
           <StatCards summary={summary!} />
+          <Recommendations />
           <RecentScans summary={summary!} />
           <ProjectsGrid projects={projects} />
         </>
@@ -171,6 +172,43 @@ function StatCards({ summary }: { summary: DashboardSummary }) {
           )}
         </div>
       </Card>
+    </div>
+  );
+}
+
+function Recommendations() {
+  const { t } = useTranslation();
+  const [items, setItems] = useState<Recommendation[] | null>(null);
+
+  useEffect(() => {
+    dashboardApi.recommendations().then(setItems).catch(() => setItems([]));
+  }, []);
+
+  if (items === null || items.length === 0) return null;
+
+  return (
+    <div className="mt-8">
+      <h2 className="mb-1 text-sm font-medium uppercase tracking-wide text-slate-400">{t("recommendations.title")}</h2>
+      <p className="mb-3 text-xs text-slate-500">{t("recommendations.subtitle")}</p>
+      <div className="space-y-2">
+        {items.map((r) => (
+          <Link key={r.vulnerability_id} href={`/projects/${r.project_id}`}>
+            <Card className="flex items-center justify-between gap-3 transition hover:border-accent-cyan/40">
+              <div className="flex items-center gap-3">
+                <Badge kind="severity" value={r.severity} />
+                <div>
+                  <div className="text-sm font-medium text-slate-100">{r.title}</div>
+                  <div className="text-xs text-slate-500">
+                    {r.project_name}
+                    {r.cvss_score != null && ` · CVSS ${r.cvss_score}`}
+                  </div>
+                </div>
+              </div>
+              <span className="text-xs text-accent-cyan">{t("recommendations.review")}</span>
+            </Card>
+          </Link>
+        ))}
+      </div>
     </div>
   );
 }

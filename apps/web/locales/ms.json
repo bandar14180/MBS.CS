@@ -310,5 +310,10 @@
     "invite": "Jemput",
     "empty": "Belum ada ahli pasukan.",
     "remove": "Buang"
+  },
+  "recommendations": {
+    "title": "Cadangan",
+    "subtitle": "Penemuan keutamaan tertinggi untuk dibaiki seterusnya.",
+    "review": "Semak →"
   }
 }

@@ -310,5 +310,10 @@
     "invite": "Invitar",
     "empty": "Aún no hay miembros del equipo.",
     "remove": "Eliminar"
+  },
+  "recommendations": {
+    "title": "Recomendaciones",
+    "subtitle": "Hallazgos de mayor prioridad para corregir a continuación.",
+    "review": "Revisar →"
   }
 }
