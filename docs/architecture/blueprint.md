@@ -701,3 +701,20 @@ First slice of the "graduation project → commercial product" push. Public mark
 - **Landing page (`app/page.tsx`, was a login redirect)**: `LandingNav` (sticky, glass-on-scroll, language selector), `Hero` (headline/subtitle/CTAs + CSS dashboard-preview visual), `Services` (7 cards), `AgentsWorkflow` (the 5 AI agents + the Target→Recon→Analysis→Discovery→Validation→Risk→Report pipeline, RTL-aware arrows), `TrustSection` (RLS isolation / authorization-first / evidence-backed / OWASP·NIST·ISO 27001·PCI DSS), `CTASection`, `Footer`. Root layout now wraps `<I18nProvider>`.
 - **Verified**: `tsc --noEmit` clean; `/`, `/login`, `/register`, `/dashboard` all 200; English SSR strings present in HTML; 7-locale parity green. (Pixel-level RTL/locale switching is client-side — verify in a browser.)
 - **Deferred (later phases):** AI Security Assistant chat + visible agent runs (Phase 2), plan/billing enforcement + org/team UI (Phase 3), continuous security (Phase 4), SSO/audit/API keys + ISO/PCI mapping (Phase 5).
+
+## Phase 2 — AI Assistant + full app i18n (2026-07-27/28)
+
+- **AI Security Assistant** (`ai_agent/assistant.py` + `modules/assistant/`): `POST /workspaces/{id}/assistant/ask` (gated `project:read`) answers security questions, optionally grounded in a vulnerability (`project_id`+`vulnerability_id`). Same injectable `SupportsComplete` pattern — mockable-first, clean **503** when no key. Frontend: floating chat widget (`components/assistant/AssistantWidget.tsx`) via an `AssistantProvider` in the dashboard layout, plus "Ask AI about this" on each vulnerability. 6 tests.
+- **Full app i18n**: every screen now translated across the 7 languages — auth pages, dashboard home + sidebar, and all project tabs (Targets/Scans/Vulnerabilities/Reports) + the live scan-progress view. `check-i18n.js` parity at **213 keys** × 7. UI primitives (`components/ui.tsx`) restyled to the cyber/glass theme so the whole dashboard inherits it.
+- **RTL correctness**: technical/English strings (tool names, commands, error messages, versions, durations) are wrapped in `dir="ltr"` spans so bidi punctuation stops flipping inside the RTL (Arabic) layout; directional arrows use `.flip-rtl`.
+
+## Backend hardening — fail-fast pipeline (2026-07-28)
+
+Driven by a production-readiness audit. Every change proven by live execution (see commits).
+
+- **Fail-fast**: `_run_single_tool` now raises `ToolExecutionError` on a non-zero tool exit (previously it marked the tool failed but continued). Any tool failure aborts the scan immediately — later tools do **not** run. Scan status is binary: `completed` only if every tool succeeded, else `failed` (removed the `completed_with_errors` half-state). Proven: httpx failure → naabu & nmap never execute, scan=failed.
+- **No silent AI fallback**: removed the AI-planner try/except that quietly reverted to deterministic order. Instead, `create_scan` **rejects `use_ai_planner` at creation with a clear 400** when `ANTHROPIC_API_KEY` is unset (fail-fast at the right layer — no confusing 0.1s "all skipped" scan). Runtime propagation remains as a safety net.
+- **Report gating**: `create_report` 409s unless the project has ≥1 `completed` scan — no report over a failed/empty assessment.
+- **Error visibility**: new `tool_runs.error_message` column (migration `a1c2e3f40510`) stores the exact failure (exception, or exit code + stderr tail); `ToolRunRead` exposes it + a computed `duration_seconds`. Structured logs: `scan.start` / `tool.start` / `tool.done` (exit, duration, assets, vulns, evidence) / `tool.failed` / `scan.finished`.
+- **Live scan-progress UI** (`components/project/ScanProgress.tsx`): staged pipeline with real-time per-tool status, duration, a prominent "Scan Failed" banner (tool + reason + suggested fix), and total time. Proven live: `naabu:running → nmap:running(184s) → completed`.
+- **Audit**: swept the backend for silent-error handlers; only the two above swallowed failures — both removed. Remaining handlers (JSONL parse skips, per-host resolution skips, typed auth/S3 handlers) are legitimate and kept. Full suite **75 passed**.
