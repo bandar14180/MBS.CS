@@ -732,3 +732,13 @@ Monetization *architecture* (no payment processor yet — it plugs in behind thi
 - **Frontend**: `PlanUsage` widget on the dashboard — plan name + price, per-quota usage bars (amber near limit, rose at limit), and a plan selector to upgrade. 7-language i18n (223 keys).
 - **Tests** (`test_billing.py`): pure plan/`_over` logic, public catalog, default-unlimited, tier validation (400), and live **402** enforcement on project + target limits. Full suite **86 passed**.
 - **Deferred**: real payment processor (Stripe) + invoices/webhooks; per-plan feature gating (e.g. active-testing or AI only on paid); annual pricing. The enforcement seam is ready for all of these.
+
+## Phase 4 — Continuous security: scheduled scans (2026-07-28)
+
+Turns MBS.SC from one-shot scanning into recurring assessment. New `scan_schedules` table (migration `b2d4f6a8c012`), **deliberately NOT RLS-protected** — same rationale as `scans`: the Celery-beat scheduler has no workspace/request context, so it reads due schedules across all workspaces by trusted internal query, then bootstraps the RLS GUC per-schedule from the trusted `workspace_id`.
+
+- **`modules/schedules/`**: CRUD service + router (project-scoped, `scan:create`/`scan:read`); interval bounded 5 min – 30 days. `run_due_schedules()` finds enabled + due schedules and launches each via the **existing `create_scan`** — so quota, authorization-scope, active-testing gate, and fail-fast all apply unchanged — then advances `next_run_at` and records `last_run_at`/`last_scan_id`/`last_error`. One schedule failing (quota, revoked scope) is recorded on its row and never blocks the others.
+- **Celery beat**: `beat_schedule` tick every 60 s (`schedules.enqueue_due`) in a new dedicated `beat` docker-compose service (reuses the worker image, command overridden); the worker executes the scans it enqueues. `schedule_tasks.py` uses the same fresh-engine + StaticPool pattern as `scan_tasks` so the session-level RLS GUC survives per-schedule commits.
+- **Frontend**: `SchedulesPanel` in the Scans tab — create with frequency presets (hourly / 6h / daily / weekly) + module selection, enable/disable, delete, next/last-run times, and last-error surfacing. 7-language i18n (237 keys).
+- **Proven live end-to-end**: beat emitted the tick → worker fired the due schedule → the scheduled scan was created **and ran to completion** (`schedule.fired -> scan=… -> scans.run_scan succeeded`). Tests cover `compute_next_run`, CRUD, interval floor (422), project isolation. Full suite **90 passed**.
+- **Deferred (rest of continuous security)**: notifications (email/webhook on completion / new critical finding), and diff-against-last-scan alerting. The schedule + scan history are the substrate for both.
