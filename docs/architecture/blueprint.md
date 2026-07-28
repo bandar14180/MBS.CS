@@ -742,3 +742,13 @@ Turns MBS.SC from one-shot scanning into recurring assessment. New `scan_schedul
 - **Frontend**: `SchedulesPanel` in the Scans tab — create with frequency presets (hourly / 6h / daily / weekly) + module selection, enable/disable, delete, next/last-run times, and last-error surfacing. 7-language i18n (237 keys).
 - **Proven live end-to-end**: beat emitted the tick → worker fired the due schedule → the scheduled scan was created **and ran to completion** (`schedule.fired -> scan=… -> scans.run_scan succeeded`). Tests cover `compute_next_run`, CRUD, interval floor (422), project isolation. Full suite **90 passed**.
 - **Deferred (rest of continuous security)**: notifications (email/webhook on completion / new critical finding), and diff-against-last-scan alerting. The schedule + scan history are the substrate for both.
+
+## Phase 4 (cont.) — In-app notifications (2026-07-28)
+
+`notifications` table (migration `c3e5a7b9d024`, ENABLE+FORCE RLS on workspace_id). Fired from the orchestrator when a scan finishes (best-effort, never affects the outcome, runs with the workspace RLS GUC already set): `scan_completed` (info), `scan_failed` (warning), or `critical_findings` (critical) when the scan first-detected new high/critical vulns. Endpoints under `/workspaces/{id}/notifications` (list, unread-count, {id}/read, read-all — `workspace:view`). Frontend: `NotificationBell` in the dashboard sidebar (unread badge, 30 s poll, mark-all-read). 7-lang i18n. Proven live: a completed scan produced an unread notification. Suite 93 passed.
+
+## Phase 5 — Audit log (2026-07-28)
+
+Append-only `audit_events` table (migration `d4f6b8c0e136`, ENABLE+FORCE RLS on workspace_id; actor email denormalized to survive user deletion). `audit.record()` flushes within the action's own transaction (atomic). Instrumented the key security decisions — `scan.created`, `vulnerability.status_changed`, `plan.changed` — each stamped with actor + detail. `GET /workspaces/{id}/audit` gated `workspace:manage` (owner/admin). Frontend `/audit` page (action / actor / detail / when) + sidebar link, graceful 403. 7-lang i18n. Proven live. Suite **96 passed**.
+
+- **Deferred (rest of Phase 5)**: workspace API keys (needs an auth-dependency path that also accepts a hashed key), and SSO (SAML/OIDC — needs an external IdP to verify). Both are additive on top of the current auth layer.
