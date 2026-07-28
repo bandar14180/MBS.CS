@@ -24,6 +24,18 @@ function scanDuration(scan: Scan): string | null {
   return s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${s.toFixed(1)}s`;
 }
 
+// Map a tool error to actionable guidance for the operator.
+function suggestFix(error: string | null): string {
+  const e = (error || "").toLowerCase();
+  if (e.includes("resolvable") || e.includes("dns resolution") || e.includes("name or service not known"))
+    return "The target hostname could not be resolved. Check the domain/host is spelled correctly and is publicly resolvable (has DNS records).";
+  if (e.includes("timed out") || e.includes("timeout"))
+    return "The tool timed out. The target may be slow, rate-limiting, or filtering traffic — retry, or narrow the scope.";
+  if (e.includes("connection refused") || e.includes("no route"))
+    return "The target refused the connection or is unreachable from the scanner. Confirm it is online and reachable.";
+  return "Review the tool error above and the target configuration, then re-run the scan.";
+}
+
 export function ScanProgress({ projectId, scan }: { projectId: string; scan: Scan }) {
   const [runs, setRuns] = useState<ToolRun[] | null>(null);
   const live = !TERMINAL.has(scan.status);
@@ -59,9 +71,34 @@ export function ScanProgress({ projectId, scan }: { projectId: string; scan: Sca
   }
 
   const total = scanDuration(scan);
+  const failedRun = scan.status === "failed" ? (runs || []).find((r) => r.status === "failed") : undefined;
 
   return (
     <div className="mt-4 border-t border-cyber-border/60 pt-4">
+      {failedRun && (
+        <div className="mb-4 rounded-xl border border-rose-500/40 bg-rose-500/10 p-4">
+          <div className="flex items-center gap-2 text-sm font-semibold text-rose-300">
+            <span className="text-base">✕</span> Scan Failed
+          </div>
+          <dl className="mt-2 space-y-1 text-sm">
+            <div className="flex gap-2">
+              <dt className="w-24 shrink-0 text-slate-400">Tool</dt>
+              <dd className="font-mono text-slate-200">{STAGE_LABEL[failedRun.tool_name] || failedRun.tool_name}</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="w-24 shrink-0 text-slate-400">Reason</dt>
+              <dd className="font-mono text-rose-300">{failedRun.error_message || "unknown error"}</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="w-24 shrink-0 text-slate-400">Suggested fix</dt>
+              <dd className="text-slate-300">{suggestFix(failedRun.error_message)}</dd>
+            </div>
+          </dl>
+          <p className="mt-3 text-xs text-slate-400">
+            The pipeline stopped here — later stages did not run and no report was generated.
+          </p>
+        </div>
+      )}
       {runs === null ? (
         <Spinner />
       ) : (
