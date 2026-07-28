@@ -241,5 +241,21 @@
     "unlimited": "Illimitato",
     "changePlan": "Cambia piano",
     "perMonth": "/mese"
+  },
+  "schedules": {
+    "title": "Scansioni pianificate",
+    "frequency": "Frequenza",
+    "hourly": "Ogni ora",
+    "every6h": "Ogni 6 ore",
+    "daily": "Ogni giorno",
+    "weekly": "Ogni settimana",
+    "create": "Pianifica",
+    "none": "Ancora nessuna scansione pianificata.",
+    "nextRun": "Prossima esecuzione",
+    "lastRun": "Ultima esecuzione",
+    "enable": "Abilita",
+    "disable": "Disabilita",
+    "delete": "Elimina",
+    "lastError": "Ultimo errore"
   }
 }

@@ -171,6 +171,27 @@ export const scanApi = {
   toolRuns: (pid: string, sid: string) => api<ToolRun[]>(ws(`/projects/${pid}/scans/${sid}/tool-runs`)),
 };
 
+// ---- Scheduled scans ----
+export const scheduleApi = {
+  list: (pid: string) => api<ScanSchedule[]>(ws(`/projects/${pid}/schedules`)),
+  create: (
+    pid: string,
+    target_id: string,
+    scan_type: string,
+    requested_modules: string[],
+    interval_minutes: number,
+    use_ai_planner: boolean
+  ) =>
+    api<ScanSchedule>(ws(`/projects/${pid}/schedules`), {
+      method: "POST",
+      body: { target_id, scan_type, requested_modules, interval_minutes, use_ai_planner },
+    }),
+  update: (pid: string, sid: string, patch: { enabled?: boolean; interval_minutes?: number }) =>
+    api<ScanSchedule>(ws(`/projects/${pid}/schedules/${sid}`), { method: "PATCH", body: patch }),
+  remove: (pid: string, sid: string) =>
+    api<Response>(ws(`/projects/${pid}/schedules/${sid}`), { method: "DELETE", raw: true }),
+};
+
 // ---- Vulnerabilities ----
 export const vulnApi = {
   list: (pid: string, severity?: string, status?: string) => {
@@ -227,6 +248,11 @@ export interface AuthorizationScope {
 export interface Scan {
   id: string; target_id: string; scan_type: string; status: string; config: any; created_at: string;
   started_at: string | null; completed_at: string | null;
+}
+export interface ScanSchedule {
+  id: string; target_id: string; scan_type: string; requested_modules: string[]; use_ai_planner: boolean;
+  interval_minutes: number; enabled: boolean; next_run_at: string; last_run_at: string | null;
+  last_scan_id: string | null; last_error: string | null; created_at: string;
 }
 export interface ToolRun {
   id: string; tool_name: string; tool_version: string; status: string; exit_code: number | null;

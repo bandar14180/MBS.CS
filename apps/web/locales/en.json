@@ -241,5 +241,21 @@
     "unlimited": "Unlimited",
     "changePlan": "Change plan",
     "perMonth": "/mo"
+  },
+  "schedules": {
+    "title": "Scheduled scans",
+    "frequency": "Frequency",
+    "hourly": "Every hour",
+    "every6h": "Every 6 hours",
+    "daily": "Every day",
+    "weekly": "Every week",
+    "create": "Schedule",
+    "none": "No scheduled scans yet.",
+    "nextRun": "Next run",
+    "lastRun": "Last run",
+    "enable": "Enable",
+    "disable": "Disable",
+    "delete": "Delete",
+    "lastError": "Last error"
   }
 }

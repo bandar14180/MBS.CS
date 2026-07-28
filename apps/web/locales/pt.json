@@ -241,5 +241,21 @@
     "unlimited": "Ilimitado",
     "changePlan": "Alterar plano",
     "perMonth": "/mês"
+  },
+  "schedules": {
+    "title": "Varreduras agendadas",
+    "frequency": "Frequência",
+    "hourly": "A cada hora",
+    "every6h": "A cada 6 horas",
+    "daily": "Todos os dias",
+    "weekly": "Toda semana",
+    "create": "Agendar",
+    "none": "Nenhuma varredura agendada ainda.",
+    "nextRun": "Próxima execução",
+    "lastRun": "Última execução",
+    "enable": "Ativar",
+    "disable": "Desativar",
+    "delete": "Excluir",
+    "lastError": "Último erro"
   }
 }

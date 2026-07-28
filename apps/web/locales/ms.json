@@ -241,5 +241,21 @@
     "unlimited": "Tanpa had",
     "changePlan": "Tukar pelan",
     "perMonth": "/bln"
+  },
+  "schedules": {
+    "title": "Imbasan berjadual",
+    "frequency": "Kekerapan",
+    "hourly": "Setiap jam",
+    "every6h": "Setiap 6 jam",
+    "daily": "Setiap hari",
+    "weekly": "Setiap minggu",
+    "create": "Jadualkan",
+    "none": "Belum ada imbasan berjadual.",
+    "nextRun": "Larian seterusnya",
+    "lastRun": "Larian terakhir",
+    "enable": "Dayakan",
+    "disable": "Lumpuhkan",
+    "delete": "Padam",
+    "lastError": "Ralat terakhir"
   }
 }

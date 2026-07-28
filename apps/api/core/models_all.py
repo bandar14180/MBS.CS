@@ -14,6 +14,7 @@ from apps.api.modules.projects import models as projects_models  # noqa: F401
 from apps.api.modules.reports import models as reports_models  # noqa: F401
 from apps.api.modules.risk import models as risk_models  # noqa: F401
 from apps.api.modules.scans import models as scans_models  # noqa: F401
+from apps.api.modules.schedules import models as schedules_models  # noqa: F401
 from apps.api.modules.users import models as users_models  # noqa: F401
 from apps.api.modules.vulnerabilities import models as vulnerabilities_models  # noqa: F401
 from apps.api.modules.vulnerabilities import remediation_models  # noqa: F401

@@ -6,6 +6,7 @@ import { scanApi, type Scan, type Target } from "@/lib/api";
 import { useTranslation } from "@/lib/i18n";
 import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@/components/ui";
 import { ScanProgress } from "@/components/project/ScanProgress";
+import { SchedulesPanel } from "@/components/project/SchedulesPanel";
 
 const MODULES = ["subfinder", "httpx", "naabu", "nmap", "nuclei"];
 const ACTIVE_MODULES = new Set(["nuclei"]);
@@ -123,6 +124,8 @@ export function ScansTab({ projectId, targets }: { projectId: string; targets: T
           </form>
         )}
       </Card>
+
+      <SchedulesPanel projectId={projectId} targets={targets} />
 
       <ErrorText>{error}</ErrorText>
 

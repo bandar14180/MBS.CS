@@ -241,5 +241,21 @@
     "unlimited": "غير محدود",
     "changePlan": "تغيير الخطة",
     "perMonth": "/شهرياً"
+  },
+  "schedules": {
+    "title": "الفحوصات المجدوَلة",
+    "frequency": "التكرار",
+    "hourly": "كل ساعة",
+    "every6h": "كل 6 ساعات",
+    "daily": "كل يوم",
+    "weekly": "كل أسبوع",
+    "create": "جدولة",
+    "none": "لا فحوصات مجدوَلة بعد.",
+    "nextRun": "التشغيل التالي",
+    "lastRun": "آخر تشغيل",
+    "enable": "تفعيل",
+    "disable": "تعطيل",
+    "delete": "حذف",
+    "lastError": "آخر خطأ"
   }
 }

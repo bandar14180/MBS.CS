@@ -241,5 +241,21 @@
     "unlimited": "Ilimitado",
     "changePlan": "Cambiar plan",
     "perMonth": "/mes"
+  },
+  "schedules": {
+    "title": "Análisis programados",
+    "frequency": "Frecuencia",
+    "hourly": "Cada hora",
+    "every6h": "Cada 6 horas",
+    "daily": "Cada día",
+    "weekly": "Cada semana",
+    "create": "Programar",
+    "none": "Aún no hay análisis programados.",
+    "nextRun": "Próxima ejecución",
+    "lastRun": "Última ejecución",
+    "enable": "Activar",
+    "disable": "Desactivar",
+    "delete": "Eliminar",
+    "lastError": "Último error"
   }
 }

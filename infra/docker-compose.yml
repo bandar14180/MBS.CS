@@ -78,6 +78,24 @@ services:
     volumes:
       - ../apps/api:/srv/apps/api
 
+  # Celery beat: emits the periodic "enqueue due schedules" tick (continuous
+  # security). Reuses the worker image; the worker executes the scans it queues.
+  beat:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+    restart: unless-stopped
+    command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "beat", "--loglevel=info"]
+    env_file:
+      - ../.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../apps/api:/srv/apps/api
+
   web:
     build:
       context: ..

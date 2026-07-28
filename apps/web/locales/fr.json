@@ -241,5 +241,21 @@
     "unlimited": "Illimité",
     "changePlan": "Changer de forfait",
     "perMonth": "/mois"
+  },
+  "schedules": {
+    "title": "Analyses planifiées",
+    "frequency": "Fréquence",
+    "hourly": "Toutes les heures",
+    "every6h": "Toutes les 6 heures",
+    "daily": "Tous les jours",
+    "weekly": "Toutes les semaines",
+    "create": "Planifier",
+    "none": "Aucune analyse planifiée pour l'instant.",
+    "nextRun": "Prochaine exécution",
+    "lastRun": "Dernière exécution",
+    "enable": "Activer",
+    "disable": "Désactiver",
+    "delete": "Supprimer",
+    "lastError": "Dernière erreur"
   }
 }
