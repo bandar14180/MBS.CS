@@ -315,5 +315,12 @@
     "title": "Raccomandazioni",
     "subtitle": "Risultati a più alta priorità da correggere per primi.",
     "review": "Esamina →"
+  },
+  "aiAgents": {
+    "title": "Agenti IA",
+    "subtitle": "Agenti autonomi che alimentano ogni valutazione.",
+    "active": "Attivo",
+    "inactive": "Non configurato",
+    "configureHint": "Imposta ANTHROPIC_API_KEY per abilitare l'IA dal vivo. La scansione funziona senza."
   }
 }

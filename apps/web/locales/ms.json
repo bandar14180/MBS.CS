@@ -315,5 +315,12 @@
     "title": "Cadangan",
     "subtitle": "Penemuan keutamaan tertinggi untuk dibaiki seterusnya.",
     "review": "Semak →"
+  },
+  "aiAgents": {
+    "title": "Ejen AI",
+    "subtitle": "Ejen autonomi yang menggerakkan setiap penilaian.",
+    "active": "Aktif",
+    "inactive": "Tidak dikonfigurasi",
+    "configureHint": "Tetapkan ANTHROPIC_API_KEY untuk mendayakan AI langsung. Imbasan berfungsi tanpanya."
   }
 }

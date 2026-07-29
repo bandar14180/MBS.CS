@@ -315,5 +315,12 @@
     "title": "Recommendations",
     "subtitle": "Highest-priority findings to fix next.",
     "review": "Review →"
+  },
+  "aiAgents": {
+    "title": "AI Agents",
+    "subtitle": "Autonomous agents that power every assessment.",
+    "active": "Active",
+    "inactive": "Not configured",
+    "configureHint": "Set ANTHROPIC_API_KEY to enable live AI. Scanning works without it."
   }
 }

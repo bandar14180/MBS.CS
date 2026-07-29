@@ -315,5 +315,12 @@
     "title": "Recommandations",
     "subtitle": "Résultats prioritaires à corriger en premier.",
     "review": "Examiner →"
+  },
+  "aiAgents": {
+    "title": "Agents IA",
+    "subtitle": "Des agents autonomes qui pilotent chaque évaluation.",
+    "active": "Actif",
+    "inactive": "Non configuré",
+    "configureHint": "Définissez ANTHROPIC_API_KEY pour activer l'IA en direct. L'analyse fonctionne sans elle."
   }
 }

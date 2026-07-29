@@ -7,6 +7,7 @@ import { dashboardApi, projectApi, type DashboardSummary, type Project, type Rec
 import { useTranslation } from "@/lib/i18n";
 import { Badge, Button, Card, ErrorText, Input, Label, Spinner } from "@/components/ui";
 import { PlanUsage } from "@/components/PlanUsage";
+import { AiAgentsPanel } from "@/components/AiAgentsPanel";
 
 export default function DashboardPage() {
   const { t } = useTranslation();
@@ -88,6 +89,7 @@ export default function DashboardPage() {
       ) : (
         <>
           <PlanUsage />
+          <AiAgentsPanel />
           <StatCards summary={summary!} />
           <Recommendations />
           <RecentScans summary={summary!} />

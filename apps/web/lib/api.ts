@@ -259,6 +259,11 @@ export const vulnApi = {
     api<Remediation>(ws(`/projects/${pid}/vulnerabilities/${vid}/remediation`), { method: "POST" }),
 };
 
+// ---- AI status ----
+export const aiApi = {
+  status: () => api<AIStatus>("/ai/status"),
+};
+
 // ---- AI Security Assistant ----
 export const assistantApi = {
   ask: (question: string, opts: { projectId?: string; vulnerabilityId?: string } = {}) =>
@@ -324,6 +329,7 @@ export interface Report { id: string; type: string; format: string; generated_at
 export interface AssistantAnswer {
   answer: string; model_version: string; prompt_version: string; grounded_in_vulnerability: boolean;
 }
+export interface AIStatus { enabled: boolean; model: string; }
 export interface SeverityCounts { critical: number; high: number; medium: number; low: number; info: number; }
 export interface RecentScan {
   id: string; project_id: string; project_name: string; target_value: string;

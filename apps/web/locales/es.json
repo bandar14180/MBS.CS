@@ -315,5 +315,12 @@
     "title": "Recomendaciones",
     "subtitle": "Hallazgos de mayor prioridad para corregir a continuación.",
     "review": "Revisar →"
+  },
+  "aiAgents": {
+    "title": "Agentes de IA",
+    "subtitle": "Agentes autónomos que impulsan cada evaluación.",
+    "active": "Activo",
+    "inactive": "No configurado",
+    "configureHint": "Establece ANTHROPIC_API_KEY para habilitar la IA en vivo. El análisis funciona sin ella."
   }
 }

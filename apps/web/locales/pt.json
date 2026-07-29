@@ -315,5 +315,12 @@
     "title": "Recomendações",
     "subtitle": "Descobertas de maior prioridade para corrigir a seguir.",
     "review": "Revisar →"
+  },
+  "aiAgents": {
+    "title": "Agentes de IA",
+    "subtitle": "Agentes autônomos que impulsionam cada avaliação.",
+    "active": "Ativo",
+    "inactive": "Não configurado",
+    "configureHint": "Defina ANTHROPIC_API_KEY para habilitar a IA ao vivo. A varredura funciona sem ela."
   }
 }
