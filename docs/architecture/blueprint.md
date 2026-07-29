@@ -756,3 +756,14 @@ Append-only `audit_events` table (migration `d4f6b8c0e136`, ENABLE+FORCE RLS on 
 Programmatic access. `api_keys` table (migration `e6a8c0d2f248`), **NOT RLS-protected** (like `scans`): a key is resolved by hash during auth, before any workspace RLS context exists. Only the SHA-256 hash is stored; the plaintext (`mbsk_<token>`) is returned once. The auth layer (`core/deps.py`) now accepts an `mbsk_` bearer token — it authenticates AS the key's creator, and `get_workspace_context` enforces the key is only valid for its bound workspace (via `request.state`); the JWT path is unchanged (backward compatible). Endpoints (`workspace:manage`): create / list (never leaks the secret) / revoke. Frontend `/api-keys` page (one-time secret reveal + copy, prefix + last-used, revoke) + sidebar link, 7-lang i18n. Tests cover the full lifecycle, workspace-binding (cross-workspace 403), bogus-key 401, and manager-only creation. Proven live. Suite **100 passed**.
 
 - **Deferred (rest of Phase 5)**: SSO (SAML/OIDC — needs an external IdP to verify) and a Stripe payment processor behind the plan-enforcement seam. Both are additive on top of the current auth/billing layers.
+
+## Original-vision gaps closed (2026-07-28)
+
+A pass over the original product brief surfaced dashboard/enterprise items that had backend support but no UI (or no endpoint). All added, 7-lang i18n, verified live, suite **102 passed**:
+
+- **User Profile** (`/profile`) — `PATCH /users/me` (name) + `POST /users/me/change-password` (verifies current, re-hashes). Frontend page; the sidebar email links to it.
+- **Team / Members management** (`/team`) — UI over the existing member endpoints (list / invite / change-role / remove) + `GET /roles`. Owner/admin; graceful 403 for members.
+- **Recommendations** — `GET /workspaces/{id}/dashboard/recommendations` returns the highest-priority active findings workspace-wide (severity then CVSS); shown as a dashboard section linking to each project.
+- **Visible AI Agents** — `GET /ai/status` ({enabled, model}); a dashboard panel shows the 5 agents + a live-AI Active/Not-configured badge.
+
+- **Genuinely deferred (need external services to build+verify)**: **Cloud Security Assessment (AWS)** — a service on the landing page but no cloud scanner yet (needs AWS credentials + a target account to implement and prove); a **dedicated API-security scanner** beyond httpx probing; **SSO** (external IdP); **Stripe** (payment account). These are the honest remaining items.
