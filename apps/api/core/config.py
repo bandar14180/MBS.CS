@@ -76,15 +76,41 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     ai_model: str = "claude-opus-4-8"
 
+    # Local, self-hosted model via an OpenAI-compatible endpoint (Ollama/vLLM).
+    # Keeps scan data in-house and needs NO external egress -- the right choice
+    # when the network blocks the internet or intercepts TLS. Ollama's
+    # OpenAI-compatible API lives under /v1; it ignores auth (a dummy key is sent).
+    ollama_base_url: str = "http://localhost:11434/v1"
+    ollama_model: str = "llama3.1:8b"
+    ollama_api_key: str = ""
+
     ai_max_tokens: int = 4096
     ai_request_timeout_s: float = 60.0
     ai_max_retries: int = 3
+
+    # --- Outbound TLS / proxy (enterprise networking) -----------------------
+    # For networks that intercept TLS (corporate proxy/AV) or require an egress
+    # proxy. The correct fix for TLS inspection is a custom CA bundle -- NEVER
+    # disabling verification. Proxies are honored by httpx (trust_env) and mirrored
+    # into the process env by configure_networking() so the Go scanner tools use
+    # them too.
+    ssl_verify: bool = True          # dev-only override; MUST stay True in production
+    ssl_ca_bundle: str = ""          # path to a custom CA bundle (PEM), e.g. corporate root
+    http_proxy: str = ""
+    https_proxy: str = ""
+    no_proxy: str = ""
 
     # --- Scanner engine -----------------------------------------------------
     # Directory the Nuclei template set is baked into (set in Dockerfile.worker).
     # When set, the nuclei runner passes `-templates <dir>` so template discovery
     # never depends on the ambient $HOME at scan time. Empty = nuclei's own default.
     nuclei_templates_dir: str = ""
+
+    # Target types the scanner can actually assess today. Scans on any other type
+    # are rejected at creation -- never a "completed" scan that assessed nothing.
+    # domain/ip_range are covered by the recon + nuclei toolchain; api /
+    # cloud_account / repo need dedicated engines (roadmap) and stay gated until then.
+    supported_target_types: list[str] = ["domain", "ip_range"]
 
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
@@ -121,16 +147,36 @@ class Settings(BaseSettings):
 
     @property
     def active_ai_api_key(self) -> str:
-        """The API key for the currently selected provider ("" if unset)."""
+        """The API key for the currently selected provider ("" if unset). The
+        local provider needs no real key, so it reports a sentinel -> ai_enabled."""
         return {
             "openrouter": self.openrouter_api_key,
             "anthropic": self.anthropic_api_key,
+            "local": self.ollama_api_key or "local",
         }.get(self.ai_provider, "")
 
     @property
     def active_ai_model(self) -> str:
         """The model id the selected provider will send."""
-        return self.openrouter_model if self.ai_provider == "openrouter" else self.ai_model
+        return {
+            "openrouter": self.openrouter_model,
+            "anthropic": self.ai_model,
+            "local": self.ollama_model,
+        }.get(self.ai_provider, self.openrouter_model)
+
+    @property
+    def httpx_verify(self):
+        """Value for httpx `verify=`: a custom CA bundle path when configured (or
+        the REQUESTS_CA_BUNDLE/SSL_CERT_FILE env fallback), else True. Returns
+        False only when ssl_verify is explicitly disabled (development)."""
+        if not self.ssl_verify:
+            return False
+        bundle = (
+            self.ssl_ca_bundle
+            or os.environ.get("REQUESTS_CA_BUNDLE")
+            or os.environ.get("SSL_CERT_FILE")
+        )
+        return bundle if bundle else True
 
     @property
     def ai_enabled(self) -> bool:
@@ -155,13 +201,30 @@ class Settings(BaseSettings):
             problems.append("CORS_ALLOW_ORIGINS must list explicit origins in production, not '*'.")
         if self.trusted_hosts == ["*"]:
             problems.append("TRUSTED_HOSTS must list explicit hostnames in production, not '*'.")
-        if self.ai_provider not in ("openrouter", "anthropic"):
+        if self.ai_provider not in ("openrouter", "anthropic", "local"):
             problems.append(f"AI_PROVIDER '{self.ai_provider}' is not a known provider.")
+        if not self.ssl_verify:
+            problems.append("SSL_VERIFY is disabled; never disable TLS verification in production.")
         if problems:
             raise RuntimeError(
                 "Refusing to start in production with insecure configuration:\n  - "
                 + "\n  - ".join(problems)
             )
+
+
+def configure_networking(settings: "Settings | None" = None) -> None:
+    """Mirror proxy / CA settings into the process environment so every outbound
+    client honors them: httpx picks up HTTP(S)_PROXY via trust_env, and the Go
+    scanner tools (subfinder/httpx/nuclei/...) read REQUESTS_CA_BUNDLE/SSL_CERT_FILE
+    and the proxy vars too. Idempotent; explicit env always wins (setdefault)."""
+    s = settings or get_settings()
+    for var, val in (("HTTP_PROXY", s.http_proxy), ("HTTPS_PROXY", s.https_proxy), ("NO_PROXY", s.no_proxy)):
+        if val:
+            os.environ.setdefault(var, val)
+            os.environ.setdefault(var.lower(), val)
+    if s.ssl_ca_bundle:
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", s.ssl_ca_bundle)
+        os.environ.setdefault("SSL_CERT_FILE", s.ssl_ca_bundle)
 
 
 @lru_cache

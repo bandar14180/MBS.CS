@@ -311,10 +311,24 @@ async def _run_single_tool(
     # Every finding must trace to raw evidence (blueprint §1) -- store the raw
     # stdout/stderr blob in object storage and record an evidence row BEFORE
     # turning any of it into assets. Stored even for failed runs (debuggability).
+    #
+    # FAIL-SOFT (evidence storage): object storage (MinIO/S3) being down must NOT
+    # fail an otherwise-successful scan. On a storage error we record a sentinel
+    # evidence row (so vulnerability -> evidence linkage still holds) and mark the
+    # tool run so the scan honestly aggregates to completed_with_errors.
     blob = (
         f"$ {raw.command}\n\n=== STDOUT ===\n{raw.stdout}\n\n=== STDERR ===\n{raw.stderr}\n"
     ).encode()
-    storage_uri, checksum = evidence_store.store_raw_output(tool_run.id, blob)
+    storage_failed = False
+    try:
+        storage_uri, checksum = evidence_store.store_raw_output(tool_run.id, blob)
+    except Exception as exc:  # noqa: BLE001 -- storage outage must not fail the scan
+        storage_failed = True
+        storage_uri, checksum = f"unavailable://evidence-storage-failed/{tool_run.id}", ""
+        logger.warning(
+            "tool.evidence_store_failed scan=%s tool=%s error=%s",
+            scan.id, runner.name, exc, exc_info=True,
+        )
     tool_run.raw_output_ref = storage_uri
     evidence = Evidence(
         tool_run_id=tool_run.id,
@@ -341,6 +355,11 @@ async def _run_single_tool(
 
     stderr_tail = (raw.stderr or "").strip()[-1000:]
     status = classify_run(runner, raw, produced_findings=bool(findings or vuln_findings))
+    # Evidence storage failed: the tool ran, but its raw output couldn't be
+    # persisted -- never a clean success, so downgrade completed -> partial so the
+    # scan honestly aggregates to completed_with_errors (fail-soft).
+    if storage_failed and status == "completed":
+        status = "partial"
 
     if status == "failed":
         # Don't trust output from a failed run -- record the error, ingest nothing.
@@ -351,6 +370,9 @@ async def _run_single_tool(
             f"non-zero exit {raw.exit_code}; partial results kept"
             + (f": {stderr_tail}" if stderr_tail else "")
         )
+    if storage_failed:
+        note = "evidence storage unavailable (raw output not persisted)"
+        tool_run.error_message = f"{tool_run.error_message}; {note}" if tool_run.error_message else note
 
     for finding in findings:
         await upsert_asset(

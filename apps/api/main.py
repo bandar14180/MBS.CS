@@ -7,7 +7,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from sqlalchemy import text
 from starlette.responses import JSONResponse, Response
 
-from apps.api.core.config import get_settings
+from apps.api.core.config import configure_networking, get_settings
 from apps.api.core.logging import configure_logging
 from apps.api.core.middleware import (
     ObservabilityMiddleware,
@@ -50,6 +50,8 @@ _ROUTERS = (
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_json)
+    # Mirror proxy / custom-CA settings into the process env for all outbound clients.
+    configure_networking(settings)
     # Fail fast if production is misconfigured (placeholder secrets, wildcard CORS, ...).
     settings.validate_production()
     # Non-fatal AI configuration report (no paid call at boot).

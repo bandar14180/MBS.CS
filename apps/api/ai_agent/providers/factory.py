@@ -13,6 +13,10 @@ def get_ai_client() -> SupportsComplete:
         from apps.api.ai_agent.providers.anthropic import AnthropicClient
 
         return AnthropicClient()
+    if provider == "local":
+        from apps.api.ai_agent.providers.local import LocalClient
+
+        return LocalClient()
     from apps.api.ai_agent.providers.openrouter import OpenRouterClient
 
     return OpenRouterClient()

@@ -23,6 +23,27 @@ def _auth(tokens: dict) -> dict:
     return {"Authorization": f"Bearer {tokens['access_token']}"}
 
 
+def test_unsupported_target_type_scan_is_rejected(client: TestClient, no_celery_dispatch) -> None:
+    # A repo/api/cloud_account target has no scanner engine yet -> creating a scan
+    # must fail clearly at creation, never "complete" having assessed nothing.
+    owner = _register(client, "Owner")
+    headers = _auth(owner)
+    ws = client.post("/api/v1/workspaces", headers=headers, json={"name": "WS"}).json()["id"]
+    proj = client.post(f"/api/v1/workspaces/{ws}/projects", headers=headers, json={"name": "P"}).json()["id"]
+    tgt = client.post(
+        f"/api/v1/workspaces/{ws}/projects/{proj}/targets",
+        headers=headers,
+        json={"type": "repo", "value": "github.com/example/repo"},
+    ).json()["id"]
+    resp = client.post(
+        f"/api/v1/workspaces/{ws}/projects/{proj}/scans",
+        headers=headers,
+        json={"target_id": tgt, "scan_type": "web", "requested_modules": ["nmap"]},
+    )
+    assert resp.status_code == 400
+    assert "not supported" in resp.json()["detail"]
+
+
 def _make_target(client: TestClient, headers: dict) -> tuple[str, str, str]:
     ws = client.post("/api/v1/workspaces", headers=headers, json={"name": "Scan WS"})
     workspace_id = ws.json()["id"]

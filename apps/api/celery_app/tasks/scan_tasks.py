@@ -23,6 +23,11 @@ async def _run(scan_id: str) -> None:
     # worker's own writes to tool_runs/evidence/assets. One persistent
     # connection keeps the GUC alive across those commits.
     settings = get_settings()
+    # Honor enterprise proxy / custom-CA settings for the scanner tools + AI calls
+    # made during the scan (mirrors them into the process env). Idempotent.
+    from apps.api.core.config import configure_networking
+
+    configure_networking(settings)
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:

@@ -22,7 +22,20 @@ async def create_scan(
     requested_modules: list[str],
     use_ai_planner: bool = False,
 ) -> Scan:
-    await get_target(db, workspace_id, project_id, target_id)  # 404s if target isn't in this project/workspace
+    target = await get_target(db, workspace_id, project_id, target_id)  # 404s if not in this project/workspace
+
+    from apps.api.core.config import get_settings
+
+    # Refuse target types the scanner can't actually assess yet -- otherwise the
+    # scan would "complete" having run nothing. Clear validation error instead.
+    supported = get_settings().supported_target_types
+    if target.type not in supported:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Target type '{target.type}' is not supported for scanning yet "
+            f"(supported: {', '.join(supported)}). Refusing to start a scan that would "
+            f"assess nothing.",
+        )
 
     from apps.api.modules.billing import service as billing
 

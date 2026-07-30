@@ -1,5 +1,6 @@
 import httpx
 
+from apps.api.ai_agent.providers._http import sync_client
 from apps.api.ai_agent.providers.base import (
     AIProviderError,
     BaseAIProvider,
@@ -58,7 +59,7 @@ class OpenRouterClient(BaseAIProvider):
                 {"role": "user", "content": user},
             ],
         }
-        with httpx.Client(timeout=self._timeout_s) as client:
+        with sync_client(self._timeout_s) as client:
             resp = client.post(f"{self._base_url}/chat/completions", headers=headers, json=payload)
         # Terminal client errors (bad request / auth / payment / forbidden /
         # not found) -> do not retry; surface a clear message. 429 and 5xx fall

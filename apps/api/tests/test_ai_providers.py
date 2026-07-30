@@ -155,3 +155,75 @@ def test_validate_production_accepts_hardened_config() -> None:
 
 def test_validate_production_noop_in_dev() -> None:
     Settings(environment="development").validate_production()  # never raises
+
+
+# --- local (Ollama) provider + enterprise TLS/proxy ---
+
+def test_local_provider_reuses_openai_compatible_path(monkeypatch) -> None:
+    from apps.api.ai_agent.providers.local import LocalClient
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}], "usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+        )
+
+    _mock_httpx(monkeypatch, handler)
+    client = LocalClient(model="llama3.1:8b", base_url="http://ollama:11434/v1")
+    with collect_ai_usage(agent_role="planner", workspace_id="w1") as records:
+        assert client.complete_json("s", "u") == {"ok": True}
+    assert captured["url"] == "http://ollama:11434/v1/chat/completions"
+    assert records[0].provider == "local" and records[0].model == "llama3.1:8b"
+
+
+def test_factory_selects_local(monkeypatch) -> None:
+    from apps.api.ai_agent.providers import factory
+    from apps.api.ai_agent.providers.local import LocalClient
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ai_provider", "local")
+    assert isinstance(factory.get_ai_client(), LocalClient)
+
+
+def test_local_provider_enables_ai_without_key() -> None:
+    s = Settings(ai_provider="local")
+    assert s.ai_enabled is True  # local needs no API key
+    assert s.active_ai_model == s.ollama_model
+
+
+def test_httpx_verify_reflects_settings() -> None:
+    assert Settings().httpx_verify is True  # secure default
+    assert Settings(ssl_verify=False).httpx_verify is False  # explicit dev override
+    assert Settings(ssl_ca_bundle="/etc/ssl/corp-root.pem").httpx_verify == "/etc/ssl/corp-root.pem"
+
+
+def test_validate_production_rejects_disabled_ssl() -> None:
+    s = Settings(
+        environment="production",
+        jwt_secret_key="a" * 48,
+        s3_access_key="real",
+        s3_secret_key="real",
+        database_url="postgresql+asyncpg://u:p@db:5432/mbs",
+        cors_allow_origins=["https://x.example.com"],
+        trusted_hosts=["x.example.com"],
+        ssl_verify=False,
+    )
+    with pytest.raises(RuntimeError) as exc:
+        s.validate_production()
+    assert "SSL_VERIFY" in str(exc.value)
+
+
+def test_configure_networking_mirrors_env(monkeypatch) -> None:
+    from apps.api.core.config import configure_networking
+
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var.lower(), raising=False)
+    configure_networking(Settings(https_proxy="http://proxy:3128", ssl_ca_bundle="/etc/ssl/corp.pem"))
+    import os
+
+    assert os.environ["HTTPS_PROXY"] == "http://proxy:3128"
+    assert os.environ["REQUESTS_CA_BUNDLE"] == "/etc/ssl/corp.pem"
