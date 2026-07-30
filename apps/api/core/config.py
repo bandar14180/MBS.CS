@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     s3_secret_key: str = "minioadmin"
     s3_bucket_evidence: str = "mbs-evidence"
     s3_bucket_reports: str = "mbs-reports"
+    # Object-storage backend behind the StorageProvider interface. "s3" covers
+    # MinIO + AWS S3 (default); azure_blob / gcs are future implementations.
+    storage_provider: str = "s3"
 
     jwt_secret_key: str = "change-me-in-.env"
     jwt_access_token_ttl_minutes: int = 15

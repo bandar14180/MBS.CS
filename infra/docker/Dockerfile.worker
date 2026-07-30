@@ -56,6 +56,11 @@ ENV HOME=/home/appuser \
 RUN nuclei -update-templates \
     && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ]
 
+# Warm httpx's tech-detection ("dit") model into the image so scans don't download
+# ~92MB at runtime (P2-15). Best-effort: if the build network can't fetch it, we
+# fall back to the runtime download (unchanged behavior) rather than failing.
+RUN echo "https://example.com" | httpx-pd -tech-detect -silent -timeout 20 >/dev/null 2>&1 || true
+
 # Application code last: it changes most often, so keeping it after the template
 # layer keeps rebuilds fast. Owned by the runtime user (COPY runs as root).
 COPY --chown=appuser:appuser apps/__init__.py ./apps/__init__.py

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # Unit/integration tests against a real Postgres (RLS needs it) + Redis.
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mbs
+          POSTGRES_PASSWORD: mbs
+          POSTGRES_DB: mbs
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mbs -d mbs"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://mbs:mbs@localhost:5432/mbs
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r apps/api/requirements.txt
+      - name: Apply migrations
+        working-directory: db
+        run: alembic upgrade head
+      - name: Run tests
+        run: python -m pytest apps/api/tests -q
+
+  # Scan Doctor: verify the real tool binaries run. Needs network + the worker
+  # image, so it's a separate job and non-blocking (network can be flaky in CI).
+  scan-doctor:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build worker image
+        run: docker build -f infra/docker/Dockerfile.worker -t mbs-worker .
+      - name: Run scan doctor
+        run: docker run --rm mbs-worker python -m apps.api.scanner_engine.doctor

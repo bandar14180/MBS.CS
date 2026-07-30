@@ -33,6 +33,14 @@ def test_unknown_category_and_tag_map_to_nothing() -> None:
     assert techniques_for(None, None) == []
 
 
+def test_expanded_catalog_mappings() -> None:
+    # Additions from the P2 catalog expansion (deterministic mapping preserved).
+    assert any(t[1] == "T1189" for t in techniques_for("cwe-352", None))   # CSRF -> Drive-by
+    assert any(t[1] == "T1499" for t in techniques_for("cwe-400", None))   # DoS -> Endpoint DoS
+    assert any(t[1] == "T1040" for t in techniques_for("cwe-319", None))   # cleartext -> Network Sniffing
+    assert any(t[1] == "T1190" for t in techniques_for(None, ["xxe"]))     # xxe tag -> Exploit Public App
+
+
 # --- resilient tool-run classifier ---
 
 class _Fake(BaseToolRunner):

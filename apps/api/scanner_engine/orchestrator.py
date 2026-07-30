@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.events import ScanCompleted, emit as emit_event, subscribe as subscribe_event
 from apps.api.modules.assets.models import Asset
 from apps.api.modules.assets.service import upsert_asset
 from apps.api.modules.attack.service import sync_attack_mappings
@@ -179,7 +180,7 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             "scan.failed scan=%s duration=%.2fs error=%s",
             scan.id, time.monotonic() - scan_started, exc, exc_info=True,
         )
-        await _emit_scan_notification(db, scan)
+        await _publish_scan_completed(db, scan)
         raise
 
     scan.completed_at = datetime.now(timezone.utc)
@@ -188,7 +189,7 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         "scan.finished scan=%s status=%s duration=%.2fs tools_run=%d",
         scan.id, scan.status, time.monotonic() - scan_started, len(runners),
     )
-    await _emit_scan_notification(db, scan)
+    await _publish_scan_completed(db, scan)
 
 
 async def _emit_scan_notification(db: AsyncSession, scan: Scan) -> None:
@@ -201,6 +202,25 @@ async def _emit_scan_notification(db: AsyncSession, scan: Scan) -> None:
         await db.commit()
     except Exception:
         logger.warning("scan.notify_failed scan=%s", scan.id, exc_info=True)
+
+
+async def _on_scan_completed(event: ScanCompleted) -> None:
+    """Default ScanCompleted subscriber: the in-app notification. Behaviorally
+    identical to the previous direct call; now routed through the event bus so
+    other reactions can subscribe without touching the orchestrator."""
+    if event.db is not None and event.scan is not None:
+        await _emit_scan_notification(event.db, event.scan)
+
+
+# Register the built-in subscriber at import time, so it is wired wherever the
+# orchestrator runs (API process and Celery worker alike).
+subscribe_event(ScanCompleted, _on_scan_completed)
+
+
+async def _publish_scan_completed(db: AsyncSession, scan: Scan) -> None:
+    await emit_event(
+        ScanCompleted(scan_id=scan.id, workspace_id=scan.workspace_id, status=scan.status, db=db, scan=scan)
+    )
 
 
 async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:

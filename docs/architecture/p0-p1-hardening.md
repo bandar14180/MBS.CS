@@ -141,3 +141,58 @@ suite: **142 passed**.
 Failed scans that exhaust retries land on the Redis list `dlq:scans.run_scan`
 (JSON: `scan_id`, `error`, `ts`), capped at 1000. Inspect with
 `redis-cli LRANGE dlq:scans.run_scan 0 -1`.
+
+---
+
+## P2 — Product improvements (done)
+
+All additive; existing behavior preserved.
+
+### P2-10 Event-driven findings pipeline
+- `core/events.py`: a tiny in-process event bus (`subscribe` / `emit`, sync+async
+  handlers, best-effort — a failing subscriber is logged and skipped). Domain
+  event `ScanCompleted`.
+- The orchestrator now emits `ScanCompleted` on terminal status; the in-app
+  notification is registered as the first subscriber and does **exactly** what the
+  previous direct call did (behavior unchanged). New reactions can subscribe
+  without touching the orchestrator.
+
+### P2-11 Storage provider interface
+- `scanner_engine/storage_provider.py`: `StorageProvider` ABC + `S3StorageProvider`
+  (MinIO/S3, reuses the existing evidence_store client helpers) + `get_storage_provider()`
+  selected by `STORAGE_PROVIDER`. Azure Blob / GCS raise a clear NotImplemented
+  behind the same interface. `evidence_store` itself is unchanged.
+
+### P2-12 Notification provider interface
+- `modules/notifications/providers.py`: `NotificationProvider` ABC +
+  `InAppNotificationProvider` (wraps the existing `create_notification`) +
+  placeholders for email/slack/teams/webhook that raise NotImplemented, via
+  `get_notification_provider(channel)`. In-app stays the wired default.
+
+### P2-13 Expanded ATT&CK catalog
+- `modules/attack/catalog.py`: +16 CWE mappings (CSRF, clickjacking, open redirect,
+  file upload, XXE, deserialization, access control, weak crypto/cleartext, DoS, …)
+  and +19 nuclei-tag mappings, plus new techniques (T1040 Network Sniffing, T1187
+  Forced Authentication, T1499 Endpoint DoS, T1140). Deterministic mapping
+  unchanged.
+
+### P2-14 CI
+- `.github/workflows/ci.yml`: a `tests` job (Postgres+Redis services → migrations →
+  pytest) and a non-blocking `scan-doctor` job that builds the worker image and
+  runs `python -m apps.api.scanner_engine.doctor`.
+
+### P2-15 httpx tech-detection model baked in
+- `Dockerfile.worker` warms httpx's ~92 MB "dit" model at build time (best-effort,
+  `|| true`) so scans don't download it at runtime; falls back to the runtime
+  download if the build network can't fetch it.
+
+## New environment variables (P2)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `STORAGE_PROVIDER` | `s3` | object-storage backend (`s3`/`minio`; azure_blob/gcs planned) |
+
+## Tests (P2)
+`test_interfaces.py` (event bus dispatch + failure isolation + async handlers;
+storage factory default/unknown; notification factory + unimplemented channel),
+`test_attack_mapping.py` (expanded-catalog mappings). Full suite: **149 passed**.
