@@ -96,6 +96,36 @@ def test_openrouter_terminal_4xx_not_retried(monkeypatch) -> None:
     assert calls["n"] == 1  # 401 is terminal -> no retries
 
 
+def test_openrouter_402_terminal_not_retried(monkeypatch) -> None:
+    # 402 Payment Required (no OpenRouter credits) is terminal -> one attempt,
+    # surfaced with a clear provider message rather than a stringified HTTP error.
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(402, text="insufficient credits")
+
+    _mock_httpx(monkeypatch, handler)
+    client = OpenRouterClient(api_key="sk-test", max_retries=3)
+    with pytest.raises(AIProviderError) as exc:
+        client.complete_json("s", "u")
+    assert calls["n"] == 1  # 402 is terminal -> no retries
+    assert "402" in str(exc.value)
+
+
+def test_failure_message_reports_actual_attempts(monkeypatch) -> None:
+    # A non-retryable, non-terminal status (e.g. 422) breaks after one attempt;
+    # the error must report attempts actually made, not the configured max.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, text="unprocessable")
+
+    _mock_httpx(monkeypatch, handler)
+    client = OpenRouterClient(api_key="sk-test", max_retries=3)
+    with pytest.raises(AIProviderError) as exc:
+        client.complete_json("s", "u")
+    assert "after 1 attempt(s)" in str(exc.value)
+
+
 def test_provider_error_is_runtimeerror() -> None:
     # The degradation contract relies on `except RuntimeError` upstream.
     assert issubclass(AIProviderError, RuntimeError)

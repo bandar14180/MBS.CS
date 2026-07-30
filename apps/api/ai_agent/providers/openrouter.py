@@ -60,8 +60,10 @@ class OpenRouterClient(BaseAIProvider):
         }
         with httpx.Client(timeout=self._timeout_s) as client:
             resp = client.post(f"{self._base_url}/chat/completions", headers=headers, json=payload)
-        # 4xx (except 429) are terminal config/request errors -> do not retry.
-        if resp.status_code in (400, 401, 403, 404):
+        # Terminal client errors (bad request / auth / payment / forbidden /
+        # not found) -> do not retry; surface a clear message. 429 and 5xx fall
+        # through to raise_for_status and are classified retryable below.
+        if resp.status_code in (400, 401, 402, 403, 404):
             raise AIProviderError(f"OpenRouter {resp.status_code}: {resp.text[:300]}")
         resp.raise_for_status()  # 429/5xx raise HTTPStatusError -> classified retryable
         data = resp.json()

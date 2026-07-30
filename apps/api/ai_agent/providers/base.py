@@ -114,7 +114,9 @@ class BaseAIProvider(ABC):
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         started = time.monotonic()
         last_exc: Exception | None = None
+        attempts = 0
         for attempt in range(self._max_retries + 1):
+            attempts = attempt + 1
             try:
                 result = self._invoke(system, user)
                 emit_usage(result.usage, latency_ms=(time.monotonic() - started) * 1000)
@@ -127,6 +129,8 @@ class BaseAIProvider(ABC):
                     time.sleep(min(2**attempt * 0.5, 8.0))
                     continue
                 break
+        # Report the attempts actually made, not the configured max -- a
+        # non-retryable failure (e.g. 402) breaks after one attempt.
         raise AIProviderError(
-            f"{self.provider_name} call failed after {self._max_retries + 1} attempt(s): {last_exc}"
+            f"{self.provider_name} call failed after {attempts} attempt(s): {last_exc}"
         ) from last_exc
