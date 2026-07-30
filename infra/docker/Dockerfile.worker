@@ -31,16 +31,21 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Bake the Nuclei template set into the image (installs to /root/nuclei-templates)
-# so scans don't depend on GitHub egress at runtime, and a locked-down sandbox
-# can't be starved of templates later. No `|| true`: if this can't fetch
-# templates, the image is not fit to run vuln scans -- fail the build loudly.
-RUN nuclei -update-templates
-
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
 RUN pip install --no-cache-dir -r apps/api/requirements.txt
 
 COPY apps/__init__.py ./apps/__init__.py
 COPY apps/api ./apps/api
+
+# Run scans as an unprivileged user. The default recon config uses connect scans
+# (naabu/nmap) which do NOT need root/raw sockets, so no capabilities are lost.
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /srv
+USER appuser
+
+# Bake the Nuclei template set into the image so scans don't depend on GitHub
+# egress at runtime. Run AS appuser so templates install under the runtime user's
+# HOME (~/nuclei-templates), which is where nuclei's default discovery looks. No
+# `|| true`: if this can't fetch templates, the image is not fit for vuln scans.
+RUN nuclei -update-templates
 
 CMD ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "--loglevel=info"]

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.ai_agent.claude_client import ClaudeClient, SupportsComplete
+from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
 from apps.api.ai_agent.models import AIPlan
 from apps.api.ai_agent.prompts.planner import (
     PLANNER_PROMPT_VERSION,
@@ -60,7 +60,7 @@ def _sanitize(
 
 class AIPlanner:
     def __init__(self, client: SupportsComplete | None = None):
-        self._client = client or ClaudeClient()
+        self._client = client or get_ai_client()
 
     async def plan(
         self,

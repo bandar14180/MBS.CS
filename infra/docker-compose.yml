@@ -59,8 +59,10 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+    # Migrations live in ../db and are applied via `docker compose exec api ...`;
+    # keep this mount in both dev and prod. The application CODE is baked into the
+    # image (prod) and bind-mounted only in the dev override.
     volumes:
-      - ../apps/api:/srv/apps/api
       - ../db:/srv/db
 
   worker:
@@ -75,8 +77,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ../apps/api:/srv/apps/api
 
   # Celery beat: emits the periodic "enqueue due schedules" tick (continuous
   # security). Reuses the worker image; the worker executes the scans it queues.
@@ -93,8 +93,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ../apps/api:/srv/apps/api
 
   web:
     build:

@@ -3,7 +3,8 @@ FROM python:3.12-slim
 WORKDIR /srv
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    UVICORN_WORKERS=2
 
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
 RUN pip install --no-cache-dir -r apps/api/requirements.txt
@@ -11,6 +12,16 @@ RUN pip install --no-cache-dir -r apps/api/requirements.txt
 COPY apps/__init__.py ./apps/__init__.py
 COPY apps/api ./apps/api
 
+# Run as an unprivileged user (defense in depth for the internet-facing service).
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /srv
+USER appuser
+
 EXPOSE 8000
 
-CMD ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Liveness probe (no external tooling: uses the stdlib against /health).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
+
+# Production default: no --reload, multiple workers. The dev compose override
+# replaces this with a hot-reloading single-worker command.
+CMD ["sh", "-c", "uvicorn apps.api.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2}"]

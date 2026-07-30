@@ -38,11 +38,13 @@ async def create_scan(
     if use_ai_planner:
         from apps.api.core.config import get_settings
 
-        if not get_settings().anthropic_api_key:
+        settings = get_settings()
+        if not settings.ai_enabled:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                "AI planner requires ANTHROPIC_API_KEY to be configured. Turn off "
-                "'Use AI planner' to run the scan without AI, or set a key in .env.",
+                f"AI planner requires an API key for the configured AI provider "
+                f"('{settings.ai_provider}'). Turn off 'Use AI planner' to run the scan "
+                f"without AI, or set the provider's API key.",
             )
 
     # The guardrail: no verified authorization scope, no scan. See

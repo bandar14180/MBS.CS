@@ -15,12 +15,20 @@ ai_router = APIRouter(prefix="/ai", tags=["ai"])
 class AIStatus(BaseModel):
     enabled: bool
     model: str
+    provider: str
 
 
 @ai_router.get("/status", response_model=AIStatus)
 async def ai_status(current_user: CurrentUserDep) -> AIStatus:
     settings = get_settings()
-    return AIStatus(enabled=bool(settings.anthropic_api_key), model=settings.ai_model)
+    # Provider-aware: reports whichever provider/model is configured. `enabled`
+    # reflects the selected provider having a key (kept backward compatible -- the
+    # field name/shape is unchanged; `provider` is additive).
+    return AIStatus(
+        enabled=settings.ai_enabled,
+        model=settings.active_ai_model,
+        provider=settings.ai_provider,
+    )
 
 
 @router.post(

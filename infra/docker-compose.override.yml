@@ -1,0 +1,20 @@
+# Dev overrides -- auto-merged by `docker compose up` (do NOT use in production).
+# Restores hot-reload and code bind mounts so local DX is identical to before the
+# Phase 1 image hardening. Production runs the base file only:
+#   docker compose -f docker-compose.yml up -d
+services:
+  api:
+    # Single-worker hot-reload for local iteration (base image default is
+    # multi-worker, no reload).
+    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ../apps/api:/srv/apps/api
+      - ../db:/srv/db
+
+  worker:
+    volumes:
+      - ../apps/api:/srv/apps/api
+
+  beat:
+    volumes:
+      - ../apps/api:/srv/apps/api

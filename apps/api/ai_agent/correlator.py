@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 
-from apps.api.ai_agent.claude_client import ClaudeClient, SupportsComplete
+from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
 from apps.api.ai_agent.prompts.correlator import (
     CORRELATOR_PROMPT_VERSION,
     CORRELATOR_SYSTEM,
@@ -24,7 +24,7 @@ class CorrelationResult:
 
 class AICorrelator:
     def __init__(self, client: SupportsComplete | None = None):
-        self._client = client or ClaudeClient()
+        self._client = client or get_ai_client()
 
     def correlate(self, findings: list[dict]) -> CorrelationResult:
         """`findings` is a list of dicts each with at least an `id`, plus title/

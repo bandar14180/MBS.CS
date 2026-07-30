@@ -90,17 +90,26 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # exception propagates to the outer handler which marks the scan failed.
         if scan.config.get("use_ai_planner"):
             from apps.api.ai_agent.planner import AIPlanner
+            from apps.api.ai_agent.providers.usage import collect_ai_usage
+            from apps.api.ai_agent.usage_repo import persist_ai_usage
 
-            plan = await AIPlanner().plan(
-                db,
-                scan_id=scan.id,
-                target_type=target_row.type,
-                target_value=target_row.value,
-                requested_modules=requested,
-                active_testing_allowed=scope.active_testing_allowed,
-            )
+            with collect_ai_usage(
+                agent_role="planner",
+                workspace_id=str(scan.workspace_id),
+                scan_id=str(scan.id),
+            ) as planner_usage:
+                plan = await AIPlanner().plan(
+                    db,
+                    scan_id=scan.id,
+                    target_type=target_row.type,
+                    target_value=target_row.value,
+                    requested_modules=requested,
+                    active_testing_allowed=scope.active_testing_allowed,
+                )
             requested = plan.tool_sequence
             await db.commit()
+            # Independent transaction; won't disturb the scan's RLS GUC above.
+            await persist_ai_usage(planner_usage)
 
         runners = [TOOL_REGISTRY[m]() for m in requested if m in TOOL_REGISTRY]
         # Deterministic recon pipeline: run in phase order regardless of the
