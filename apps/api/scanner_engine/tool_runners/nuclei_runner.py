@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+from apps.api.core.config import get_settings
 from apps.api.scanner_engine.tool_runners._net import resolve_scan_host
 from apps.api.scanner_engine.tool_runners.base import (
     BaseToolRunner,
@@ -10,7 +11,13 @@ from apps.api.scanner_engine.tool_runners.base import (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 300
-DEFAULT_TAGS = "misconfig"  # focused, fast; reliably fires (e.g. missing security headers) on generic HTTP servers
+# A broader-but-still-safe default template set for a professional web pentest:
+# common misconfigurations, known CVEs, sensitive exposures, default credentials,
+# subdomain takeovers, and tech fingerprinting. All are gated by
+# `requires_active_testing` (they send payloads). Override per-scan via
+# config["nuclei_tags"]; the richer classifications (CWE/CVE/tags) also drive the
+# ATT&CK / kill-chain mapping downstream.
+DEFAULT_TAGS = "misconfig,cve,exposure,default-login,takeover,tech"
 
 
 class NucleiRunner(BaseToolRunner):
@@ -37,6 +44,11 @@ class NucleiRunner(BaseToolRunner):
         tags = config.get("nuclei_tags", DEFAULT_TAGS)
 
         command = ["nuclei", "-jsonl", "-silent", "-disable-update-check", "-no-color"]
+        # Point nuclei at the baked-in template set explicitly (see
+        # Dockerfile.worker) so discovery never depends on the ambient $HOME.
+        templates_dir = get_settings().nuclei_templates_dir
+        if templates_dir:
+            command += ["-templates", templates_dir]
         if tags:
             command += ["-tags", tags]
 

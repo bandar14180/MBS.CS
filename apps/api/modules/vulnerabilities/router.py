@@ -3,6 +3,8 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
 
 from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
+from apps.api.modules.attack import service as attack_service
+from apps.api.modules.attack.schemas import AttackMappingRead
 from apps.api.modules.compliance import service as compliance_service
 from apps.api.modules.compliance.schemas import ComplianceMappingRead
 from apps.api.modules.risk import service as risk_service
@@ -89,6 +91,20 @@ async def get_compliance_mappings(
     await service.get_vulnerability(db, ctx.workspace_id, project_id, vuln_id)
     mappings = await compliance_service.list_mappings(db, vuln_id)
     return [ComplianceMappingRead.model_validate(m) for m in mappings]
+
+
+@router.get(
+    "/vulnerabilities/{vuln_id}/attack-mappings",
+    response_model=list[AttackMappingRead],
+    dependencies=[Depends(require_permission("vulnerability:read"))],
+)
+async def get_attack_mappings(
+    project_id: uuid.UUID, vuln_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> list[AttackMappingRead]:
+    """MITRE ATT&CK techniques + Cyber Kill Chain phases this finding maps to."""
+    await service.get_vulnerability(db, ctx.workspace_id, project_id, vuln_id)
+    mappings = await attack_service.list_attack_mappings(db, vuln_id)
+    return [AttackMappingRead.model_validate(m) for m in mappings]
 
 
 @router.get(

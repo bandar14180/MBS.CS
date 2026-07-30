@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.modules.attack.models import AttackMapping
 from apps.api.modules.compliance.models import ComplianceMapping
 from apps.api.modules.projects.models import Project
 from apps.api.modules.risk.models import RiskScore
@@ -41,6 +42,9 @@ class ReportData:
     total_vulns: int
     active_vulns: int
     vulns: list[VulnRow] = field(default_factory=list)
+    # MITRE ATT&CK coverage across the project: (tactic_name, technique_id,
+    # technique_name, finding_count), most-hit first.
+    attack_techniques: list[tuple[str, str, str, int]] = field(default_factory=list)
 
 
 def compute_security_score(active_severity_counts: dict[str, int]) -> int:
@@ -65,6 +69,7 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     risk_by_vuln: dict[uuid.UUID, RiskScore] = {}
     compliance_by_vuln: dict[uuid.UUID, list[tuple[str, str, str]]] = {}
     evidence_by_vuln: dict[uuid.UUID, list[str]] = {}
+    attack_counts: dict[tuple[str, str, str], int] = {}
     if vuln_ids:
         for r in await db.scalars(select(RiskScore).where(RiskScore.vulnerability_id.in_(vuln_ids))):
             risk_by_vuln[r.vulnerability_id] = r
@@ -72,6 +77,9 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             compliance_by_vuln.setdefault(m.vulnerability_id, []).append(
                 (m.framework, m.control_id, m.control_description or "")
             )
+        for a in await db.scalars(select(AttackMapping).where(AttackMapping.vulnerability_id.in_(vuln_ids))):
+            key = (a.tactic_name, a.technique_id, a.technique_name)
+            attack_counts[key] = attack_counts.get(key, 0) + 1
         # vulnerability_evidence -> evidence.storage_uri
         from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
 
@@ -110,6 +118,11 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             )
         )
 
+    attack_techniques = sorted(
+        [(tactic, tid, tname, count) for (tactic, tid, tname), count in attack_counts.items()],
+        key=lambda x: (-x[3], x[0], x[1]),
+    )
+
     return ReportData(
         project_name=project_name,
         security_score=compute_security_score(active_counts),
@@ -117,4 +130,5 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         total_vulns=len(vulns),
         active_vulns=sum(active_counts.values()),
         vulns=rows,
+        attack_techniques=attack_techniques,
     )

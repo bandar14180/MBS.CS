@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     ai_request_timeout_s: float = 60.0
     ai_max_retries: int = 3
 
+    # --- Scanner engine -----------------------------------------------------
+    # Directory the Nuclei template set is baked into (set in Dockerfile.worker).
+    # When set, the nuclei runner passes `-templates <dir>` so template discovery
+    # never depends on the ambient $HOME at scan time. Empty = nuclei's own default.
+    nuclei_templates_dir: str = ""
+
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
     # check (dev only). Set explicit hostnames in production.

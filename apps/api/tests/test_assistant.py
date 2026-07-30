@@ -81,8 +81,15 @@ def test_assistant_vuln_without_project_is_400(client: TestClient) -> None:
     assert resp.status_code == 400
 
 
-def test_assistant_ask_fails_soft_without_key(client: TestClient) -> None:
-    # No ANTHROPIC_API_KEY in the test env -> clean 503, never a 500.
+def test_assistant_ask_fails_soft_without_key(client: TestClient, monkeypatch) -> None:
+    # Force no key for the active provider (don't depend on ambient env) -> the
+    # assistant must fail soft with a clean 503, never a 500. Provider-agnostic.
+    from apps.api.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+
     headers = _headers(_register(client))
     ws = client.post("/api/v1/workspaces", headers=headers, json={"name": "Asst WS3"}).json()["id"]
     resp = client.post(

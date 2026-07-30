@@ -34,18 +34,31 @@ RUN apt-get update \
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
 RUN pip install --no-cache-dir -r apps/api/requirements.txt
 
-COPY apps/__init__.py ./apps/__init__.py
-COPY apps/api ./apps/api
-
 # Run scans as an unprivileged user. The default recon config uses connect scans
 # (naabu/nmap) which do NOT need root/raw sockets, so no capabilities are lost.
-RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /srv
+RUN useradd --create-home --uid 10001 appuser
 USER appuser
 
+# Docker does NOT reset $HOME when USER changes -- it stays at the builder default
+# (/root), so `nuclei -update-templates` below would write templates into a dir
+# the runtime appuser cannot read. Pin HOME to appuser's home so templates install
+# exactly where the runtime user's nuclei looks. NUCLEI_TEMPLATES_DIR is read by
+# the nuclei runner (via Settings) so template discovery never depends on ambient
+# $HOME at scan time either.
+ENV HOME=/home/appuser \
+    NUCLEI_TEMPLATES_DIR=/home/appuser/nuclei-templates
+
 # Bake the Nuclei template set into the image so scans don't depend on GitHub
-# egress at runtime. Run AS appuser so templates install under the runtime user's
-# HOME (~/nuclei-templates), which is where nuclei's default discovery looks. No
-# `|| true`: if this can't fetch templates, the image is not fit for vuln scans.
-RUN nuclei -update-templates
+# egress at runtime. Fail the build if templates did not land, readable, under
+# appuser's HOME -- an image that cannot vuln-scan is not fit to ship (no `|| true`).
+# This sits BEFORE the app COPY so iterating on application code doesn't bust the
+# (large, slow) template layer.
+RUN nuclei -update-templates \
+    && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ]
+
+# Application code last: it changes most often, so keeping it after the template
+# layer keeps rebuilds fast. Owned by the runtime user (COPY runs as root).
+COPY --chown=appuser:appuser apps/__init__.py ./apps/__init__.py
+COPY --chown=appuser:appuser apps/api ./apps/api
 
 CMD ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "--loglevel=info"]

@@ -39,6 +39,24 @@ class VulnerabilityFinding:
     metadata: dict = field(default_factory=dict)
 
 
+def classify_run(runner: "BaseToolRunner", raw: RawToolOutput, produced_findings: bool) -> str:
+    """Classify a completed tool run as completed | partial | failed (the resilient
+    pipeline's core rule; kept pure so it is unit-testable without a DB).
+
+    - completed: exit 0, or a non-zero code the runner declares benign.
+    - partial:   non-zero (non-benign) exit that still yielded usable output.
+    - failed:    a hard failure the runner flags, or a non-zero exit with nothing
+                 usable to keep.
+    (A runner that raises/times out is handled by the caller, not here.)"""
+    if runner.hard_failure(raw):
+        return "failed"
+    if raw.exit_code == 0 or raw.exit_code in runner.benign_exit_codes:
+        return "completed"
+    if produced_findings or raw.stdout.strip():
+        return "partial"
+    return "failed"
+
+
 class BaseToolRunner(ABC):
     name: str
     version: str
@@ -53,6 +71,13 @@ class BaseToolRunner(ABC):
     # running it and recording a failure (e.g. subfinder only makes sense on a
     # domain, not an ip_range).
     applicable_target_types: set[str] | None = None
+
+    # Non-zero exit codes this tool returns on benign conditions (e.g. "host
+    # down", "no results") -- the orchestrator treats these as success, not
+    # failure. Empty by default; a genuine non-zero exit is then classified as
+    # `partial` (parseable output was still produced) or `failed` (none), and in
+    # neither case does one tool abort the whole scan (resilient pipeline).
+    benign_exit_codes: frozenset[int] = frozenset()
 
     @abstractmethod
     async def run(self, target_value: str, config: dict, prior_findings: list[CommonFinding]) -> RawToolOutput:
@@ -70,3 +95,10 @@ class BaseToolRunner(ABC):
         (which only inventory assets) don't need to implement it; vuln scanners
         like Nuclei override it."""
         return []
+
+    def hard_failure(self, raw: RawToolOutput) -> bool:
+        """Whether this raw output is a definitive tool failure regardless of any
+        parseable content (override for tool-specific error signatures, e.g. an
+        auth/usage error in stderr). Default False: the orchestrator then
+        classifies purely on exit code + whether usable output was produced."""
+        return False

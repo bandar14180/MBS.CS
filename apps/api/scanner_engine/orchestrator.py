@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.assets.models import Asset
 from apps.api.modules.assets.service import upsert_asset
+from apps.api.modules.attack.service import sync_attack_mappings
 from apps.api.modules.authorization_scope.service import require_verified_target
 from apps.api.modules.compliance.service import sync_mappings
 from apps.api.modules.risk.service import upsert_risk_score
@@ -17,7 +18,7 @@ from apps.api.modules.vulnerabilities.service import ingest_finding
 from apps.api.scanner_engine import evidence_store
 from apps.api.scanner_engine.models import Evidence, ToolRun
 from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
-from apps.api.scanner_engine.tool_runners.base import CommonFinding
+from apps.api.scanner_engine.tool_runners.base import CommonFinding, classify_run
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,6 @@ logger = logging.getLogger(__name__)
 class AuthorizationRevoked(Exception):
     """Raised when a scan's authorization scope is no longer valid at execution
     time (revoked/expired between queueing and running)."""
-
-
-class ToolExecutionError(Exception):
-    """A pipeline tool failed (raised an error or returned a non-zero exit code).
-    Raising this aborts the scan fail-fast: no later tools run, no report is
-    generated, and the scan is marked failed with the exact error."""
 
 
 async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
@@ -122,6 +117,7 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # ones (httpx probes subfinder's subdomains; nmap deep-scans naabu ports;
         # nuclei scans httpx's http services).
         discovered: list[CommonFinding] = []
+        tool_statuses: list[str] = []
         for runner in runners:
             # Skip tools that don't apply to this target's type (e.g. subfinder
             # on an ip_range) -- cleanly, without recording a failed run.
@@ -144,19 +140,30 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
                 )
                 await db.commit()
                 continue
-            findings = await _run_single_tool(
+            findings, status = await _run_single_tool(
                 db, scan, runner, target_row.value, discovered, target_row.criticality
             )
             discovered.extend(findings)
+            tool_statuses.append(status)
 
-        # The scan's status must honestly reflect its tools. A run where tools
-        # errored is NOT a success: if every executed tool failed -> "failed";
-        # if some failed -> "completed_with_errors"; otherwise "completed".
-        # (skipped_unauthorized runs are intentional, not failures.)
-        # Reached only if every tool ran cleanly -- any tool failure raised
-        # (fail-fast) and is handled below as a scan failure. There is no
-        # "partial success": a scan either fully completed or it failed.
-        scan.status = "completed"
+        # The scan's status honestly reflects its tools. RESILIENT PIPELINE: a
+        # single tool's failure or partial run no longer aborts the whole scan --
+        # evidence and any parseable findings from the other tools are kept, and a
+        # report can still be generated. Aggregate over the tools that ACTUALLY
+        # executed (skipped_unauthorized runs are intentional, not failures):
+        #   failed                -> every executed tool failed
+        #   completed_with_errors -> at least one tool failed or ran partial
+        #   completed             -> all executed tools succeeded (or none ran)
+        if tool_statuses and all(s == "failed" for s in tool_statuses):
+            scan.status = "failed"
+        elif any(s in ("failed", "partial") for s in tool_statuses):
+            scan.status = "completed_with_errors"
+        else:
+            scan.status = "completed"
+
+        # Best-effort AI attack-path narrative over all of this scan's findings.
+        # Fully fail-soft: an AI failure never changes the scan status or aborts.
+        await _synthesize_attack_narrative(db, scan)
     except Exception as exc:
         scan.status = "failed"
         scan.completed_at = datetime.now(timezone.utc)
@@ -189,6 +196,69 @@ async def _emit_scan_notification(db: AsyncSession, scan: Scan) -> None:
         logger.warning("scan.notify_failed scan=%s", scan.id, exc_info=True)
 
 
+async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:
+    """Best-effort AI attack-path narrative for the whole scan. Wires the AI
+    Correlator (grouping) together with the deterministic attack_mappings (phase
+    ordering) into one kill-chain story, persisted to attack_narratives.
+
+    FAIL-SOFT: any failure (no AI key, provider down, parse/rate-limit error)
+    logs a warning and leaves the deterministic mappings intact -- it must never
+    change the scan status or abort. Runs with the workspace RLS GUC already set."""
+    try:
+        from apps.api.ai_agent.correlator import AICorrelator
+        from apps.api.ai_agent.providers.usage import collect_ai_usage
+        from apps.api.ai_agent.usage_repo import persist_ai_usage
+        from apps.api.core.observability import get_correlation_id
+        from apps.api.modules.attack.models import AttackMapping
+        from apps.api.modules.attack.service import kill_chain_steps, save_attack_narrative
+        from apps.api.modules.vulnerabilities.models import Vulnerability
+
+        vulns = list(
+            await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan.id))
+        )
+        if not vulns:
+            return  # nothing to narrate
+
+        vuln_ids = [v.id for v in vulns]
+        mappings = list(
+            await db.scalars(select(AttackMapping).where(AttackMapping.vulnerability_id.in_(vuln_ids)))
+        )
+
+        findings = [
+            {"id": str(v.id), "title": v.title, "severity": v.severity, "category": v.category}
+            for v in vulns
+        ]
+        with collect_ai_usage(
+            agent_role="correlator",
+            workspace_id=str(scan.workspace_id),
+            scan_id=str(scan.id),
+            correlation_id=get_correlation_id(),
+        ) as usage_records:
+            correlation = AICorrelator().correlate(findings)
+
+        # Deterministic-backed kill-chain steps (from persisted mappings) plus a
+        # short summary that reflects the AI Correlator's grouping.
+        steps = kill_chain_steps({v.id: v.title for v in vulns}, mappings)
+        phases = [s["phase_name"] for s in steps]
+        summary = (
+            f"{len(vulns)} finding(s) correlated into {len(correlation.groups)} attack group(s). "
+            f"Kill-chain coverage: {', '.join(phases) if phases else 'no techniques mapped'}."
+        )
+        await save_attack_narrative(
+            db,
+            workspace_id=scan.workspace_id,
+            scan_id=scan.id,
+            summary=summary,
+            steps=steps,
+            model_version=correlation.model_version,
+            prompt_version=correlation.prompt_version,
+        )
+        await db.commit()
+        await persist_ai_usage(usage_records)
+    except Exception:  # noqa: BLE001 -- narrative is strictly best-effort
+        logger.warning("scan.attack_narrative_failed scan=%s", scan.id, exc_info=True)
+
+
 async def _run_single_tool(
     db: AsyncSession,
     scan: Scan,
@@ -196,7 +266,12 @@ async def _run_single_tool(
     target_value: str,
     prior_findings: list[CommonFinding],
     criticality: str,
-) -> list[CommonFinding]:
+) -> tuple[list[CommonFinding], str]:
+    """Run one tool resiliently and return (findings, status) where status is
+    completed | partial | failed. A tool NEVER aborts the scan: a crash/timeout or
+    a non-zero exit with no usable output is recorded as `failed` and the pipeline
+    moves on; a non-zero exit that still produced parseable output is `partial`
+    (its findings are kept). The overall scan status is aggregated by the caller."""
     config = scan.config or {}
     tool_run = ToolRun(
         scan_id=scan.id,
@@ -215,6 +290,8 @@ async def _run_single_tool(
         scan.id, runner.name, runner.version, target_value, len(prior_findings),
     )
 
+    # A crash/timeout in the runner is a failed tool run, NOT a failed scan: record
+    # it (with evidence of the exception) and let the pipeline continue.
     try:
         raw = await runner.run(target_value, config, prior_findings)
     except Exception as exc:
@@ -226,14 +303,14 @@ async def _run_single_tool(
             "tool.failed scan=%s tool=%s duration=%.2fs error=%s",
             scan.id, runner.name, time.monotonic() - started, exc, exc_info=True,
         )
-        raise
+        return [], "failed"
 
     tool_run.command_hash = hashlib.sha256(raw.command.encode()).hexdigest()
     tool_run.exit_code = raw.exit_code
 
     # Every finding must trace to raw evidence (blueprint §1) -- store the raw
     # stdout/stderr blob in object storage and record an evidence row BEFORE
-    # turning any of it into assets.
+    # turning any of it into assets. Stored even for failed runs (debuggability).
     blob = (
         f"$ {raw.command}\n\n=== STDOUT ===\n{raw.stdout}\n\n=== STDERR ===\n{raw.stderr}\n"
     ).encode()
@@ -248,22 +325,33 @@ async def _run_single_tool(
     db.add(evidence)
     await db.flush()  # need evidence.id to link vulnerabilities to it
 
-    # FAIL-FAST: a non-zero exit is a hard failure. Record it (with the exact
-    # error and the evidence we just stored for debugging), then abort -- do NOT
-    # parse partial findings, do NOT run later tools, do NOT generate a report.
-    if raw.exit_code != 0:
-        stderr_tail = (raw.stderr or "").strip()[-1000:]
-        tool_run.status = "failed"
-        tool_run.error_message = f"exit code {raw.exit_code}" + (f": {stderr_tail}" if stderr_tail else "")
-        tool_run.completed_at = datetime.now(timezone.utc)
-        await db.commit()
-        logger.error(
-            "tool.failed scan=%s tool=%s exit=%s duration=%.2fs error=%s",
-            scan.id, runner.name, raw.exit_code, time.monotonic() - started, tool_run.error_message,
-        )
-        raise ToolExecutionError(f"{runner.name} failed ({tool_run.error_message})")
+    # PARSE-FIRST: attempt to parse regardless of exit code (a parser bug must not
+    # crash the pipeline). Then classify the run. A non-zero exit is only benign if
+    # the tool declares it so; otherwise output-bearing => partial, else failed.
+    try:
+        findings = runner.parse(raw)
+    except Exception:  # noqa: BLE001 -- a broken parse yields no assets, not a crash
+        logger.warning("tool.parse_failed scan=%s tool=%s", scan.id, runner.name, exc_info=True)
+        findings = []
+    try:
+        vuln_findings = list(runner.parse_vulnerabilities(raw))
+    except Exception:  # noqa: BLE001
+        logger.warning("tool.parse_vuln_failed scan=%s tool=%s", scan.id, runner.name, exc_info=True)
+        vuln_findings = []
 
-    findings = runner.parse(raw)
+    stderr_tail = (raw.stderr or "").strip()[-1000:]
+    status = classify_run(runner, raw, produced_findings=bool(findings or vuln_findings))
+
+    if status == "failed":
+        # Don't trust output from a failed run -- record the error, ingest nothing.
+        findings, vuln_findings = [], []
+        tool_run.error_message = f"exit code {raw.exit_code}" + (f": {stderr_tail}" if stderr_tail else "")
+    elif status == "partial":
+        tool_run.error_message = (
+            f"non-zero exit {raw.exit_code}; partial results kept"
+            + (f": {stderr_tail}" if stderr_tail else "")
+        )
+
     for finding in findings:
         await upsert_asset(
             db,
@@ -275,10 +363,10 @@ async def _run_single_tool(
         )
 
     # Vulnerability findings go through the Vulnerability Engine (dedup +
-    # lifecycle), each linked to this run's evidence. Then the Risk Engine
-    # weights CVSS by asset criticality, and the Compliance Engine maps the
-    # finding's category to framework controls (blueprint §7 steps 7 & later).
-    vuln_findings = list(runner.parse_vulnerabilities(raw))
+    # lifecycle), each linked to this run's evidence. Then the Risk Engine weights
+    # CVSS by asset criticality, the Compliance Engine maps the finding's category
+    # to framework controls, and the Attack Engine maps it to MITRE ATT&CK
+    # techniques + Cyber Kill Chain phases (blueprint §7 steps 7 & later).
     for vuln_finding in vuln_findings:
         asset_id = await _resolve_asset_id(db, scan, vuln_finding.matched_at)
         vuln = await ingest_finding(
@@ -292,19 +380,19 @@ async def _run_single_tool(
         )
         await upsert_risk_score(db, vuln.id, vuln.cvss_score, criticality)
         await sync_mappings(db, vuln.id, vuln.category)
+        await sync_attack_mappings(db, vuln.id, vuln.category, vuln_finding.metadata)
 
-    # Reached only on a clean (exit 0) run -- failures raised above (fail-fast).
-    tool_run.status = "completed"
+    tool_run.status = status
     tool_run.completed_at = datetime.now(timezone.utc)
     await db.commit()
 
     logger.info(
         "tool.done scan=%s tool=%s status=%s exit=%s duration=%.2fs "
         "assets=%d vulnerabilities=%d evidence=%s",
-        scan.id, runner.name, tool_run.status, raw.exit_code, time.monotonic() - started,
+        scan.id, runner.name, status, raw.exit_code, time.monotonic() - started,
         len(findings), len(vuln_findings), storage_uri,
     )
-    return findings
+    return findings, status
 
 
 async def _resolve_asset_id(db: AsyncSession, scan: Scan, matched_at: str | None) -> uuid.UUID | None:

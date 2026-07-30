@@ -104,6 +104,27 @@ def render_executive(data: ReportData) -> bytes:
         )
     )
 
+    # MITRE ATT&CK coverage: which adversary techniques the findings map to, most
+    # frequently observed first. The per-scan kill-chain view sequences these.
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph("MITRE ATT&CK coverage", styles["H2"]))
+    if data.attack_techniques:
+        att_rows = [["Tactic", "Technique", "ID", "Findings"]]
+        for tactic, tid, tname, count in data.attack_techniques[:15]:
+            att_rows.append([_esc(tactic), Paragraph(_esc(tname), styles["Cell"]), tid, str(count)])
+        atbl = Table(att_rows, colWidths=[45 * mm, 70 * mm, 25 * mm, 20 * mm])
+        atbl.setStyle(_table_style(colors))
+        story.append(atbl)
+        story.append(
+            Paragraph(
+                "Techniques are mapped to the Cyber Kill Chain; see the scan kill-chain view for the "
+                "sequenced attack path.",
+                styles["Body"],
+            )
+        )
+    else:
+        story.append(Paragraph("No findings mapped to ATT&CK techniques.", styles["Body"]))
+
     doc.build(story)
     return buf.getvalue()
 

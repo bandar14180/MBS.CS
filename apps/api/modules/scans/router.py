@@ -3,6 +3,8 @@ import uuid
 from fastapi import APIRouter, Depends, status
 
 from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
+from apps.api.modules.attack import service as attack_service
+from apps.api.modules.attack.schemas import KillChainRead, TacticMatrixRead
 from apps.api.modules.scans import service
 from apps.api.modules.scans.schemas import AIPlanRead, EvidenceRead, ScanCreate, ScanRead, ToolRunRead
 
@@ -89,3 +91,31 @@ async def list_evidence(
 async def get_ai_plan(project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> AIPlanRead:
     plan = await service.get_ai_plan(db, ctx.workspace_id, project_id, scan_id)
     return AIPlanRead.model_validate(plan)
+
+
+@router.get(
+    "/{scan_id}/attack-matrix",
+    response_model=list[TacticMatrixRead],
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_attack_matrix(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> list[TacticMatrixRead]:
+    """MITRE ATT&CK coverage for this scan: tactics -> techniques with hit counts."""
+    await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
+    matrix = await attack_service.attack_matrix_for_scan(db, scan_id)
+    return [TacticMatrixRead.model_validate(t) for t in matrix]
+
+
+@router.get(
+    "/{scan_id}/kill-chain",
+    response_model=KillChainRead,
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_kill_chain(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> KillChainRead:
+    """The scan's Cyber Kill Chain view -- the AI Correlator's attack-path
+    narrative when available, else the deterministic mapping."""
+    await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
+    return KillChainRead.model_validate(await attack_service.kill_chain_for_scan(db, scan_id))
