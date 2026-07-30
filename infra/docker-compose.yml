@@ -70,6 +70,10 @@ services:
       context: ..
       dockerfile: infra/docker/Dockerfile.worker
     restart: unless-stopped
+    # Consume both named queues: `scans` (heavy scan jobs, routed via task_routes)
+    # and `default` (everything else, e.g. schedules.enqueue_due). acks_late is set
+    # in the Celery config so a killed worker's task is re-delivered.
+    command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "scans,default", "--loglevel=info"]
     env_file:
       - ../.env
     depends_on:

@@ -18,6 +18,25 @@ celery_app = Celery(
 )
 celery_app.conf.broker_connection_retry_on_startup = True
 
+# --- Reliability (P1-6) -------------------------------------------------------
+# acks_late + reject_on_worker_lost: a task is only acknowledged AFTER it finishes,
+# so if a worker is killed mid-scan the broker re-delivers it (graceful recovery).
+# Scans are idempotent (orchestrator skips already-finished scans), so redelivery
+# is safe. prefetch=1 stops a worker hoarding long scans. Named queues let the
+# heavy scan work scale/isolate separately from everything else.
+celery_app.conf.update(
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
+    task_default_queue="default",
+    task_routes={
+        "scans.run_scan": {"queue": "scans"},
+        # schedules.enqueue_due stays on the default queue (cheap, frequent).
+    },
+    # Task-level retry defaults; the scan task overrides max_retries/backoff.
+    task_acks_on_failure_or_timeout=True,
+)
+
 # Continuous security: a beat tick every 60s launches any due recurring scans.
 # Runs in the dedicated `beat` service (see docker-compose); the worker executes
 # the scans it enqueues.

@@ -37,7 +37,45 @@ async def _run(scan_id: str) -> None:
         await engine.dispose()
 
 
-@celery_app.task(name="scans.run_scan")
-def run_scan_task(scan_id: str) -> str:
-    asyncio.run(_run(scan_id))
+def _record_dlq(scan_id: str, exc: Exception) -> None:
+    """Push an exhausted scan task onto a Redis dead-letter list for inspection.
+    Best-effort: a DLQ write must never mask the original failure."""
+    import json
+    import time as _time
+
+    try:
+        import redis
+
+        client = redis.from_url(get_settings().redis_url)
+        client.rpush(
+            "dlq:scans.run_scan",
+            json.dumps({"scan_id": scan_id, "error": f"{type(exc).__name__}: {exc}"[:1000], "ts": _time.time()}),
+        )
+        client.ltrim("dlq:scans.run_scan", -1000, -1)  # cap the list
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@celery_app.task(
+    bind=True,
+    name="scans.run_scan",
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,       # exponential backoff between retries
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=3,
+)
+def run_scan_task(self, scan_id: str) -> str:
+    """Execute a scan. Retries with exponential backoff on failure (transient DB /
+    storage / network issues recover); after retries are exhausted the task is
+    dead-lettered for inspection. The scan itself is idempotent -- the orchestrator
+    skips a scan that already reached a terminal state -- so acks_late redelivery
+    after a worker crash is safe."""
+    try:
+        asyncio.run(_run(scan_id))
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            _record_dlq(scan_id, exc)
+        raise
     return scan_id

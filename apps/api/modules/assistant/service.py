@@ -2,6 +2,7 @@ import uuid
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from apps.api.modules.assistant.schemas import AssistantAnswer
 from apps.api.modules.vulnerabilities.service import get_vulnerability
@@ -52,7 +53,10 @@ async def ask(
             workspace_id=workspace_id,
             correlation_id=get_correlation_id(),
         ) as usage_records:
-            result = SecurityAssistant().answer(question, context)
+            # Run the (synchronous) provider call off the event loop so heavy AI
+            # use never blocks the API. Usage collection still works: the context
+            # is copied into the worker thread and the sink list is shared.
+            result = await run_in_threadpool(SecurityAssistant().answer, question, context)
     except RuntimeError as exc:  # no provider key configured -> fail soft (503)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
 

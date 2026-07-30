@@ -41,6 +41,13 @@ async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
 async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     scan = await _load_scan(db, scan_id)
 
+    # Idempotency (P1-6): a task can be re-delivered after a worker crash
+    # (acks_late) or a retry. If this scan already reached a terminal state, do
+    # nothing -- never re-run a finished/cancelled scan.
+    if scan.status in ("completed", "completed_with_errors", "cancelled"):
+        logger.info("scan.skip_already_terminal scan=%s status=%s", scan.id, scan.status)
+        return
+
     await db.execute(
         text("SELECT set_config('app.current_workspace_id', :wid, false)"),
         {"wid": str(scan.workspace_id)},

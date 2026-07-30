@@ -129,6 +129,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = True
 
+    # How /metrics is protected. Secure by default:
+    #   token         -- require the X-Metrics-Token header to equal METRICS_TOKEN
+    #                    (Prometheus-friendly; pair with network restriction).
+    #   authenticated -- require a valid bearer JWT.
+    #   disabled      -- /metrics returns 404.
+    #   public        -- open (development only).
+    # In "token" mode with no METRICS_TOKEN set, access is denied (fail closed).
+    metrics_mode: str = "token"
+    metrics_token: str = ""
+
     # Browser origins allowed to call the API. The web app calls the API at
     # http://localhost:8000 regardless of where the page itself is served, so
     # every host the page can be opened from must be listed here or the browser
@@ -229,5 +239,11 @@ def configure_networking(settings: "Settings | None" = None) -> None:
 
 @lru_cache
 def get_settings() -> Settings:
+    # Secret loading order (first present wins): explicit env / Docker-K8s env ->
+    # external backend (setdefault) -> <NAME>_FILE (Docker/K8s secret files). See
+    # core/secrets.py. External backend is a no-op unless SECRETS_BACKEND is set.
+    from apps.api.core.secrets import load_external_secrets
+
+    load_external_secrets()
     _resolve_file_secrets()
     return Settings()

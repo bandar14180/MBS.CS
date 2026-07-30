@@ -74,5 +74,70 @@ API key; no TLS-interception problem.
 `tests/test_ai_providers.py`: local provider reuses the OpenAI-compatible path,
 factory selects local, local enables AI without a key, `httpx_verify` reflects
 settings, `validate_production` rejects disabled SSL, `configure_networking`
-mirrors env. `tests/test_scans.py`: unsupported target type → 400. Full suite:
-**131 passed**.
+mirrors env. `tests/test_scans.py`: unsupported target type → 400.
+
+---
+
+## P1 — Security & reliability (done)
+
+### P1-5 Secure `/metrics`
+- `main.py` `/metrics` now enforces `METRICS_MODE` (secure by default):
+  `disabled` (404) | `token` (require `X-Metrics-Token` == `METRICS_TOKEN`,
+  constant-time) | `authenticated` (valid bearer JWT) | `public` (dev). In `token`
+  mode with no token set, access is denied (fail closed).
+
+### P1-6 Celery reliability
+- `celery_app/worker.py`: `task_acks_late` + `task_reject_on_worker_lost` (a task
+  killed mid-scan is re-delivered), `worker_prefetch_multiplier=1`, named queues
+  via `task_routes` (`scans.run_scan` → `scans`; everything else → `default`).
+- `scan_tasks.run_scan_task`: `autoretry_for=(Exception,)` with exponential
+  backoff (`retry_backoff`, max 300s, jitter), `max_retries=3`; on exhaustion the
+  task is **dead-lettered** to the Redis list `dlq:scans.run_scan` (best-effort).
+- **Idempotency:** `orchestrator.run_scan` returns early if the scan already
+  reached a terminal state, so acks_late redelivery never re-runs a finished scan.
+- The worker service consumes `-Q scans,default`.
+
+### P1-7 Async AI (non-blocking)
+- The synchronous provider calls in the API process (assistant `ask`, remediation
+  `generate`, FP `analysis`) now run via `run_in_threadpool`, off the event loop.
+  Response shape is unchanged (no breaking change); usage collection still works
+  (the context is copied into the worker thread). The planner/correlator already
+  run in Celery.
+
+### P1-8 Sliding-window rate limiting
+- `core/middleware.RateLimitMiddleware` replaced the fixed-window counter with a
+  Redis **sorted-set sliding window** (drop-old / add / count), smoothing the
+  boundary burst a fixed window allows. Still path-aware, env-driven, and
+  fail-open.
+
+### P1-9 Secret management
+- New `core/secrets.py`: pluggable secret loading with a documented order —
+  (1) explicit env (incl. Docker/K8s injected env), (2) `<NAME>_FILE` files
+  (Docker Secrets `/run/secrets/*`, K8s mounted secrets, Vault templated files),
+  (3) an external backend via `SECRETS_BACKEND` (AWS Secrets Manager provided as
+  an interface; boto3 imported lazily, only when selected). `get_settings()` runs
+  the external backend then the file resolver; both use setdefault so explicit env
+  always wins. Nothing hardcodes/logs secrets.
+
+## New environment variables (P1)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `METRICS_MODE` | `token` | `disabled` \| `token` \| `authenticated` \| `public` |
+| `METRICS_TOKEN` | `` | shared token for `token` mode (fail-closed if unset) |
+| `SECRETS_BACKEND` | `` | `aws` selects AWS Secrets Manager (else none) |
+| `AWS_SECRETS_ID` | `` | secret bundle id when `SECRETS_BACKEND=aws` |
+| `AWS_REGION` | `` | region for AWS Secrets Manager |
+
+Rate-limit vars (`RATE_LIMIT_ENABLED`, `RATE_LIMIT_DEFAULT`, `RATE_LIMIT_AUTH`,
+`RATE_LIMIT_AI`) are unchanged; the strategy under them is now sliding-window.
+
+## Tests
+`test_metrics.py` (all 4 modes), `test_reliability.py` (secret order + AWS provider
+mapping + Celery retry/queue config + best-effort DLQ), plus the P0 tests. Full
+suite: **142 passed**.
+
+## DLQ operations
+Failed scans that exhaust retries land on the Redis list `dlq:scans.run_scan`
+(JSON: `scan_id`, `error`, `ts`), capped at 1000. Inspect with
+`redis-cli LRANGE dlq:scans.run_scan 0 -1`.

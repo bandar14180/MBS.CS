@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from sqlalchemy import text
+from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from apps.api.core.config import configure_networking, get_settings
@@ -132,8 +133,27 @@ def create_app() -> FastAPI:
                             status_code=200 if ok else 503)
 
     @app.get("/metrics")
-    def metrics() -> Response:
-        """Prometheus scrape endpoint."""
+    def metrics(request: Request) -> Response:
+        """Prometheus scrape endpoint. Access is governed by METRICS_MODE
+        (secure by default): disabled | token | authenticated | public."""
+        mode = settings.metrics_mode
+        if mode == "disabled":
+            return Response(status_code=404)
+        if mode == "authenticated":
+            from apps.api.core.security import decode_access_token
+
+            authz = request.headers.get("authorization", "")
+            token = authz[7:] if authz[:7].lower() == "bearer " else ""
+            try:
+                decode_access_token(token)
+            except Exception:  # noqa: BLE001
+                return Response("Unauthorized", status_code=401)
+        elif mode != "public":  # "token" (default) or any unknown value -> fail closed
+            import hmac
+
+            supplied = request.headers.get("x-metrics-token", "")
+            if not settings.metrics_token or not hmac.compare_digest(supplied, settings.metrics_token):
+                return Response("Forbidden", status_code=403)
         return Response(metrics_response_body(), media_type=CONTENT_TYPE_LATEST)
 
     return app

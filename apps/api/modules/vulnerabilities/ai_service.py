@@ -35,18 +35,23 @@ async def generate_remediation(
 ) -> Remediation:
     vuln = await get_vulnerability(db, workspace_id, project_id, vuln_id)
 
+    from starlette.concurrency import run_in_threadpool
+
     from apps.api.ai_agent.remediation_writer import RemediationWriter
 
     try:
-        result = RemediationWriter().write(
-            title=vuln.title,
-            severity=vuln.severity,
-            category=vuln.category,
-            matched_at=_location_hint(vuln.fingerprint),
-            cvss_score=vuln.cvss_score,
-            description=vuln.description,
+        # Off the event loop -- the provider call is synchronous.
+        result = await run_in_threadpool(
+            lambda: RemediationWriter().write(
+                title=vuln.title,
+                severity=vuln.severity,
+                category=vuln.category,
+                matched_at=_location_hint(vuln.fingerprint),
+                cvss_score=vuln.cvss_score,
+                description=vuln.description,
+            )
         )
-    except RuntimeError as exc:  # ANTHROPIC_API_KEY not set
+    except RuntimeError as exc:  # no provider key configured
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
 
     stmt = pg_insert(Remediation.__table__).values(
@@ -97,9 +102,11 @@ async def fp_analysis(db: AsyncSession, workspace_id: uuid.UUID, project_id: uui
     )
     findings = [_finding_dict(v) for v in vulns]
 
+    from starlette.concurrency import run_in_threadpool
+
     from apps.api.ai_agent.fp_reducer import FPReducer
 
     try:
-        return FPReducer().assess(findings)
+        return await run_in_threadpool(FPReducer().assess, findings)  # off the event loop
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))

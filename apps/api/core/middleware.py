@@ -1,5 +1,6 @@
 import logging
 import time
+import uuid
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -77,10 +78,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Fixed-window rate limiter backed by Redis (reuses REDIS_URL). Path-aware:
-    auth and AI endpoints get tighter limits than the global default. Fail-open --
-    if Redis is unreachable, requests are allowed (availability over enforcement)
-    and a warning is logged, so a Redis blip never takes the API down."""
+    """Sliding-window rate limiter backed by Redis (reuses REDIS_URL). Path-aware:
+    auth and AI endpoints get tighter limits than the global default.
+
+    Uses a per-key Redis sorted set of request timestamps: each request drops
+    entries older than the window, records itself, and counts what remains. Unlike
+    a fixed window this smooths the boundary burst (a fixed window allows up to 2x
+    the limit across an edge). Fail-open -- if Redis is unreachable, requests are
+    allowed (availability over enforcement) and a warning is logged, so a Redis
+    blip never takes the API down."""
 
     def __init__(self, app, *, redis_url: str, default: str, auth: str, ai: str):
         super().__init__(app)
@@ -107,19 +113,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         bucket, (limit, window) = self._limit_for(request.url.path)
         ip = _client_ip(request)
-        window_index = int(time.time()) // window
-        key = f"rl:{bucket}:{ip}:{window_index}"
+        key = f"rl:{bucket}:{ip}"
+        now = time.time()
         try:
             client = await self._get_redis()
-            count = await client.incr(key)
-            if count == 1:
-                await client.expire(key, window)
+            async with client.pipeline(transaction=True) as pipe:
+                pipe.zremrangebyscore(key, 0, now - window)          # drop entries outside the window
+                pipe.zadd(key, {f"{now}:{uuid.uuid4().hex}": now})   # record this request (unique member)
+                pipe.zcard(key)                                      # how many remain in the window
+                pipe.expire(key, window + 1)                         # let idle keys self-clean
+                results = await pipe.execute()
+            count = results[2]
             if count > limit:
-                retry_after = window - (int(time.time()) % window)
                 return JSONResponse(
                     {"detail": "Rate limit exceeded. Try again later."},
                     status_code=429,
-                    headers={"Retry-After": str(retry_after)},
+                    headers={"Retry-After": str(window)},
                 )
         except Exception:  # noqa: BLE001 -- fail open on limiter/redis failure
             logger.warning("rate limiter unavailable; allowing request", exc_info=True)
