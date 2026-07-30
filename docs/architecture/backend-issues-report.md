@@ -1,5 +1,11 @@
 # MBS.SC Backend — Outstanding Issues Report
 
+> **Status (2026-07-30): all P0 and P1 items RESOLVED; P2 items implemented as
+> additive interfaces/improvements.** See
+> [p0-p2-implementation-report.md](p0-p2-implementation-report.md) and
+> [p0-p1-hardening.md](p0-p1-hardening.md). Items below remain as the original
+> assessment; residual debt is listed in the implementation report.
+
 _Compiled 2026-07-29 from the Phase 1/Phase 2 work and a full live end-to-end scan
 (scanme.nmap.org). Each item lists impact and a recommended fix. Priorities:
 **P0** = blocks correct/complete operation, **P1** = important hardening/reliability,
