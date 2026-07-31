@@ -1,8 +1,9 @@
 import uuid
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 
 from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
+from apps.api.core.pagination import PaginationDep, set_page_headers
 from apps.api.modules.notifications import service
 from apps.api.modules.notifications.schemas import NotificationRead, UnreadCount
 
@@ -11,9 +12,10 @@ router = APIRouter(prefix="/workspaces/{workspace_id}/notifications", tags=["not
 
 @router.get("", response_model=list[NotificationRead], dependencies=[Depends(require_permission("workspace:view"))])
 async def list_notifications(
-    db: DbDep, ctx: WorkspaceContextDep, unread: bool = Query(default=False)
+    db: DbDep, ctx: WorkspaceContextDep, response: Response, page: PaginationDep, unread: bool = Query(default=False)
 ) -> list[NotificationRead]:
-    notes = await service.list_notifications(db, ctx.workspace_id, unread_only=unread)
+    notes, total = await service.list_notifications(db, ctx.workspace_id, unread_only=unread, page=page)
+    set_page_headers(response, total=total, page=page)
     return [NotificationRead.model_validate(n) for n in notes]
 
 

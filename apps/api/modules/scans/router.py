@@ -1,8 +1,9 @@
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 
 from apps.api.core.deps import CurrentUserDep, DbDep, WorkspaceContextDep, require_permission
+from apps.api.core.pagination import PaginationDep, set_page_headers
 from apps.api.modules.attack import service as attack_service
 from apps.api.modules.attack.schemas import KillChainRead, TacticMatrixRead
 from apps.api.modules.scans import service
@@ -48,8 +49,11 @@ async def create_scan(project_id: uuid.UUID, payload: ScanCreate, db: DbDep, ctx
     response_model=list[ScanRead],
     dependencies=[Depends(require_permission("scan:read"))],
 )
-async def list_scans(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> list[ScanRead]:
-    scans = await service.list_scans(db, ctx.workspace_id, project_id)
+async def list_scans(
+    project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep, response: Response, page: PaginationDep
+) -> list[ScanRead]:
+    scans, total = await service.list_scans(db, ctx.workspace_id, project_id, page)
+    set_page_headers(response, total=total, page=page)
     return [ScanRead.model_validate(s) for s in scans]
 
 

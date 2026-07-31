@@ -5,6 +5,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
 from apps.api.modules.authorization_scope.service import require_verified_target
 from apps.api.modules.projects.service import get_target
 from apps.api.modules.scans.models import Scan
@@ -110,13 +111,15 @@ async def create_scan(
     return scan
 
 
-async def list_scans(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID) -> list[Scan]:
-    result = await db.scalars(
+async def list_scans(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, page: Pagination | None = None
+) -> tuple[list[Scan], int]:
+    query = (
         select(Scan)
         .where(Scan.workspace_id == workspace_id, Scan.project_id == project_id)
-        .order_by(Scan.created_at.desc())
+        .order_by(Scan.created_at.desc(), Scan.id)
     )
-    return list(result)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def get_scan(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, scan_id: uuid.UUID) -> Scan:
