@@ -66,6 +66,42 @@ def test_storage_provider_unknown_backend_raises(monkeypatch) -> None:
         storage_provider.get_storage_provider()
 
 
+class _FakeStorage:
+    """A fake StorageProvider (duck-typed) for tests -- no real object store."""
+
+    store: dict[str, bytes] = {}
+
+    def put(self, key, content, content_type="application/octet-stream"):
+        _FakeStorage.store[key] = content
+        return f"s3://reports/{key}"
+
+    def get(self, key):
+        return _FakeStorage.store[key]
+
+
+def test_reports_storage_goes_through_provider(monkeypatch) -> None:
+    # reports/storage.py no longer imports evidence_store's private helpers -- it
+    # uses the StorageProvider interface, so a fake provider drives it end to end.
+    import uuid
+
+    from apps.api.modules.reports import storage as report_storage
+
+    _FakeStorage.store.clear()
+    monkeypatch.setattr(report_storage, "get_storage_provider", lambda bucket=None: _FakeStorage())
+    rid = uuid.uuid4()
+    uri = report_storage.store_report(rid, b"PDF-BYTES")
+    assert uri.startswith("s3://")
+    assert report_storage.fetch_report(uri) == b"PDF-BYTES"
+
+
+def test_reports_storage_has_no_private_evidence_import() -> None:
+    import inspect
+
+    from apps.api.modules.reports import storage as report_storage
+
+    assert "_get_s3_client" not in inspect.getsource(report_storage)
+
+
 # --- notification provider (P2-12) ---
 
 def test_notification_provider_factory() -> None:

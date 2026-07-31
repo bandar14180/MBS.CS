@@ -27,9 +27,9 @@ class StorageProvider(ABC):
 
 
 class S3StorageProvider(StorageProvider):
-    """MinIO / AWS S3 compatible. Reuses the existing evidence_store client helpers
-    (same endpoint/credentials/signature) so nothing about current behavior
-    changes -- this only formalizes the interface."""
+    """MinIO / AWS S3 compatible. Self-contained boto3 client (same endpoint /
+    credentials / signature as the rest of the platform), so callers depend on this
+    interface rather than reaching into another module's private helpers."""
 
     name = "s3"
 
@@ -37,10 +37,23 @@ class S3StorageProvider(StorageProvider):
         self._bucket = bucket or get_settings().s3_bucket_evidence
 
     def _client(self):
-        from apps.api.scanner_engine import evidence_store
+        import boto3
+        from botocore.client import Config
+        from botocore.exceptions import ClientError
 
-        client = evidence_store._get_s3_client()
-        evidence_store._ensure_bucket(client, self._bucket)
+        s = get_settings()
+        client = boto3.client(
+            "s3",
+            endpoint_url=s.s3_endpoint_url,
+            aws_access_key_id=s.s3_access_key,
+            aws_secret_access_key=s.s3_secret_key,
+            config=Config(signature_version="s3v4"),
+            region_name="us-east-1",
+        )
+        try:
+            client.head_bucket(Bucket=self._bucket)
+        except ClientError:
+            client.create_bucket(Bucket=self._bucket)
         return client
 
     def put(self, key: str, content: bytes, content_type: str = "application/octet-stream") -> str:
