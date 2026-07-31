@@ -115,6 +115,17 @@ class Settings(BaseSettings):
     # cloud_account / repo need dedicated engines (roadmap) and stay gated until then.
     supported_target_types: list[str] = ["domain", "ip_range"]
 
+    # --- SSRF / target safety (multi-tenant) --------------------------------
+    # By default the scanner refuses to touch non-public addresses (loopback,
+    # RFC1918, link-local, ULA, reserved, multicast) and cloud metadata endpoints,
+    # at target creation AND at every DNS resolution (defends DNS rebinding).
+    # Set scan_allow_private_targets=true ONLY for an on-prem/internal engagement,
+    # and then only the exact CIDRs in scan_allowed_cidrs may be scanned. Cloud
+    # metadata IPs stay blocked unless listed as an explicit host (/32 or /128) in
+    # scan_allowed_cidrs. There is deliberately no blanket "disable SSRF" switch.
+    scan_allow_private_targets: bool = False
+    scan_allowed_cidrs: list[str] = []
+
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
     # check (dev only). Set explicit hostnames in production.

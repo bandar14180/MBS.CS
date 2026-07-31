@@ -78,6 +78,26 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         if target_row is None:
             raise ValueError("Target disappeared")
 
+        # SSRF re-check at execution time (defense in depth): the target may
+        # predate the creation-time guard, or its DNS may now resolve to a
+        # forbidden address (rebinding). A forbidden target hard-aborts the scan --
+        # this is a safety failure, not a fail-soft tool error.
+        import socket as _socket
+
+        from apps.api.scanner_engine.net_guard import (
+            TargetNotAllowed,
+            _host_from_value,
+            resolve_and_validate,
+        )
+
+        if target_row.type in ("domain", "ip_range"):
+            try:
+                resolve_and_validate(_host_from_value(target_row.value))
+            except TargetNotAllowed as exc:
+                raise ValueError(f"Target blocked by SSRF policy: {exc}")
+            except _socket.gaierror:
+                pass  # unresolvable now; tools will fail cleanly, no scan of a bad host
+
         requested = scan.config.get("requested_modules", [])
 
         # Opt-in AI planning (blueprint §7 step 2). When enabled, the AI Planner

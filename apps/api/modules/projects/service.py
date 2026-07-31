@@ -73,6 +73,16 @@ async def create_target(
 ) -> Target:
     await get_project(db, workspace_id, project_id)  # 404s if project isn't in this workspace
 
+    # SSRF guard: refuse a target that is (or resolves to) a private/reserved/
+    # metadata address unless the on-prem allowlist explicitly permits it. The
+    # authoritative re-check happens again at scan time (DNS-rebinding defense).
+    from apps.api.scanner_engine.net_guard import TargetNotAllowed, validate_target_value
+
+    try:
+        validate_target_value(target_type, value)
+    except TargetNotAllowed as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
     from apps.api.modules.billing import service as billing
 
     await billing.enforce_target_quota(db, workspace_id)
