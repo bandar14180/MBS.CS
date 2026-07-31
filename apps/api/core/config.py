@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     ai_request_timeout_s: float = 60.0
     ai_max_retries: int = 3
 
+    # AI correlator (attack-path narrative) latency controls. A large scan must not
+    # trigger unbounded AI work: beyond ai_correlator_max_findings the AI narrative
+    # is skipped (findings are STILL deterministically mapped to ATT&CK; only the
+    # generated story is bounded). The call is also wall-clock bounded and can use a
+    # smaller/faster model. All fail-soft: a skip/timeout never fails the scan.
+    ai_correlator_max_findings: int = 60
+    ai_correlator_timeout_seconds: float = 90.0
+    ai_correlator_model: str = ""  # optional override; empty = the active provider's default
+
     # --- Outbound TLS / proxy (enterprise networking) -----------------------
     # For networks that intercept TLS (corporate proxy/AV) or require an egress
     # proxy. The correct fix for TLS inspection is a custom CA bundle -- NEVER

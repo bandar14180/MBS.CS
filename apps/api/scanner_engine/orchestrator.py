@@ -252,19 +252,35 @@ async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:
     logs a warning and leaves the deterministic mappings intact -- it must never
     change the scan status or abort. Runs with the workspace RLS GUC already set."""
     try:
+        import asyncio
+
         from apps.api.ai_agent.correlator import AICorrelator
+        from apps.api.ai_agent.providers.factory import get_ai_client
         from apps.api.ai_agent.providers.usage import collect_ai_usage
         from apps.api.ai_agent.usage_repo import persist_ai_usage
+        from apps.api.core.config import get_settings
         from apps.api.core.observability import get_correlation_id
         from apps.api.modules.attack.models import AttackMapping
         from apps.api.modules.attack.service import kill_chain_steps, save_attack_narrative
         from apps.api.modules.vulnerabilities.models import Vulnerability
 
+        settings = get_settings()
         vulns = list(
             await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan.id))
         )
         if not vulns:
             return  # nothing to narrate
+
+        # LATENCY BOUND: beyond the cap, skip the AI narrative entirely. The
+        # deterministic ATT&CK mapping is already persisted and the kill-chain
+        # endpoint falls back to it, so coverage is unchanged -- only the generated
+        # story is bounded. Never blocks a large scan on unbounded AI work.
+        if len(vulns) > settings.ai_correlator_max_findings:
+            logger.info(
+                "scan.attack_narrative_skipped scan=%s findings=%d > cap=%d",
+                scan.id, len(vulns), settings.ai_correlator_max_findings,
+            )
+            return
 
         vuln_ids = [v.id for v in vulns]
         mappings = list(
@@ -275,13 +291,19 @@ async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:
             {"id": str(v.id), "title": v.title, "severity": v.severity, "category": v.category}
             for v in vulns
         ]
+        client = get_ai_client(settings.ai_correlator_model or None)
         with collect_ai_usage(
             agent_role="correlator",
             workspace_id=str(scan.workspace_id),
             scan_id=str(scan.id),
             correlation_id=get_correlation_id(),
         ) as usage_records:
-            correlation = AICorrelator().correlate(findings)
+            # Wall-clock bound the (blocking) correlator off the loop; a timeout is
+            # fail-soft -> deterministic fallback, scan unaffected.
+            correlation = await asyncio.wait_for(
+                asyncio.to_thread(AICorrelator(client=client).correlate, findings),
+                timeout=settings.ai_correlator_timeout_seconds,
+            )
 
         # Deterministic-backed kill-chain steps (from persisted mappings) plus a
         # short summary that reflects the AI Correlator's grouping.
@@ -302,6 +324,8 @@ async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:
         )
         await db.commit()
         await persist_ai_usage(usage_records)
+    except TimeoutError:
+        logger.warning("scan.attack_narrative_timeout scan=%s", scan.id)
     except Exception:  # noqa: BLE001 -- narrative is strictly best-effort
         logger.warning("scan.attack_narrative_failed scan=%s", scan.id, exc_info=True)
 

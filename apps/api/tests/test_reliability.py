@@ -69,3 +69,62 @@ def test_record_dlq_is_best_effort(monkeypatch) -> None:
         scan_tasks, "get_settings", lambda: types.SimpleNamespace(redis_url="redis://127.0.0.1:1/0")
     )
     scan_tasks._record_dlq("scan-1", RuntimeError("boom"))  # must not raise
+
+
+class _FakeRedis:
+    def __init__(self):
+        self.lists: dict = {}
+
+    def rpush(self, k, v):
+        self.lists.setdefault(k, []).append(v.encode() if isinstance(v, str) else v)
+
+    def lrange(self, k, a, b):
+        return list(self.lists.get(k, []))
+
+    def lrem(self, k, count, val):
+        lst = self.lists.get(k, [])
+        n = lst.count(val)
+        self.lists[k] = [x for x in lst if x != val]
+        return n
+
+    def llen(self, k):
+        return len(self.lists.get(k, []))
+
+    def delete(self, k):
+        self.lists.pop(k, None)
+
+    def ltrim(self, k, a, b):
+        pass
+
+
+def test_dlq_inspect_replay_remove(monkeypatch) -> None:
+    import json
+
+    from apps.api.celery_app import dlq
+    from apps.api.celery_app.tasks import scan_tasks
+
+    fake = _FakeRedis()
+    monkeypatch.setattr(dlq, "_redis", lambda: fake)
+    fake.rpush(dlq.DLQ_KEY, json.dumps({"scan_id": "s1", "error": "boom", "retries": 3}))
+    fake.rpush(dlq.DLQ_KEY, json.dumps({"scan_id": "s2", "error": "bad", "retries": 3}))
+
+    assert len(dlq.inspect()) == 2
+
+    calls: list = []
+    monkeypatch.setattr(scan_tasks.run_scan_task, "delay", lambda sid: calls.append(sid))
+    assert dlq.replay("s1") is True          # re-enqueued once
+    assert calls == ["s1"]
+    assert [e["scan_id"] for e in dlq.inspect()] == ["s2"]   # s1 removed from DLQ
+    assert dlq.replay("missing") is False    # nothing to replay
+
+    assert dlq.remove("s2") == 1
+    assert dlq.inspect() == []
+
+
+def test_get_ai_client_accepts_model_override(monkeypatch) -> None:
+    from apps.api.ai_agent.providers import factory
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ai_provider", "local")
+    client = factory.get_ai_client("llama3.2:1b")
+    assert client.model_version == "llama3.2:1b"

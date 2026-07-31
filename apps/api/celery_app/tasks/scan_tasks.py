@@ -37,9 +37,13 @@ async def _run(scan_id: str) -> None:
         await engine.dispose()
 
 
-def _record_dlq(scan_id: str, exc: Exception) -> None:
-    """Push an exhausted scan task onto a Redis dead-letter list for inspection.
-    Best-effort: a DLQ write must never mask the original failure."""
+DLQ_KEY = "dlq:scans.run_scan"
+
+
+def _record_dlq(scan_id: str, exc: Exception, *, task_id: str | None = None, retries: int = 0) -> None:
+    """Push an exhausted scan task onto a Redis dead-letter list for inspection /
+    replay. Best-effort: a DLQ write must never mask the original failure. See
+    apps.api.celery_app.dlq for inspect/replay/remove tooling."""
     import json
     import time as _time
 
@@ -48,10 +52,19 @@ def _record_dlq(scan_id: str, exc: Exception) -> None:
 
         client = redis.from_url(get_settings().redis_url)
         client.rpush(
-            "dlq:scans.run_scan",
-            json.dumps({"scan_id": scan_id, "error": f"{type(exc).__name__}: {exc}"[:1000], "ts": _time.time()}),
+            DLQ_KEY,
+            json.dumps(
+                {
+                    "task_name": "scans.run_scan",
+                    "task_id": task_id,
+                    "scan_id": scan_id,          # workspace is derivable via the scan row
+                    "retries": retries,
+                    "error": f"{type(exc).__name__}: {exc}"[:1000],
+                    "ts": _time.time(),
+                }
+            ),
         )
-        client.ltrim("dlq:scans.run_scan", -1000, -1)  # cap the list
+        client.ltrim(DLQ_KEY, -1000, -1)  # cap the list
     except Exception:  # noqa: BLE001
         pass
 
@@ -76,6 +89,6 @@ def run_scan_task(self, scan_id: str) -> str:
         asyncio.run(_run(scan_id))
     except Exception as exc:
         if self.request.retries >= self.max_retries:
-            _record_dlq(scan_id, exc)
+            _record_dlq(scan_id, exc, task_id=self.request.id, retries=self.request.retries)
         raise
     return scan_id
