@@ -87,3 +87,27 @@ def test_unimplemented_channel_send_raises() -> None:
     provider = get_notification_provider("email")
     with pytest.raises(NotImplementedError):
         asyncio.run(provider.send(title="t", workspace_id="w"))
+
+
+# --- scanner capability registry (P0-2) ---
+
+def test_capability_registry_supported_and_scanners() -> None:
+    from apps.api.scanner_engine import capabilities
+
+    assert capabilities.is_supported("domain") is True
+    assert capabilities.is_supported("ip_range") is True
+    assert capabilities.is_supported("repo") is False
+    assert capabilities.is_supported("cloud_account") is False
+    assert "subfinder" in capabilities.scanners_for("domain")
+    assert "subfinder" not in capabilities.scanners_for("ip_range")  # domain-only tool
+    assert capabilities.scanners_for("repo") == []
+
+
+def test_config_can_narrow_but_not_widen_capabilities(monkeypatch) -> None:
+    from apps.api.core.config import get_settings
+    from apps.api.scanner_engine import capabilities
+
+    monkeypatch.setattr(get_settings(), "supported_target_types", ["domain", "repo"])
+    assert capabilities.is_supported("repo") is False       # no engine -> config can't enable
+    assert capabilities.is_supported("domain") is True
+    assert capabilities.is_supported("ip_range") is False   # config narrowed it out

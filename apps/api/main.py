@@ -29,6 +29,7 @@ from apps.api.modules.authorization_scope.router import router as authorization_
 from apps.api.modules.dashboard.router import router as dashboard_router
 from apps.api.modules.projects.router import router as projects_router
 from apps.api.modules.reports.router import router as reports_router
+from apps.api.modules.scans.router import capabilities_router as scan_capabilities_router
 from apps.api.modules.scans.router import router as scans_router
 from apps.api.modules.schedules.router import router as schedules_router
 from apps.api.modules.users.router import router as users_router
@@ -40,7 +41,7 @@ logger = logging.getLogger("mbs.app")
 
 _ROUTERS = (
     auth_router, users_router, workspaces_router, roles_router, projects_router,
-    dashboard_router, authorization_scope_router, scans_router, schedules_router,
+    dashboard_router, authorization_scope_router, scans_router, scan_capabilities_router, schedules_router,
     assets_router, vulnerabilities_router, reports_router, assistant_router,
     ai_status_router, billing_router, plans_public_router, notifications_router,
     audit_router, api_keys_router,

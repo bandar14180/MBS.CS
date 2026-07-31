@@ -23,6 +23,16 @@ def _auth(tokens: dict) -> dict:
     return {"Authorization": f"Bearer {tokens['access_token']}"}
 
 
+def test_scan_capabilities_endpoint(client: TestClient) -> None:
+    owner = _register(client, "Owner")
+    resp = client.get("/api/v1/scan-capabilities", headers=_auth(owner))
+    assert resp.status_code == 200
+    caps = resp.json()
+    assert caps["domain"]["supported"] is True
+    assert caps["repo"]["supported"] is False
+    assert "subfinder" in caps["domain"]["scanners"]
+
+
 def test_private_ip_target_rejected_at_creation(client: TestClient) -> None:
     # SSRF guard wired into target creation: a private CIDR is refused with 400.
     owner = _register(client, "Owner")

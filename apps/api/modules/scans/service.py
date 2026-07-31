@@ -24,17 +24,17 @@ async def create_scan(
 ) -> Scan:
     target = await get_target(db, workspace_id, project_id, target_id)  # 404s if not in this project/workspace
 
-    from apps.api.core.config import get_settings
+    from apps.api.scanner_engine import capabilities
 
-    # Refuse target types the scanner can't actually assess yet -- otherwise the
-    # scan would "complete" having run nothing. Clear validation error instead.
-    supported = get_settings().supported_target_types
-    if target.type not in supported:
+    # Refuse target types with no scanner engine -- otherwise the scan would
+    # "complete" having run nothing. The capability registry is the source of truth.
+    if not capabilities.is_supported(target.type):
+        supported = sorted(capabilities.supported_target_types())
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Target type '{target.type}' is not supported for scanning yet "
-            f"(supported: {', '.join(supported)}). Refusing to start a scan that would "
-            f"assess nothing.",
+            f"(supported: {', '.join(supported) or 'none'}). Refusing to start a scan "
+            f"that would assess nothing.",
         )
 
     from apps.api.modules.billing import service as billing

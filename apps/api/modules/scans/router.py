@@ -2,13 +2,25 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
-from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
+from apps.api.core.deps import CurrentUserDep, DbDep, WorkspaceContextDep, require_permission
 from apps.api.modules.attack import service as attack_service
 from apps.api.modules.attack.schemas import KillChainRead, TacticMatrixRead
 from apps.api.modules.scans import service
 from apps.api.modules.scans.schemas import AIPlanRead, EvidenceRead, ScanCreate, ScanRead, ToolRunRead
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/projects/{project_id}/scans", tags=["scans"])
+
+# Scanner capabilities are global (not tenant-specific): which target types can
+# actually be scanned + which tools run for each. Lets clients avoid submitting a
+# target type that has no engine (no hollow scans).
+capabilities_router = APIRouter(prefix="/scan-capabilities", tags=["scans"])
+
+
+@capabilities_router.get("")
+async def get_scan_capabilities(current_user: CurrentUserDep) -> dict:
+    from apps.api.scanner_engine.capabilities import capability_map
+
+    return capability_map()
 
 
 @router.post(
