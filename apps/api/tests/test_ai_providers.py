@@ -139,8 +139,8 @@ def test_validate_production_rejects_dev_defaults() -> None:
     assert "JWT_SECRET_KEY" in msg and "minioadmin" in msg
 
 
-def test_validate_production_accepts_hardened_config() -> None:
-    s = Settings(
+def _hardened(**overrides) -> Settings:
+    base = dict(
         environment="production",
         jwt_secret_key="a" * 48,
         s3_access_key="real-access",
@@ -149,8 +149,27 @@ def test_validate_production_accepts_hardened_config() -> None:
         cors_allow_origins=["https://mbs.example.com"],
         trusted_hosts=["mbs.example.com"],
         ai_provider="openrouter",
+        rate_limit_enabled=True,
+        metrics_mode="token",
     )
-    s.validate_production()  # must not raise
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_validate_production_accepts_hardened_config() -> None:
+    _hardened().validate_production()  # must not raise
+
+
+def test_validate_production_requires_rate_limiting() -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _hardened(rate_limit_enabled=False).validate_production()
+    assert "RATE_LIMIT_ENABLED" in str(exc.value)
+
+
+def test_validate_production_rejects_public_metrics() -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _hardened(metrics_mode="public").validate_production()
+    assert "METRICS_MODE" in str(exc.value)
 
 
 def test_validate_production_noop_in_dev() -> None:

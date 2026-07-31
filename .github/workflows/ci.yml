@@ -42,6 +42,21 @@ jobs:
       - name: Run tests
         run: python -m pytest apps/api/tests -q
 
+  # Dependency vulnerability audit. Non-blocking for now (a single transitive
+  # advisory should surface, not wedge every PR); triage findings and pin/upgrade.
+  deps-audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Audit dependencies
+        run: pip-audit -r apps/api/requirements.txt --strict --desc
+
   # Scan Doctor: verify the real tool binaries run. Needs network + the worker
   # image, so it's a separate job and non-blocking (network can be flaky in CI).
   scan-doctor:

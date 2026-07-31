@@ -3,23 +3,35 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+import bcrypt
 import jwt
-from passlib.context import CryptContext
 
 from apps.api.core.config import get_settings
 
 settings = get_settings()
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 JWT_ALGORITHM = "HS256"
 
+# Password hashing: bcrypt directly (the maintained package), replacing the stale
+# passlib 1.7.4 which could not read bcrypt 4.x and warned at startup. bcrypt's
+# 72-byte input limit is applied explicitly (passlib did this silently), so
+# behavior is unchanged and existing `$2b$`/`$2a$`/`$2y$` hashes still verify.
+_BCRYPT_MAX_BYTES = 72
+
+
+def _pw_bytes(password: str) -> bytes:
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+
 
 def hash_password(password: str) -> str:
-    return _pwd_context.hash(password)
+    return bcrypt.hashpw(_pw_bytes(password), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return _pwd_context.verify(password, password_hash)
+    try:
+        return bcrypt.checkpw(_pw_bytes(password), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
 
 
 def create_access_token(user_id: UUID) -> str:

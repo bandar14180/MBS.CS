@@ -15,6 +15,7 @@ _FILE_BACKED_SECRETS = (
     "S3_SECRET_KEY",
     "ANTHROPIC_API_KEY",
     "OPENROUTER_API_KEY",
+    "METRICS_TOKEN",
 )
 
 # Placeholder / insecure defaults that must never survive into production.
@@ -229,6 +230,10 @@ class Settings(BaseSettings):
             problems.append(f"AI_PROVIDER '{self.ai_provider}' is not a known provider.")
         if not self.ssl_verify:
             problems.append("SSL_VERIFY is disabled; never disable TLS verification in production.")
+        if not self.rate_limit_enabled:
+            problems.append("RATE_LIMIT_ENABLED must be true in production (unrestricted limits are unsafe).")
+        if self.metrics_mode == "public":
+            problems.append("METRICS_MODE must not be 'public' in production.")
         if problems:
             raise RuntimeError(
                 "Refusing to start in production with insecure configuration:\n  - "

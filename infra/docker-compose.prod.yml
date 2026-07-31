@@ -11,6 +11,9 @@ services:
       ENVIRONMENT: production
       RATE_LIMIT_ENABLED: "true"
       ENABLE_HSTS: "true"
+      # /metrics is token-gated in prod ("public" is rejected at startup).
+      METRICS_MODE: token
+      METRICS_TOKEN_FILE: /run/secrets/metrics_token
       # Explicit hostnames/origins are REQUIRED in production (wildcards are rejected).
       TRUSTED_HOSTS: '["mbs.example.com"]'
       CORS_ALLOW_ORIGINS: '["https://mbs.example.com"]'
@@ -23,6 +26,7 @@ services:
       - jwt_secret_key
       - openrouter_api_key
       - s3_secret_key
+      - metrics_token
 
   worker:
     environment:
@@ -40,3 +44,5 @@ secrets:
     file: ./secrets/openrouter_api_key.txt
   s3_secret_key:
     file: ./secrets/s3_secret_key.txt
+  metrics_token:
+    file: ./secrets/metrics_token.txt

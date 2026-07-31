@@ -10,8 +10,7 @@ celery==5.4.0
 redis==5.0.8
 boto3==1.35.24
 pyjwt==2.9.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
+bcrypt==4.2.1
 anthropic==0.34.2
 reportlab==4.2.2
 prometheus-client==0.21.0
