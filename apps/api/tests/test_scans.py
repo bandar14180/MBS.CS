@@ -23,6 +23,21 @@ def _auth(tokens: dict) -> dict:
     return {"Authorization": f"Bearer {tokens['access_token']}"}
 
 
+def test_private_ip_target_rejected_at_creation(client: TestClient) -> None:
+    # SSRF guard wired into target creation: a private CIDR is refused with 400.
+    owner = _register(client, "Owner")
+    headers = _auth(owner)
+    ws = client.post("/api/v1/workspaces", headers=headers, json={"name": "WS"}).json()["id"]
+    proj = client.post(f"/api/v1/workspaces/{ws}/projects", headers=headers, json={"name": "P"}).json()["id"]
+    resp = client.post(
+        f"/api/v1/workspaces/{ws}/projects/{proj}/targets",
+        headers=headers,
+        json={"type": "ip_range", "value": "10.0.0.0/24"},
+    )
+    assert resp.status_code == 400
+    assert "SSRF" in resp.json()["detail"] or "not permitted" in resp.json()["detail"]
+
+
 def test_unsupported_target_type_scan_is_rejected(client: TestClient, no_celery_dispatch) -> None:
     # A repo/api/cloud_account target has no scanner engine yet -> creating a scan
     # must fail clearly at creation, never "complete" having assessed nothing.
@@ -152,6 +167,8 @@ def test_use_ai_planner_flag_persisted_to_config(client: TestClient, no_celery_d
     # the provider is never actually called). Default provider is openrouter.
     from apps.api.core.config import get_settings
 
+    # Pin the provider so the test is deterministic regardless of the dev's .env.
+    monkeypatch.setattr(get_settings(), "ai_provider", "openrouter")
     monkeypatch.setattr(get_settings(), "openrouter_api_key", "sk-test-dummy")
 
     owner = _register(client, "Owner")
@@ -178,6 +195,9 @@ def test_use_ai_planner_without_key_is_rejected(client: TestClient, no_celery_di
     # fail-fasts. Default provider is openrouter.
     from apps.api.core.config import get_settings
 
+    # Pin the provider so the test is deterministic regardless of the dev's .env
+    # (AI_PROVIDER=local is key-less-but-enabled and would not reject).
+    monkeypatch.setattr(get_settings(), "ai_provider", "openrouter")
     monkeypatch.setattr(get_settings(), "openrouter_api_key", "")
     monkeypatch.setattr(get_settings(), "anthropic_api_key", "")
 

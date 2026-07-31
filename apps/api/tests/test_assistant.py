@@ -87,6 +87,9 @@ def test_assistant_ask_fails_soft_without_key(client: TestClient, monkeypatch) -
     from apps.api.core.config import get_settings
 
     settings = get_settings()
+    # Pin the provider so the test is deterministic regardless of the dev's .env
+    # (AI_PROVIDER=local would otherwise be key-less-but-enabled).
+    monkeypatch.setattr(settings, "ai_provider", "openrouter")
     monkeypatch.setattr(settings, "openrouter_api_key", "")
     monkeypatch.setattr(settings, "anthropic_api_key", "")
 
