@@ -26,13 +26,18 @@ DEFAULT_POST_EXPLOIT_ALLOWLIST = frozenset(
     {"whoami", "id", "hostname", "uname", "pwd", "list_dir", "count_rows", "read_canary"}
 )
 
-# Backstop deny-list: substrings that indicate a state-changing / harmful operation.
-# The allowlist above is the primary control; this is defense in depth.
-_DESTRUCTIVE_MARKERS = (
-    "delete", "drop", "truncate", "insert", "update ", "write", "rm ", "unlink",
-    "chmod", "chown", "mkfs", "format", "shutdown", "reboot", "kill ", "persist",
-    "backdoor", "implant", "exfil", "encrypt", "ransom", " > ", ">>",
+# Backstop deny-list (defense in depth; the post-exploit allowlist is the primary
+# control). Command-like words are matched at WORD boundaries so a benign token like
+# "confirm" or "perform" is never mistaken for the "rm" command; a few
+# unambiguous phrases/redirects are matched as substrings.
+_DESTRUCTIVE_WORDS = frozenset(
+    {
+        "delete", "drop", "truncate", "insert", "update", "write", "rm", "unlink",
+        "chmod", "chown", "mkfs", "format", "shutdown", "reboot", "kill", "persist",
+        "backdoor", "implant", "exfil", "exfiltrate", "encrypt", "ransom",
+    }
 )
+_DESTRUCTIVE_SUBSTRINGS = (">>", " > ")
 
 
 class SafetyViolation(RuntimeError):
@@ -72,8 +77,13 @@ def tier_at_most(tier: str, ceiling: str) -> bool:
 
 
 def is_destructive(operation: str) -> bool:
-    op = f" {(operation or '').lower()} "
-    return any(marker in op for marker in _DESTRUCTIVE_MARKERS)
+    import re
+
+    op = (operation or "").lower()
+    if any(sub in op for sub in _DESTRUCTIVE_SUBSTRINGS):
+        return True
+    words = set(re.findall(r"[a-z]+", op))
+    return bool(words & _DESTRUCTIVE_WORDS)
 
 
 def assert_action_allowed(

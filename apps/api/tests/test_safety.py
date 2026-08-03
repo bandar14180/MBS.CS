@@ -28,7 +28,11 @@ def test_destructive_operations_detected(op) -> None:
     assert is_destructive(op) is True
 
 
-@pytest.mark.parametrize("op", ["whoami", "id", "SELECT 1", "select count(*) from t", "hostname"])
+@pytest.mark.parametrize("op", [
+    "whoami", "id", "SELECT 1", "select count(*) from t", "hostname",
+    # word-boundary regressions: these end in / contain "rm" etc. but are benign
+    "version_confirm", "login_check", "confirm", "perform check", "transform data", "form",
+])
 def test_benign_operations_not_flagged(op) -> None:
     assert is_destructive(op) is False
 
