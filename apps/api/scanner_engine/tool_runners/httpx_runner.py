@@ -17,6 +17,8 @@ class HttpxRunner(BaseToolRunner):
     version = "1.10.0"
     requires_active_testing = False  # HTTP probing/fingerprinting -- passive recon
     phase = 20  # after subfinder (10), before naabu (30)
+    kill_chain_phase = "reconnaissance"
+    safety_tier = "active_safe"  # sends benign HTTP probes (no state change)
 
     def _host_set(self, target_value: str, prior_findings: list[CommonFinding]) -> list[str]:
         """Probe the original target plus any subdomains subfinder discovered."""

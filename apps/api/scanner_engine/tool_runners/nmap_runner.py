@@ -13,6 +13,8 @@ class NmapRunner(BaseToolRunner):
     version = "7"  # apt-provided; major line pinned, exact patch varies by base image
     requires_active_testing = False  # service/version detection -- recon
     phase = 40  # last: deep-scans the ports naabu found
+    kill_chain_phase = "reconnaissance"
+    safety_tier = "active_safe"  # connect + version detection (no state change)
 
     def _targets_and_ports(
         self, target_value: str, prior_findings: list[CommonFinding]

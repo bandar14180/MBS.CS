@@ -11,6 +11,8 @@ class SubfinderRunner(BaseToolRunner):
     version = "2.14.0"
     requires_active_testing = False  # passive enumeration from public sources
     phase = 10  # first in the recon pipeline
+    kill_chain_phase = "reconnaissance"
+    safety_tier = "passive"  # queries public sources; no packets to the target
     applicable_target_types = {"domain"}  # subdomain enumeration only makes sense for a domain
 
     async def run(self, target_value: str, config: dict, prior_findings: list[CommonFinding]) -> RawToolOutput:

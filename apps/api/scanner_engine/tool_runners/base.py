@@ -66,6 +66,16 @@ class BaseToolRunner(ABC):
     # requested tools in ascending phase order regardless of request order.
     phase: int = 100
 
+    # Cyber Kill Chain phase this tool serves (values match
+    # modules.attack.catalog.KillChainPhase.*). Lets the autonomous agent pick
+    # tools appropriate to the current phase and reason about progression.
+    kill_chain_phase: str = "reconnaissance"
+
+    # Safety classification (values match scanner_engine.safety.SafetyTier.*). The
+    # agent may only run a tool whose tier is within the engagement's Rules of
+    # Engagement. Default active_safe; passive recon tools override to "passive".
+    safety_tier: str = "active_safe"
+
     # Target `type` values this tool applies to (None = all). The orchestrator
     # skips a requested runner when the target type doesn't match, instead of
     # running it and recording a failure (e.g. subfinder only makes sense on a

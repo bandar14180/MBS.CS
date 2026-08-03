@@ -25,6 +25,8 @@ class NucleiRunner(BaseToolRunner):
     version = "3.11.0"
     requires_active_testing = True  # sends template payloads -> gated on active_testing_allowed (§7)
     phase = 50  # last: runs against http services discovered earlier in the pipeline
+    kill_chain_phase = "delivery"      # delivers detection probes/payloads
+    safety_tier = "active_safe"        # DETECTION templates only (no exploitation)
 
     def _target_urls(self, target_value: str, prior_findings: list[CommonFinding]) -> list[str]:
         """Scan the HTTP services httpx confirmed; fall back to http(s) on the
