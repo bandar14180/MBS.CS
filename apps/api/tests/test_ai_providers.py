@@ -207,6 +207,19 @@ def test_factory_selects_local(monkeypatch) -> None:
     assert isinstance(factory.get_ai_client(), LocalClient)
 
 
+def test_factory_selects_deepseek(monkeypatch) -> None:
+    from apps.api.ai_agent.providers import factory
+    from apps.api.ai_agent.providers.deepseek import DeepSeekClient
+    from apps.api.core.config import get_settings
+
+    s = get_settings()
+    monkeypatch.setattr(s, "ai_provider", "deepseek")
+    monkeypatch.setattr(s, "deepseek_api_key", "sk-test")
+    client = factory.get_ai_client("deepseek-chat")
+    assert isinstance(client, DeepSeekClient)
+    assert client.provider_name == "deepseek" and client.model_version == "deepseek-chat"
+
+
 def test_local_provider_enables_ai_without_key() -> None:
     s = Settings(ai_provider="local")
     assert s.ai_enabled is True  # local needs no API key

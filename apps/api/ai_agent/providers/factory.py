@@ -20,6 +20,10 @@ def get_ai_client(model: str | None = None) -> SupportsComplete:
         from apps.api.ai_agent.providers.local import LocalClient
 
         return LocalClient(model=model)
+    if provider == "deepseek":
+        from apps.api.ai_agent.providers.deepseek import DeepSeekClient
+
+        return DeepSeekClient(model=model)
     from apps.api.ai_agent.providers.openrouter import OpenRouterClient
 
     return OpenRouterClient(model=model)

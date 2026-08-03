@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3.1:8b"
     ollama_api_key: str = ""
 
+    # DeepSeek (OpenAI-compatible, cloud). Strong structured-JSON output -> a good
+    # brain for the autonomous agent. Needs egress (honor SSL_CA_BUNDLE/proxy on
+    # TLS-intercepting networks).
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"
+
     ai_max_tokens: int = 4096
     ai_request_timeout_s: float = 60.0
     ai_max_retries: int = 3
@@ -135,6 +142,15 @@ class Settings(BaseSettings):
     # scan_allowed_cidrs. There is deliberately no blanket "disable SSRF" switch.
     scan_allow_private_targets: bool = False
     scan_allowed_cidrs: list[str] = []
+
+    # --- Autonomous red-team agent -----------------------------------------
+    # Deployment-wide safety ceiling the per-engagement RoE can restrict but never
+    # exceed (see scanner_engine/safety.py). Default active_safe = recon + vuln
+    # detection only; real exploitation additionally needs agent_exploitation_enabled
+    # AND a per-engagement opt-in. agent_max_steps bounds the agentic loop.
+    agent_safety_ceiling: str = "active_safe"     # passive | active_safe | intrusive
+    agent_exploitation_enabled: bool = False      # deployment gate for INTRUSIVE actions
+    agent_max_steps: int = 40
 
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
@@ -187,6 +203,7 @@ class Settings(BaseSettings):
             "openrouter": self.openrouter_api_key,
             "anthropic": self.anthropic_api_key,
             "local": self.ollama_api_key or "local",
+            "deepseek": self.deepseek_api_key,
         }.get(self.ai_provider, "")
 
     @property
@@ -196,6 +213,7 @@ class Settings(BaseSettings):
             "openrouter": self.openrouter_model,
             "anthropic": self.ai_model,
             "local": self.ollama_model,
+            "deepseek": self.deepseek_model,
         }.get(self.ai_provider, self.openrouter_model)
 
     @property
@@ -235,7 +253,7 @@ class Settings(BaseSettings):
             problems.append("CORS_ALLOW_ORIGINS must list explicit origins in production, not '*'.")
         if self.trusted_hosts == ["*"]:
             problems.append("TRUSTED_HOSTS must list explicit hostnames in production, not '*'.")
-        if self.ai_provider not in ("openrouter", "anthropic", "local"):
+        if self.ai_provider not in ("openrouter", "anthropic", "local", "deepseek"):
             problems.append(f"AI_PROVIDER '{self.ai_provider}' is not a known provider.")
         if not self.ssl_verify:
             problems.append("SSL_VERIFY is disabled; never disable TLS verification in production.")
