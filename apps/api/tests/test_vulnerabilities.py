@@ -43,6 +43,41 @@ def test_nuclei_requires_active_testing_flag() -> None:
     assert NucleiRunner().requires_active_testing is True
 
 
+# --- Nuclei target selection (pure unit) ---
+
+def test_nuclei_targets_httpx_confirmed_services_first() -> None:
+    from apps.api.scanner_engine.tool_runners.base import CommonFinding
+
+    prior = [
+        CommonFinding(asset_type="http_service", value="http://10.0.0.1", metadata={"host": "10.0.0.1"}),
+        CommonFinding(asset_type="http_service", value="http://10.0.0.1", metadata={"host": "10.0.0.1"}),  # dupe
+        CommonFinding(asset_type="service", value="10.0.0.1:3000", metadata={"ip": "10.0.0.1", "port": 3000}),
+    ]
+    # httpx findings win and are deduped; discovered ports are ignored here.
+    assert NucleiRunner()._target_urls("10.0.0.1", prior) == ["http://10.0.0.1"]
+
+
+def test_nuclei_falls_back_to_discovered_ports_when_httpx_found_nothing() -> None:
+    """The port-3000 gap: httpx (default 80/443) confirmed no http_service, but
+    naabu/nmap found the app on :3000 -- nuclei must still probe it."""
+    from apps.api.scanner_engine.tool_runners.base import CommonFinding
+
+    prior = [
+        CommonFinding(asset_type="port", value="172.18.0.7:3000",
+                      metadata={"host": "172.18.0.7", "ip": "172.18.0.7", "port": 3000}),
+        CommonFinding(asset_type="service", value="172.18.0.7:3000",
+                      metadata={"ip": "172.18.0.7", "port": 3000, "service": "ppp"}),  # nmap dupe of same ep
+    ]
+    urls = NucleiRunner()._target_urls("172.18.0.7", prior)
+    # both schemes for the one discovered endpoint, deduped across naabu+nmap
+    assert urls == ["http://172.18.0.7:3000", "https://172.18.0.7:3000"]
+
+
+def test_nuclei_bare_host_fallback_when_no_findings() -> None:
+    urls = NucleiRunner()._target_urls("10.0.0.1", [])
+    assert urls == ["http://10.0.0.1", "https://10.0.0.1"]
+
+
 # --- vulnerability engine CVSS floor (pure) ---
 
 def test_cvss_score_falls_back_to_severity_floor() -> None:

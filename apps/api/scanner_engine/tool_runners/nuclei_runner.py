@@ -28,13 +28,51 @@ class NucleiRunner(BaseToolRunner):
     kill_chain_phase = "delivery"      # delivers detection probes/payloads
     safety_tier = "active_safe"        # DETECTION templates only (no exploitation)
 
+    # Bound the fan-out when we probe discovered ports (a top-ports sweep can
+    # return many): each endpoint becomes two URLs (http + https).
+    _MAX_DISCOVERED_ENDPOINTS = 50
+
     def _target_urls(self, target_value: str, prior_findings: list[CommonFinding]) -> list[str]:
-        """Scan the HTTP services httpx confirmed; fall back to http(s) on the
-        resolved target if httpx didn't run."""
+        """Pick what nuclei scans, in priority order:
+
+        1. The HTTP services httpx confirmed (`http_service` findings) -- the
+           happy path when the web app is on a default port httpx probed.
+        2. If httpx confirmed none (e.g. the app listens on a non-standard port
+           like :3000 that httpx's default 80/443 probe never saw), fall back to
+           the open ports naabu (`port`) and nmap (`service`) discovered, probing
+           http+https on each. Without httpx we can't know the scheme, so we try
+           both; nuclei's HTTP templates simply no-op on a port that doesn't
+           speak (that) HTTP. This is what stops a web app on an odd port from
+           being invisible to the vuln scan.
+        3. Only if nothing was discovered at all, http(s) on the bare target.
+        """
         urls = [f.value for f in prior_findings if f.asset_type == "http_service" and f.value]
         if urls:
             seen: set[str] = set()
             return [u for u in urls if not (u in seen or seen.add(u))]
+
+        # Derive endpoints from discovered ports/services (same target host, so
+        # already net_guard-validated; a port doesn't change the host).
+        endpoints: list[str] = []
+        seen_ep: set[str] = set()
+        for f in prior_findings:
+            if f.asset_type not in ("service", "port"):
+                continue
+            host = f.metadata.get("ip") or f.metadata.get("host")
+            port = f.metadata.get("port")
+            if not host or port is None:
+                continue
+            ep = f"{host}:{port}"
+            if ep not in seen_ep:
+                seen_ep.add(ep)
+                endpoints.append(ep)
+        if endpoints:
+            probed: list[str] = []
+            for ep in endpoints[: self._MAX_DISCOVERED_ENDPOINTS]:
+                probed.append(f"http://{ep}")
+                probed.append(f"https://{ep}")
+            return probed
+
         try:
             ip = resolve_scan_host(target_value)
         except Exception:
