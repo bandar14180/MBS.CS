@@ -18,6 +18,12 @@ class ScanCreate(BaseModel):
         description="Let the AI Planner order/prune the requested tools (needs ANTHROPIC_API_KEY; "
         "falls back to deterministic order if it fails).",
     )
+    use_agent: bool = Field(
+        default=False,
+        description="Run the autonomous RedTeamAgent: it drives tool selection dynamically by "
+        "kill-chain phase within the engagement's Rules of Engagement (supersedes use_ai_planner; "
+        "fail-soft).",
+    )
 
 
 class ScanRead(BaseModel):

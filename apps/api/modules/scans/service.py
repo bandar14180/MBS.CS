@@ -22,6 +22,7 @@ async def create_scan(
     scan_type: str,
     requested_modules: list[str],
     use_ai_planner: bool = False,
+    use_agent: bool = False,
 ) -> Scan:
     target = await get_target(db, workspace_id, project_id, target_id)  # 404s if not in this project/workspace
 
@@ -84,7 +85,11 @@ async def create_scan(
         initiated_by=initiated_by,
         scan_type=scan_type,
         status="queued",
-        config={"requested_modules": requested_modules, "use_ai_planner": use_ai_planner},
+        config={
+            "requested_modules": requested_modules,
+            "use_ai_planner": use_ai_planner,
+            "use_agent": use_agent,
+        },
     )
     db.add(scan)
     await db.commit()
