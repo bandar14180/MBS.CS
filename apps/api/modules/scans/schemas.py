@@ -24,6 +24,16 @@ class ScanCreate(BaseModel):
         "kill-chain phase within the engagement's Rules of Engagement (supersedes use_ai_planner; "
         "fail-soft).",
     )
+    exploitation_enabled: bool = Field(
+        default=False,
+        description="Rules of Engagement: allow SAFE, non-destructive exploitation confirmation "
+        "(needs the deployment to also enable it). Off by default.",
+    )
+    approved_hosts: list[str] = Field(
+        default_factory=list,
+        description="Human pre-approval: hosts the agent may attempt exploitation on ('*' = all in "
+        "scope). Unapproved hosts are modeled only, never exploited.",
+    )
 
 
 class ScanRead(BaseModel):

@@ -354,9 +354,83 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
         await db.commit()
         step_no += 1
 
+    # EXPLOITATION PHASE -- gated, deterministic, SAFE. The LLM planned recon above;
+    # exploitation runs only when the RoE enables it (deployment + engagement) and is
+    # never driven by the model, so a misbehaving model can't trigger it. Each attempt
+    # additionally requires host approval + passes the safety gate.
+    if roe.exploitation_enabled:
+        state.current_phase = "exploitation"
+        confirmed = await _run_exploitation_phase(db, scan, target_row, roe, step_no)
+        if confirmed:
+            state.attack_graph = {
+                **(state.attack_graph or {}),
+                "confirmed_access": [
+                    {"target": r.target, "access_type": r.access_type, "module": r.module, "proof": r.proof}
+                    for r in confirmed
+                ],
+            }
+
     state.status = "completed"
     await db.commit()
     return tool_statuses
+
+
+async def _run_exploitation_phase(db: AsyncSession, scan: Scan, target_row, roe, base_step_no: int) -> list:
+    """Deterministic, gated exploitation of this scan's confirmed findings using
+    curated modules. Non-destructive by construction. Every attempt is triple-gated:
+    (1) roe.exploitation_enabled, (2) the target host is human-approved (approved_hosts
+    in the engagement config; '*' = all), (3) safety.assert_action_allowed. A blocked
+    or unapproved finding is recorded (modeled), never executed. Returns the confirmed
+    ExploitResults for the attack graph."""
+    from apps.api.modules.agent.models import AgentStep
+    from apps.api.modules.vulnerabilities.models import Vulnerability
+    from apps.api.scanner_engine.exploits import EXPLOIT_REGISTRY
+    from apps.api.scanner_engine.safety import SafetyViolation, assert_action_allowed
+
+    vulns = list(await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan.id)))
+    approved = set(scan.config.get("approved_hosts", []))
+    host = target_row.value
+    host_ok = "*" in approved or host in approved
+    results: list = []
+    step_no = base_step_no
+
+    def _rec(module_name, tier, action_type, status, detail):
+        db.add(
+            AgentStep(
+                workspace_id=scan.workspace_id, scan_id=scan.id, step_no=step_no,
+                phase="exploitation", action_type=action_type, tool_or_module=module_name,
+                safety_tier=tier, rationale=None, result_summary=(detail or None) and detail[:2000], status=status,
+            )
+        )
+
+    for v in vulns:
+        finding = {"category": v.category, "fingerprint": v.fingerprint, "title": v.title, "severity": v.severity}
+        for module_cls in EXPLOIT_REGISTRY.values():
+            module = module_cls()
+            if not module.can_attempt(finding):
+                continue
+            # Gate 2: human pre-approval per host (Rules of Engagement).
+            if roe.require_approval and not host_ok:
+                _rec(module.name, module.safety_tier, "approval_wait", "skipped",
+                     f"host '{host}' not approved -- modeled only: {v.title[:60]}")
+                step_no += 1
+                await db.commit()
+                continue
+            # Gate 3: the non-bypassable safety check (intrusive + non-destructive).
+            try:
+                assert_action_allowed(safety_tier=module.safety_tier, roe=roe, operation=module.proof_action)
+            except SafetyViolation as exc:
+                _rec(module.name, module.safety_tier, "exploit", "blocked", str(exc))
+                step_no += 1
+                await db.commit()
+                continue
+            res = await module.attempt(host, finding)
+            results.append(res)
+            _rec(module.name, module.safety_tier, "exploit", "executed" if res.exploitable else "skipped",
+                 f"{res.access_type}: {res.proof}")
+            step_no += 1
+            await db.commit()
+    return results
 
 
 async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:

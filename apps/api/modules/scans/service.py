@@ -23,6 +23,8 @@ async def create_scan(
     requested_modules: list[str],
     use_ai_planner: bool = False,
     use_agent: bool = False,
+    exploitation_enabled: bool = False,
+    approved_hosts: list[str] | None = None,
 ) -> Scan:
     target = await get_target(db, workspace_id, project_id, target_id)  # 404s if not in this project/workspace
 
@@ -89,6 +91,8 @@ async def create_scan(
             "requested_modules": requested_modules,
             "use_ai_planner": use_ai_planner,
             "use_agent": use_agent,
+            "exploitation_enabled": exploitation_enabled,
+            "approved_hosts": approved_hosts or [],
         },
     )
     db.add(scan)
