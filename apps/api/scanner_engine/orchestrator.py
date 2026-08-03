@@ -267,6 +267,7 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
     from apps.api.ai_agent.agent import RedTeamAgent
     from apps.api.ai_agent.providers.usage import collect_ai_usage
     from apps.api.ai_agent.usage_repo import persist_ai_usage
+    from apps.api.core.config import get_settings
     from apps.api.modules.agent.models import AgentStep, EngagementState
     from apps.api.scanner_engine.safety import RulesOfEngagement, SafetyViolation, assert_action_allowed
 
