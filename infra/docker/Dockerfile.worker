@@ -56,6 +56,22 @@ ENV HOME=/home/appuser \
 RUN nuclei -update-templates \
     && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ]
 
+# DAST enhancement: katana crawler. It feeds discovered URLs+parameters to the
+# nuclei-dast runner (fuzzing for SQLi/XSS/etc.) -- the app-layer coverage the
+# signature pipeline lacks. Installed like the other ProjectDiscovery tools
+# (release zip), but as its OWN layer AFTER the slow nuclei-templates layer so
+# adding it never busts that (large) cache. Needs root for /usr/local/bin.
+USER root
+ARG KATANA_VERSION=1.1.2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl unzip \
+    && curl -sSfL "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_amd64.zip" -o /tmp/katana.zip \
+    && unzip -o /tmp/katana.zip -d /tmp/katana && mv /tmp/katana/katana /usr/local/bin/katana \
+    && chmod +x /usr/local/bin/katana \
+    && rm -rf /tmp/katana* \
+    && apt-get purge -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+USER appuser
+
 # Warm httpx's tech-detection ("dit") model into the image so scans don't download
 # ~92MB at runtime (P2-15). Best-effort: if the build network can't fetch it, we
 # fall back to the runtime download (unchanged behavior) rather than failing.
