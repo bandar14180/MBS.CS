@@ -1,7 +1,13 @@
 """Unit tests for the DAST enhancement: the shared web-target helper, the katana
 crawler runner, and the nuclei-dast fuzzing runner. All pure (no network)."""
 from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
-from apps.api.scanner_engine.tool_runners._web import crawled_urls, discovered_port_urls, web_targets
+from apps.api.scanner_engine.tool_runners._web import (
+    crawled_urls,
+    discovered_port_urls,
+    param_discovery_targets,
+    web_targets,
+)
+from apps.api.scanner_engine.tool_runners.arjun_runner import ArjunRunner
 from apps.api.scanner_engine.tool_runners.base import CommonFinding, RawToolOutput
 from apps.api.scanner_engine.tool_runners.katana_runner import KatanaRunner
 from apps.api.scanner_engine.tool_runners.nuclei_dast_runner import NucleiDastRunner
@@ -111,7 +117,49 @@ def test_nuclei_dast_requires_active_testing_and_reuses_nuclei_parsing() -> None
 
 
 def test_registry_has_dast_pipeline_in_order() -> None:
-    for name in ("katana", "nuclei-dast"):
+    for name in ("katana", "arjun", "nuclei-dast"):
         assert name in TOOL_REGISTRY
-    order = [TOOL_REGISTRY[n].phase for n in ("httpx", "naabu", "nmap", "katana", "nuclei", "nuclei-dast")]
+    order = [TOOL_REGISTRY[n].phase for n in ("httpx", "naabu", "nmap", "katana", "arjun", "nuclei", "nuclei-dast")]
     assert order == sorted(order)  # strictly ascending pipeline phases
+
+
+# --- arjun parameter discovery ---
+
+def test_param_discovery_targets_api_first_static_skipped_query_stripped() -> None:
+    prior = [
+        CommonFinding("url", "http://a/js/app.js", {}),          # static -> skip
+        CommonFinding("url", "http://a/api/products?", {}),      # crawler's trailing '?' -> base path kept
+        CommonFinding("url", "http://a/api/products?q=x", {}),   # same base -> deduped
+        CommonFinding("url", "http://a/about", {}),
+        CommonFinding("url", "http://a/api/files/view?file=", {}),
+    ]
+    targets = param_discovery_targets(prior, max_targets=10)
+    # api base paths first (deduped, query stripped), then the rest
+    assert targets == ["http://a/api/products", "http://a/api/files/view", "http://a/about"]
+
+
+def test_arjun_parse_builds_parameterised_urls() -> None:
+    raw = RawToolOutput(
+        command="arjun",
+        stdout=(
+            '{"http://a/api/products": {"method": "GET", "params": ["q", "sort", "category"]},'
+            ' "http://a/dead": {"method": "GET", "params": []}}'  # no params -> no finding
+        ),
+        stderr="",
+        exit_code=0,
+    )
+    findings = ArjunRunner().parse(raw)
+    assert [f.value for f in findings] == ["http://a/api/products?q=1&sort=1&category=1"]
+    assert findings[0].asset_type == "url"
+    assert findings[0].metadata["params"] == ["q", "sort", "category"]
+
+
+def test_arjun_parse_handles_empty_or_bad_json() -> None:
+    assert ArjunRunner().parse(RawToolOutput("arjun", "", "", 0)) == []
+    assert ArjunRunner().parse(RawToolOutput("arjun", "not json", "", 0)) == []
+
+
+def test_arjun_feeds_nuclei_dast() -> None:
+    # arjun's parameterised url findings become nuclei-dast targets (params-first).
+    prior = [CommonFinding("url", "http://a/api/products?q=1&sort=1", {"source": "arjun", "has_params": True})]
+    assert NucleiDastRunner()._target_urls("a", prior)[0] == "http://a/api/products?q=1&sort=1"

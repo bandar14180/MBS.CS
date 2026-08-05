@@ -56,11 +56,12 @@ ENV HOME=/home/appuser \
 RUN nuclei -update-templates \
     && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ]
 
-# DAST enhancement: katana crawler. It feeds discovered URLs+parameters to the
-# nuclei-dast runner (fuzzing for SQLi/XSS/etc.) -- the app-layer coverage the
-# signature pipeline lacks. Installed like the other ProjectDiscovery tools
-# (release zip), but as its OWN layer AFTER the slow nuclei-templates layer so
-# adding it never busts that (large) cache. Needs root for /usr/local/bin.
+# DAST enhancement: the app-layer coverage the signature pipeline lacks.
+#   katana  -- crawler (release zip), feeds discovered URLs to the fuzzer.
+#   arjun   -- HTTP parameter discovery (pip), turns crawled endpoint paths into
+#              fuzzable param URLs so nuclei-dast can inject SQLi/XSS/LFI probes.
+# Installed as their OWN layer AFTER the slow nuclei-templates layer so adding
+# them never busts that (large) cache. Needs root for /usr/local/bin + site-packages.
 USER root
 ARG KATANA_VERSION=1.1.2
 RUN apt-get update \
@@ -69,6 +70,7 @@ RUN apt-get update \
     && unzip -o /tmp/katana.zip -d /tmp/katana && mv /tmp/katana/katana /usr/local/bin/katana \
     && chmod +x /usr/local/bin/katana \
     && rm -rf /tmp/katana* \
+    && pip install --no-cache-dir arjun==2.2.7 \
     && apt-get purge -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 USER appuser
 

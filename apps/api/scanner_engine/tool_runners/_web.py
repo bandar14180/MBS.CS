@@ -75,8 +75,37 @@ def web_targets(
 
 
 def crawled_urls(prior_findings: list[CommonFinding]) -> list[str]:
-    """URLs a crawler (katana) discovered, parameterised ones first -- those are
-    what DAST fuzzing actually has something to inject into."""
-    urls = _dedupe([f.value for f in prior_findings if f.asset_type == "url" and f.value])
-    with_params = [u for u in urls if "?" in u]
-    return with_params + [u for u in urls if u not in with_params]
+    """URLs for the DAST fuzzer, best-first so a big crawl can't crowd the good
+    targets out of the fuzz cap:
+      1. arjun-confirmed parameters (highest value -- a real param to inject),
+      2. other parameterised URLs (katana found a `?param=`),
+      3. paramless URLs (little for -dast to fuzz)."""
+    url_findings = [f for f in prior_findings if f.asset_type == "url" and f.value]
+    arjun = _dedupe([f.value for f in url_findings if f.metadata.get("source") == "arjun"])
+    with_params = _dedupe([f.value for f in url_findings if "?" in f.value and f.value not in arjun])
+    paramless = _dedupe([f.value for f in url_findings if "?" not in f.value])
+    return _dedupe(arjun + with_params + paramless)
+
+
+# Static assets have no server-side parameters to discover -- skip them so param
+# discovery (arjun) spends its (expensive) budget on real endpoints.
+_STATIC_EXT = (
+    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".map", ".webp", ".pdf", ".mp4", ".mp3",
+)
+
+
+def param_discovery_targets(prior_findings: list[CommonFinding], max_targets: int = 10) -> list[str]:
+    """The crawled endpoints worth running parameter discovery on: the base path
+    of every non-static URL, `/api/` paths first (the JSON API is where the
+    injectable params usually hide). We strip the query and dedupe by path --
+    crucial because the crawler emits API endpoints WITH a trailing `?` (e.g.
+    `/api/products?`), and those are exactly the paths whose real parameter names
+    we need arjun to discover. Bounded because arjun is request-heavy per URL."""
+    bases = _dedupe(
+        [f.value.split("?", 1)[0] for f in prior_findings if f.asset_type == "url" and f.value]
+    )
+    candidates = [u for u in bases if not u.lower().endswith(_STATIC_EXT)]
+    api = [u for u in candidates if "/api/" in u]
+    rest = [u for u in candidates if "/api/" not in u]
+    return (api + rest)[:max_targets]

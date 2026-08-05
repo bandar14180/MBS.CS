@@ -1,3 +1,4 @@
+from apps.api.scanner_engine.tool_runners.arjun_runner import ArjunRunner
 from apps.api.scanner_engine.tool_runners.base import BaseToolRunner
 from apps.api.scanner_engine.tool_runners.httpx_runner import HttpxRunner
 from apps.api.scanner_engine.tool_runners.katana_runner import KatanaRunner
@@ -18,6 +19,7 @@ TOOL_REGISTRY: dict[str, type[BaseToolRunner]] = {
     "naabu": NaabuRunner,
     "nmap": NmapRunner,
     "katana": KatanaRunner,
+    "arjun": ArjunRunner,
     "nuclei": NucleiRunner,
     "nuclei-dast": NucleiDastRunner,
 }
