@@ -39,24 +39,46 @@ async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
     return scan
 
 
+async def _claim_scan(db: AsyncSession, scan_id: uuid.UUID) -> bool:
+    """Atomically CLAIM a scan for execution (F3). A single conditional UPDATE uses the
+    `status` column as the claim token: only a `queued` scan (first run) or a `failed`
+    scan (retry) is claimable; a `running` or terminal scan is not. Returns True iff
+    THIS caller won the claim. Prevents duplicate concurrent execution from acks_late
+    redelivery / duplicate dispatch WITHOUT any long-held lock -- the row lock is held
+    only for this one statement, which commits immediately (the multi-minute scan then
+    runs lock-free). Under READ COMMITTED a losing worker updates 0 rows. Does NOT
+    recover orphaned `running` scans (out of scope -- see F3b follow-up)."""
+    result = await db.execute(
+        text(
+            "UPDATE scans SET status = 'running', started_at = now() "
+            "WHERE id = :id AND status IN ('queued', 'failed') RETURNING id"
+        ),
+        {"id": str(scan_id)},
+    )
+    claimed = result.first() is not None
+    await db.commit()  # make the claim durable + visible to other workers
+    return claimed
+
+
 async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     scan = await _load_scan(db, scan_id)
 
-    # Idempotency (P1-6): a task can be re-delivered after a worker crash
-    # (acks_late) or a retry. If this scan already reached a terminal state, do
-    # nothing -- never re-run a finished/cancelled scan.
-    if scan.status in ("completed", "completed_with_errors", "cancelled"):
-        logger.info("scan.skip_already_terminal scan=%s status=%s", scan.id, scan.status)
+    # ATOMIC CLAIM (F3): a task can be re-delivered after a worker crash (acks_late),
+    # duplicated, or retried. Claim the scan with a single conditional UPDATE (status
+    # is the claim token) -- only a queued (first run) or failed (retry) scan is
+    # claimable; a running or terminal scan is not. This prevents duplicate concurrent
+    # execution without any long-held lock. If we don't win the claim, skip cleanly.
+    claimed = await _claim_scan(db, scan_id)
+    await db.refresh(scan)  # resync the ORM object after the raw claim UPDATE
+    if not claimed:
+        logger.info("scan.skip_not_claimable scan=%s status=%s", scan.id, scan.status)
         return
 
     await db.execute(
         text("SELECT set_config('app.current_workspace_id', :wid, false)"),
         {"wid": str(scan.workspace_id)},
     )
-
-    scan.status = "running"
-    scan.started_at = datetime.now(timezone.utc)
-    await db.commit()
+    # status='running' + started_at were set atomically by _claim_scan above.
 
     scan_started = time.monotonic()
     logger.info(
