@@ -132,6 +132,15 @@ def kill_chain_steps(title_by_vuln_id: dict[uuid.UUID, str], mappings: list[Atta
     return steps
 
 
+async def scan_kill_chain_steps(db: AsyncSession, scan_id: uuid.UUID) -> list[dict]:
+    """Deterministic kill-chain steps for a scan's findings so far (pure ATT&CK
+    mapping, no AI). Shared by the live agent state-projection (mid-scan reasoning)
+    and the kill-chain endpoint's fallback, so the two never diverge."""
+    mappings = await _scan_mappings(db, scan_id)
+    vulns = list(await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan_id)))
+    return kill_chain_steps({v.id: v.title for v in vulns}, mappings)
+
+
 async def attack_matrix_for_scan(db: AsyncSession, scan_id: uuid.UUID) -> list[dict]:
     """ATT&CK-navigator-style view: tactics -> techniques with a hit count (how
     many of the scan's findings map to each technique)."""
@@ -169,7 +178,5 @@ async def kill_chain_for_scan(db: AsyncSession, scan_id: uuid.UUID) -> dict:
             "steps": narrative.steps,
             "model_version": narrative.model_version,
         }
-    mappings = await _scan_mappings(db, scan_id)
-    vulns = list(await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan_id)))
-    steps = kill_chain_steps({v.id: v.title for v in vulns}, mappings)
+    steps = await scan_kill_chain_steps(db, scan_id)
     return {"ai_generated": False, "summary": None, "steps": steps, "model_version": None}

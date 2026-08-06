@@ -56,3 +56,16 @@ class KillChainRead(BaseModel):
     summary: str | None = None
     model_version: str | None = None
     steps: list[KillChainStep]
+
+
+class AttackGraphRead(BaseModel):
+    """Read-only view of a scan's evidence-driven attack graph (M4.4.5), sourced from
+    the persisted EngagementState.attack_graph -- never recomputed and never writable
+    via the API. `has_engagement` is False for a non-agent scan (empty graph, not a
+    404). The graph dict is the actual persisted nodes/edges/counts/confirmed_access."""
+
+    has_engagement: bool
+    status: str | None = None
+    current_phase: str | None = None
+    objective: str | None = None
+    graph: dict = {}

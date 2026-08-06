@@ -167,7 +167,7 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
                     await db.commit()
                     continue
                 findings, status = await _run_single_tool(
-                    db, scan, runner, target_row.value, discovered, target_row.criticality
+                    db, scan, runner, target_row.value, discovered, target_row.criticality, target_row.type
                 )
                 discovered.extend(findings)
                 tool_statuses.append(status)
@@ -205,7 +205,11 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     await db.commit()
     logger.info(
         "scan.finished scan=%s status=%s duration=%.2fs tools_run=%d",
-        scan.id, scan.status, time.monotonic() - scan_started, len(runners),
+        # tool_statuses is populated by BOTH branches (the agent path returns it,
+        # the deterministic path appends to it), so it is the correct count here.
+        # `runners` is only bound in the deterministic branch -- referencing it on
+        # an agent-driven scan raised NameError after the row was already committed.
+        scan.id, scan.status, time.monotonic() - scan_started, len(tool_statuses),
     )
     await _publish_scan_completed(db, scan)
 
@@ -241,19 +245,6 @@ async def _publish_scan_completed(db: AsyncSession, scan: Scan) -> None:
     )
 
 
-def _summarize_findings(discovered: list[CommonFinding]) -> str:
-    """Bounded summary of discovered assets for the agent's context (never the raw
-    tool output). Keeps the model's context small as an engagement grows."""
-    if not discovered:
-        return "(none yet)"
-    from collections import Counter
-
-    counts = Counter(f.asset_type for f in discovered)
-    totals = "; ".join(f"{n} {t}(s)" for t, n in counts.items())
-    examples = ", ".join(f"{f.asset_type}:{f.value}" for f in discovered[:8])
-    return f"{totals}. Examples: {examples}"
-
-
 async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> list[str]:
     """Agent-driven engagement (M2): the single RedTeamAgent chooses tools
     dynamically by kill-chain phase + accumulated results, within the engagement's
@@ -264,12 +255,25 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
     per-tool safety violation blocks just that tool, never the engagement."""
     import asyncio
 
-    from apps.api.ai_agent.agent import RedTeamAgent
+    from apps.api.ai_agent.agent import AgentDecision, RedTeamAgent
+    from apps.api.ai_agent.prompts.agent import AGENT_PROMPT_VERSION
     from apps.api.ai_agent.providers.usage import collect_ai_usage
     from apps.api.ai_agent.usage_repo import persist_ai_usage
     from apps.api.core.config import get_settings
     from apps.api.modules.agent.models import AgentStep, EngagementState
+    from apps.api.modules.agent.repo import latest_agent_decision, persist_agent_decision
+    from apps.api.modules.attack.service import scan_kill_chain_steps
+    from apps.api.scanner_engine import attack_graph as ag
+    from apps.api.scanner_engine.attack_graph import AccessEvidence, AssetEvidence
     from apps.api.scanner_engine.safety import RulesOfEngagement, SafetyViolation, assert_action_allowed
+    from apps.api.scanner_engine.state_projection import (
+        ActionOutcome,
+        summarize_actions,
+        summarize_attack_context,
+        summarize_attack_graph,
+        summarize_findings,
+        summarize_prior_beliefs,
+    )
 
     settings = get_settings()
     roe = RulesOfEngagement.from_config(scan.config)
@@ -287,92 +291,270 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
 
     discovered: list[CommonFinding] = []
     tool_statuses: list[str] = []
+    outcomes: list[ActionOutcome] = []  # the memory of what has been tried (blueprint §14)
+    asset_evidence: list[AssetEvidence] = []  # assets w/ originating tool, for the attack graph
+    access_evidence: list[AccessEvidence] = []  # confirmed access, accumulated across rounds
     already_run: set[str] = set()
     step_no = 0
+    # M4.4.3 deterministic budget counters (agent_max_steps stays the HARD ceiling).
+    loop_started = time.monotonic()
+    ai_calls = 0
+    stall = 0  # consecutive tool runs that produced no new findings
+
+    def _budget_snapshot() -> dict:
+        return {
+            "step_no": step_no,
+            "max_steps": settings.agent_max_steps,
+            "ai_calls": ai_calls,
+            "elapsed_seconds": round(time.monotonic() - loop_started, 2),
+            "min_confidence": settings.agent_min_confidence,
+            "stall": stall,
+        }
+
+    def _budget_stop_reason() -> str | None:
+        """Deterministic termination precedence (checked BEFORE each AI call). None
+        means continue. Never extends past agent_max_steps (the while guard)."""
+        if settings.agent_max_ai_calls and ai_calls >= settings.agent_max_ai_calls:
+            return "ai_call_budget_exhausted"
+        if settings.agent_time_budget_seconds and (time.monotonic() - loop_started) >= settings.agent_time_budget_seconds:
+            return "time_budget_exhausted"
+        if settings.agent_stall_limit and stall >= settings.agent_stall_limit:
+            return "no_progress"
+        return None
+
+    async def _rebuild_graph(new_access: list[AccessEvidence] | None = None) -> dict:
+        """Deterministically (re)build the evidence-driven attack graph from all
+        accumulated evidence and persist it to engagement_state. Idempotent -- the
+        LLM never writes here (blueprint §7/§18). Confirmed access ACCUMULATES so a
+        rebuild never drops access nodes across reasoning rounds (M4.4.4)."""
+        if new_access:
+            access_evidence.extend(new_access)
+        graph_findings = await _graph_findings(db, scan)
+        state.attack_graph = ag.update_graph(
+            state.attack_graph or {},
+            assets=asset_evidence,
+            findings=graph_findings,
+            access=access_evidence or None,
+            now=datetime.now(timezone.utc).isoformat(),
+        )
+        return state.attack_graph
 
     def _record(phase, action_type, tool, tier, rationale, result, status):
-        db.add(
-            AgentStep(
-                workspace_id=scan.workspace_id,
-                scan_id=scan.id,
-                step_no=step_no,
-                phase=phase,
-                action_type=action_type,
-                tool_or_module=tool,
-                safety_tier=tier,
-                rationale=(rationale or None) and rationale[:2000],
-                result_summary=(result or None) and result[:2000],
-                status=status,
-            )
+        step = AgentStep(
+            workspace_id=scan.workspace_id,
+            scan_id=scan.id,
+            step_no=step_no,
+            phase=phase,
+            action_type=action_type,
+            tool_or_module=tool,
+            safety_tier=tier,
+            rationale=(rationale or None) and rationale[:2000],
+            result_summary=(result or None) and result[:2000],
+            status=status,
+        )
+        db.add(step)
+        return step
+
+    async def _persist_decision(decision, step, budget_state=None) -> None:
+        """Persist the STRUCTURED reasoning audit (agent_decisions) for this cycle,
+        hard-linked to its AgentStep. AgentStep is unchanged -- this is complementary
+        (blueprint M4.4). Flush first so the step has an id to reference."""
+        await db.flush()
+        await persist_agent_decision(
+            db,
+            workspace_id=scan.workspace_id,
+            scan_id=scan.id,
+            step_no=step_no,
+            decision=decision,
+            agent_step_id=step.id,
+            budget_state=budget_state or {"step_no": step_no, "max_steps": settings.agent_max_steps},
         )
 
-    while step_no < settings.agent_max_steps:
-        available = agent.available_tools(
-            target_type=target_row.type,
-            active_testing_allowed=scope.active_testing_allowed,
-            roe=roe,
-            already_run=already_run,
-        )
-        with collect_ai_usage(
-            agent_role="agent", workspace_id=str(scan.workspace_id), scan_id=str(scan.id)
-        ) as usage:
-            decision = await asyncio.to_thread(
-                agent.decide,
+    async def _decision_loop() -> None:
+        """One reasoning round: the agent proposes candidates, the CODE selects +
+        validates + executes DETECTION tools from the allowlist, until it finishes or
+        a deterministic budget stops it. Continues across rounds from the same
+        step/budget counters and accumulated `already_run`. The agent NEVER selects
+        exploitation -- that stays deterministic and gated in the outer round."""
+        nonlocal step_no, ai_calls, stall
+        while step_no < settings.agent_max_steps:
+            # Deterministic budget stop (checked before spending an AI call). Recorded as
+            # a finish decision so the termination reason is auditable in agent_decisions.
+            budget_stop = _budget_stop_reason()
+            if budget_stop:
+                fin = AgentDecision(
+                    "finish", None, state.current_phase, f"budget stop: {budget_stop}",
+                    agent._client.model_version, AGENT_PROMPT_VERSION, stop_reason=budget_stop,
+                )
+                step = _record(state.current_phase, "decision", None, None, fin.summary(), "engagement stopped (budget)", "executed")
+                await _persist_decision(fin, step, budget_state=_budget_snapshot())
+                step_no += 1  # every persisted decision consumes a unique step_no (across rounds)
+                await db.commit()
+                break
+
+            available = agent.available_tools(
                 target_type=target_row.type,
-                target_value=target_row.value,
-                current_phase=state.current_phase,
-                findings_summary=_summarize_findings(discovered),
-                tools_run_summary=", ".join(sorted(already_run)) or "(none)",
-                available=available,
+                active_testing_allowed=scope.active_testing_allowed,
+                roe=roe,
+                already_run=already_run,
             )
-        await persist_ai_usage(usage)
+            # Live ATT&CK / kill-chain context from the findings so far, so the agent
+            # reasons over which phases are already evidenced (not just which tools
+            # ran) -- makes ATT&CK a decision input, not a report section (§16/§17).
+            attack_summary = summarize_attack_context(await scan_kill_chain_steps(db, scan.id))
+            # Evidence-driven attack graph (asset->service->finding->technique + access),
+            # rebuilt from accumulated evidence and fed back into reasoning (blueprint §7).
+            graph = await _rebuild_graph()
+            # Belief continuity (M4.4.2): carry the PREVIOUS cycle's structured reasoning
+            # forward from the persisted agent_decisions row -- hypotheses stay UNVERIFIED.
+            prior = await latest_agent_decision(db, scan.id)
+            prior_beliefs = (
+                summarize_prior_beliefs(prior.observations, prior.inferences, prior.hypotheses)
+                if prior else "(none yet)"
+            )
+            with collect_ai_usage(
+                agent_role="agent", workspace_id=str(scan.workspace_id), scan_id=str(scan.id)
+            ) as usage:
+                decision = await asyncio.to_thread(
+                    agent.decide,
+                    target_type=target_row.type,
+                    target_value=target_row.value,
+                    current_phase=state.current_phase,
+                    findings_summary=summarize_findings(discovered),
+                    attack_summary=attack_summary,
+                    actions_summary=summarize_actions(outcomes),
+                    graph_summary=summarize_attack_graph(graph),
+                    objective=state.objective or "",
+                    prior_beliefs=prior_beliefs,
+                    min_confidence=settings.agent_min_confidence,
+                    available=available,
+                )
+            ai_calls += 1
+            await persist_ai_usage(usage)
 
-        if decision.action != "run_tool" or not decision.tool:
-            _record(decision.phase, "decision", None, None, decision.rationale, "engagement finished", "executed")
-            await db.commit()
-            break
+            if decision.action != "run_tool" or not decision.tool:
+                step = _record(decision.phase, "decision", None, None, decision.summary(), "engagement finished", "executed")
+                await _persist_decision(decision, step, budget_state=_budget_snapshot())
+                step_no += 1  # every persisted decision consumes a unique step_no (across rounds)
+                await db.commit()
+                break
 
-        runner = TOOL_REGISTRY[decision.tool]()
-        # Safety gate (belt and suspenders -- available_tools already filtered).
-        try:
-            assert_action_allowed(safety_tier=runner.safety_tier, roe=roe)
-        except SafetyViolation as exc:
-            _record(decision.phase, "tool_run", decision.tool, runner.safety_tier, decision.rationale, f"BLOCKED: {exc}", "blocked")
+            runner = TOOL_REGISTRY[decision.tool]()
+            # Safety gate (belt and suspenders -- available_tools already filtered).
+            try:
+                assert_action_allowed(safety_tier=runner.safety_tier, roe=roe)
+            except SafetyViolation as exc:
+                step = _record(decision.phase, "tool_run", decision.tool, runner.safety_tier, decision.summary(), f"BLOCKED: {exc}", "blocked")
+                await _persist_decision(decision, step, budget_state=_budget_snapshot())
+                outcomes.append(ActionOutcome(decision.tool, "blocked", str(exc)[:120]))
+                already_run.add(decision.tool)
+                await db.commit()
+                step_no += 1
+                continue
+
+            findings, status = await _run_single_tool(
+                db, scan, runner, target_row.value, discovered, target_row.criticality, target_row.type
+            )
+            discovered.extend(findings)
+            # Tag each discovered asset with the tool that found it, for graph provenance.
+            asset_evidence.extend(
+                AssetEvidence(asset_type=f.asset_type, value=f.value, tool=runner.name, metadata=f.metadata)
+                for f in findings
+            )
+            tool_statuses.append(status)
+            outcomes.append(ActionOutcome(decision.tool, status, f"{len(findings)} finding(s)"))
             already_run.add(decision.tool)
+            state.current_phase = decision.phase
+            # Stall detection (M4.4.3): a tool run that yields no new findings advances the
+            # no-progress counter; any new evidence resets it.
+            stall = stall + 1 if not findings else 0
+            step = _record(decision.phase, "tool_run", decision.tool, runner.safety_tier, decision.summary(), f"{status}: {len(findings)} finding(s)", status)
+            await _persist_decision(decision, step, budget_state=_budget_snapshot())
             await db.commit()
             step_no += 1
-            continue
 
-        findings, status = await _run_single_tool(
-            db, scan, runner, target_row.value, discovered, target_row.criticality
-        )
-        discovered.extend(findings)
-        tool_statuses.append(status)
-        already_run.add(decision.tool)
-        state.current_phase = decision.phase
-        _record(decision.phase, "tool_run", decision.tool, runner.safety_tier, decision.rationale, f"{status}: {len(findings)} finding(s)", status)
-        await db.commit()
-        step_no += 1
+    # OUTER ROUNDS (M4.4.4): recon/detection reasoning, then deterministic gated
+    # exploitation, then -- if exploitation produced NEW confirmed access and a round
+    # remains -- RE-ENTER so the next reasoning cycle sees that access (feedback only;
+    # the agent never selects exploitation). Default agent_max_rounds=1 == prior behavior.
+    round_no = 0
+    while round_no < settings.agent_max_rounds:
+        await _decision_loop()
 
-    # EXPLOITATION PHASE -- gated, deterministic, SAFE. The LLM planned recon above;
-    # exploitation runs only when the RoE enables it (deployment + engagement) and is
-    # never driven by the model, so a misbehaving model can't trigger it. Each attempt
-    # additionally requires host approval + passes the safety gate.
-    if roe.exploitation_enabled:
-        state.current_phase = "exploitation"
-        confirmed = await _run_exploitation_phase(db, scan, target_row, roe, step_no)
-        if confirmed:
-            state.attack_graph = {
-                **(state.attack_graph or {}),
-                "confirmed_access": [
-                    {"target": r.target, "access_type": r.access_type, "module": r.module, "proof": r.proof}
+        # EXPLOITATION PHASE -- gated, deterministic, SAFE. Runs only when the RoE
+        # enables it (deployment + engagement); never driven by the model, so a
+        # misbehaving model can't trigger it. Each attempt additionally requires host
+        # approval + passes the safety gate.
+        new_access: list = []
+        if roe.exploitation_enabled:
+            state.current_phase = "exploitation"
+            confirmed = await _run_exploitation_phase(db, scan, target_row, roe, step_no)
+            if confirmed:
+                # Keep the M2 confirmed_access key (back-compat) AND fold the confirmed
+                # access into the evidence-driven graph as access nodes on their hosts.
+                state.attack_graph = {
+                    **(state.attack_graph or {}),
+                    "confirmed_access": [
+                        {"target": r.target, "access_type": r.access_type, "module": r.module, "proof": r.proof}
+                        for r in confirmed
+                    ],
+                }
+                new_access = [
+                    AccessEvidence(target=r.target, access_type=r.access_type, module=r.module, proof=r.proof)
                     for r in confirmed
-                ],
-            }
+                    if r.exploitable
+                ]
+                await _rebuild_graph(new_access=new_access)
+
+        round_no += 1
+        # Re-enter only if exploitation produced new access AND a round remains, so the
+        # NEXT reasoning cycle consumes the confirmed access (feedback only).
+        if not new_access or round_no >= settings.agent_max_rounds:
+            break
 
     state.status = "completed"
     await db.commit()
     return tool_statuses
+
+
+async def _graph_findings(db: AsyncSession, scan: Scan) -> list:
+    """Collect this scan's ingested vulnerabilities as FindingEvidence for the attack
+    graph: each finding's deterministic ATT&CK techniques (from attack_mappings) and
+    the value of the asset it was resolved to (vuln.asset_id -> asset), so the graph
+    can link Finding -> Service without inventing a location. Pure read; the graph
+    construction itself is deterministic and evidence-only."""
+    from collections import defaultdict
+
+    from apps.api.modules.attack.models import AttackMapping
+    from apps.api.modules.vulnerabilities.models import Vulnerability
+    from apps.api.scanner_engine.attack_graph import FindingEvidence
+
+    vulns = list(await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan.id)))
+    if not vulns:
+        return []
+
+    vuln_ids = [v.id for v in vulns]
+    techniques: dict = defaultdict(list)
+    for m in await db.scalars(select(AttackMapping).where(AttackMapping.vulnerability_id.in_(vuln_ids))):
+        techniques[m.vulnerability_id].append((m.tactic_id, m.technique_id, m.technique_name, m.kill_chain_phase))
+
+    asset_value: dict = {}
+    asset_ids = {v.asset_id for v in vulns if v.asset_id}
+    if asset_ids:
+        for a in await db.scalars(select(Asset).where(Asset.id.in_(asset_ids))):
+            asset_value[a.id] = a.value
+
+    return [
+        FindingEvidence(
+            fingerprint=v.fingerprint,
+            title=v.title,
+            severity=v.severity,
+            techniques=techniques.get(v.id, []),
+            service_value=asset_value.get(v.asset_id),
+            category=v.category,
+        )
+        for v in vulns
+    ]
 
 
 async def _run_exploitation_phase(db: AsyncSession, scan: Scan, target_row, roe, base_step_no: int) -> list:
@@ -527,13 +709,33 @@ async def _run_single_tool(
     target_value: str,
     prior_findings: list[CommonFinding],
     criticality: str,
+    target_type: str,
 ) -> tuple[list[CommonFinding], str]:
     """Run one tool resiliently and return (findings, status) where status is
     completed | partial | failed. A tool NEVER aborts the scan: a crash/timeout or
     a non-zero exit with no usable output is recorded as `failed` and the pipeline
     moves on; a non-zero exit that still produced parseable output is `partial`
     (its findings are kept). The overall scan status is aggregated by the caller."""
+    from apps.api.core.config import get_settings
+    from apps.api.scanner_engine import scope_guard
+
     config = scan.config or {}
+
+    # M4.5 (G9): authorization-scope enforcement on DERIVED hosts. A discovered asset
+    # is handed to this active tool only if its host is within the target's authorized
+    # scope; out-of-scope or indeterminable-host findings are recorded as observations
+    # (see the in_scope tagging below) but NEVER actively probed -- FAIL CLOSED. The
+    # primary target is always probed: it is passed as target_value, not a finding.
+    scoped_prior = prior_findings
+    if get_settings().scan_enforce_derived_scope:
+        scoped_prior, out_of_scope = scope_guard.partition_in_scope(target_type, target_value, prior_findings)
+        if out_of_scope:
+            logger.info(
+                "scan.out_of_scope_skipped scan=%s tool=%s blocked=%d hosts=%s",
+                scan.id, runner.name, len(out_of_scope),
+                ",".join(sorted({scope_guard.extract_host(f) or "?" for f in out_of_scope}))[:500],
+            )
+
     tool_run = ToolRun(
         scan_id=scan.id,
         tool_name=runner.name,
@@ -554,7 +756,7 @@ async def _run_single_tool(
     # A crash/timeout in the runner is a failed tool run, NOT a failed scan: record
     # it (with evidence of the exception) and let the pipeline continue.
     try:
-        raw = await runner.run(target_value, config, prior_findings)
+        raw = await runner.run(target_value, config, scoped_prior)
     except Exception as exc:
         tool_run.status = "failed"
         tool_run.completed_at = datetime.now(timezone.utc)
@@ -634,6 +836,16 @@ async def _run_single_tool(
     if storage_failed:
         note = "evidence storage unavailable (raw output not persisted)"
         tool_run.error_message = f"{tool_run.error_message}; {note}" if tool_run.error_message else note
+
+    # M4.5: record each discovered asset's scope decision as an observation (metadata
+    # in_scope) so the stored asset + graph reflect what was in/out of scope. Tagging
+    # happens regardless of the kill-switch; only the active-probing FILTER above is
+    # gated. Fail closed: an indeterminable host is tagged out of scope.
+    for finding in findings:
+        finding.metadata = {
+            **(finding.metadata or {}),
+            "in_scope": scope_guard.finding_in_scope(target_type, target_value, finding),
+        }
 
     for finding in findings:
         await upsert_asset(

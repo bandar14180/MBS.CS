@@ -45,11 +45,55 @@ class ReportData:
     # MITRE ATT&CK coverage across the project: (tactic_name, technique_id,
     # technique_name, finding_count), most-hit first.
     attack_techniques: list[tuple[str, str, str, int]] = field(default_factory=list)
+    # Autonomous-engagement attack graph (M4.4.6), aggregated across the project's
+    # agent scans. Empty for projects with no autonomous engagement (fail-soft). Keys:
+    # has_data, engagement_count, node_counts{type:n}, confirmed_access[{target,
+    # access_state, module}]. Only evidence-backed states appear (no invented
+    # privilege escalation / lateral movement).
+    attack_graph: dict = field(default_factory=dict)
 
 
 def compute_security_score(active_severity_counts: dict[str, int]) -> int:
     penalty = sum(_SEVERITY_PENALTY.get(sev, 0) * n for sev, n in active_severity_counts.items())
     return max(0, 100 - penalty)
+
+
+async def _gather_attack_graph(db: AsyncSession, project_id: uuid.UUID) -> dict:
+    """Aggregate the persisted attack graph(s) from the project's autonomous
+    engagements (M4.4.6). Reads the ACTUAL EngagementState.attack_graph -- never
+    recomputes. Fail-soft: returns has_data=False if there is no engagement. Only
+    evidence-backed access states are surfaced (privilege escalation / lateral
+    movement appear only if a module ever produces that evidence)."""
+    from apps.api.modules.agent.models import EngagementState
+    from apps.api.modules.scans.models import Scan
+
+    engagements = list(
+        await db.scalars(
+            select(EngagementState).join(Scan, Scan.id == EngagementState.scan_id).where(Scan.project_id == project_id)
+        )
+    )
+    node_counts: dict[str, int] = {}
+    confirmed_access: list[dict] = []
+    for eng in engagements:
+        graph = eng.attack_graph or {}
+        for node in graph.get("nodes", []):
+            ntype = node.get("type")
+            if ntype:
+                node_counts[ntype] = node_counts.get(ntype, 0) + 1
+            if ntype == "access":
+                attrs = node.get("attributes") or {}
+                # node id is "access:<target>:<access_type>" -> recover the target.
+                parts = str(node.get("id", "")).split(":")
+                target = parts[1] if len(parts) >= 3 else (parts[1] if len(parts) == 2 else "?")
+                confirmed_access.append(
+                    {"target": target, "access_state": attrs.get("access_state"), "module": attrs.get("module")}
+                )
+    return {
+        "has_data": bool(engagements) and bool(node_counts),
+        "engagement_count": len(engagements),
+        "node_counts": node_counts,
+        "confirmed_access": confirmed_access,
+    }
 
 
 async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportData:
@@ -123,6 +167,8 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         key=lambda x: (-x[3], x[0], x[1]),
     )
 
+    attack_graph = await _gather_attack_graph(db, project_id)
+
     return ReportData(
         project_name=project_name,
         security_score=compute_security_score(active_counts),
@@ -131,4 +177,5 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         active_vulns=sum(active_counts.values()),
         vulns=rows,
         attack_techniques=attack_techniques,
+        attack_graph=attack_graph,
     )

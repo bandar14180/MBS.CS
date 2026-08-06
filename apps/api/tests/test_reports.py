@@ -57,6 +57,23 @@ def test_executive_report_is_pdf() -> None:
     assert len(out) > 800
 
 
+def test_executive_report_renders_attack_graph_section() -> None:
+    # M4.4.6: the report renders the autonomous attack-graph section when an agent
+    # engagement exists, including confirmed access. The default (empty attack_graph)
+    # is exercised by test_executive_report_is_pdf -> proves fail-soft/back-compat.
+    data = _sample_data()
+    data.attack_graph = {
+        "has_data": True,
+        "engagement_count": 1,
+        "node_counts": {"asset": 1, "service": 1, "finding": 1, "technique": 1, "access": 1},
+        "confirmed_access": [{"target": "203.0.113.7", "access_state": "access_obtained", "module": "known_cve"}],
+    }
+    out = render.render("executive", data)
+    assert out[:5] == b"%PDF-"
+    # A larger document than the same report without the populated section.
+    assert len(out) > len(render.render("executive", _sample_data()))
+
+
 def test_technical_report_is_pdf() -> None:
     out = render.render("technical", _sample_data(3))
     assert out[:5] == b"%PDF-"

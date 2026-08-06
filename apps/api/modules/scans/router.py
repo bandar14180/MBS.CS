@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Response, status
 from apps.api.core.deps import CurrentUserDep, DbDep, WorkspaceContextDep, require_permission
 from apps.api.core.pagination import PaginationDep, set_page_headers
 from apps.api.modules.attack import service as attack_service
-from apps.api.modules.attack.schemas import KillChainRead, TacticMatrixRead
+from apps.api.modules.attack.schemas import AttackGraphRead, KillChainRead, TacticMatrixRead
 from apps.api.modules.scans import service
 from apps.api.modules.scans.schemas import AIPlanRead, EvidenceRead, ScanCreate, ScanRead, ToolRunRead
 
@@ -138,3 +138,30 @@ async def get_kill_chain(
     narrative when available, else the deterministic mapping."""
     await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
     return KillChainRead.model_validate(await attack_service.kill_chain_for_scan(db, scan_id))
+
+
+@router.get(
+    "/{scan_id}/attack-graph",
+    response_model=AttackGraphRead,
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_attack_graph(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> AttackGraphRead:
+    """The scan's evidence-driven attack graph (M4.4.5): the ACTUAL persisted
+    EngagementState.attack_graph -- read-only, never recomputed or writable here. A
+    non-agent scan returns an empty graph (has_engagement=False), not a 404. Scope +
+    workspace isolation via get_scan (404s out-of-scope) + RLS on engagement_state."""
+    from apps.api.modules.agent.service import get_engagement
+
+    await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
+    eng = await get_engagement(db, scan_id)
+    if eng is None:
+        return AttackGraphRead(has_engagement=False, graph={})
+    return AttackGraphRead(
+        has_engagement=True,
+        status=eng.status,
+        current_phase=eng.current_phase,
+        objective=eng.objective,
+        graph=eng.attack_graph or {},
+    )

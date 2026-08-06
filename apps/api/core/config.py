@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     # scan_allowed_cidrs. There is deliberately no blanket "disable SSRF" switch.
     scan_allow_private_targets: bool = False
     scan_allowed_cidrs: list[str] = []
+    # M4.5 (G9): re-check DISCOVERED (derived) hosts against the target's authorized
+    # scope before any active tool probes them. Out-of-scope / indeterminable-host
+    # findings are recorded as observations but never actively scanned (fail closed).
+    # Kill-switch only -- default True (secure); set False to restore prior behavior.
+    scan_enforce_derived_scope: bool = True
 
     # --- Autonomous red-team agent -----------------------------------------
     # Deployment-wide safety ceiling the per-engagement RoE can restrict but never
@@ -150,7 +155,15 @@ class Settings(BaseSettings):
     # AND a per-engagement opt-in. agent_max_steps bounds the agentic loop.
     agent_safety_ceiling: str = "active_safe"     # passive | active_safe | intrusive
     agent_exploitation_enabled: bool = False      # deployment gate for INTRUSIVE actions
-    agent_max_steps: int = 40
+    agent_max_steps: int = 40                     # HARD ceiling on agentic loop steps (never bypassed)
+    # M4.4.3 deterministic budget/stop controls. All default to a no-op so existing
+    # behavior (bounded only by agent_max_steps) is unchanged until an operator opts
+    # in. A budget may only STOP earlier -- never allow execution beyond agent_max_steps.
+    agent_min_confidence: float = 0.0             # drop candidates below this confidence (0 = off)
+    agent_time_budget_seconds: float = 0.0        # wall-clock budget across the loop (0 = off)
+    agent_max_ai_calls: int = 0                   # cap on decide() calls (0 = off)
+    agent_stall_limit: int = 0                    # stop after N consecutive tool runs with no new evidence (0 = off)
+    agent_max_rounds: int = 1                     # recon<->exploitation re-entry rounds (M4.4.4; 1 = current)
 
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
