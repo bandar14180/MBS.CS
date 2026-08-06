@@ -56,6 +56,17 @@ async def lifespan(app: FastAPI):
     configure_networking(settings)
     # Fail fast if production is misconfigured (placeholder secrets, wildcard CORS, ...).
     settings.validate_production()
+    # Runtime security checks that need DB context (M4.6.1): refuse to start in
+    # production on a superuser DB role (would bypass FORCE RLS / workspace isolation),
+    # and warn when derived-scope enforcement is disabled. Dev warns and continues.
+    from apps.api.core.db import engine
+    from apps.api.core.startup_checks import run_startup_security_checks
+
+    await run_startup_security_checks(
+        engine,
+        is_production=settings.is_production,
+        enforce_derived_scope=settings.scan_enforce_derived_scope,
+    )
     # Non-fatal AI configuration report (no paid call at boot).
     logger.info(
         "ai_configuration",

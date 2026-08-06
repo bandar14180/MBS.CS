@@ -147,6 +147,11 @@ class Settings(BaseSettings):
     # findings are recorded as observations but never actively scanned (fail closed).
     # Kill-switch only -- default True (secure); set False to restore prior behavior.
     scan_enforce_derived_scope: bool = True
+    # EMERGENCY-ONLY acknowledgement to run in PRODUCTION with the control above
+    # DISABLED. Left False, production refuses to start when derived-scope enforcement
+    # is off (M4.6.1 / F2). Do NOT set this for convenience -- it turns off a security
+    # control; document the incident/reason whenever it is used.
+    scan_enforce_derived_scope_ack: bool = False
 
     # --- Autonomous red-team agent -----------------------------------------
     # Deployment-wide safety ceiling the per-engagement RoE can restrict but never
@@ -274,6 +279,17 @@ class Settings(BaseSettings):
             problems.append("RATE_LIMIT_ENABLED must be true in production (unrestricted limits are unsafe).")
         if self.metrics_mode == "public":
             problems.append("METRICS_MODE must not be 'public' in production.")
+        # M4.6.1 / F2: refuse to run in production with derived-target authorization
+        # enforcement disabled (unless explicitly, emergency-acknowledged).
+        from apps.api.core.startup_checks import derived_scope_problem
+
+        scope_problem = derived_scope_problem(
+            is_production=self.is_production,
+            enforce=self.scan_enforce_derived_scope,
+            ack=self.scan_enforce_derived_scope_ack,
+        )
+        if scope_problem:
+            problems.append(scope_problem)
         if problems:
             raise RuntimeError(
                 "Refusing to start in production with insecure configuration:\n  - "
