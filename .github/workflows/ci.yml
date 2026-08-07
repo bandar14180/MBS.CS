@@ -29,6 +29,9 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://mbs:mbs@localhost:5432/mbs
       REDIS_URL: redis://localhost:6379/0
+      # Coverage gate (Phase 1.7). Configurable per-run; default 80% (also set in
+      # pyproject.toml [tool.coverage.report].fail_under). Lower ONLY intentionally.
+      COVERAGE_FAIL_UNDER: "80"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,8 +42,25 @@ jobs:
       - name: Apply migrations
         working-directory: db
         run: alembic upgrade head
-      - name: Run tests
-        run: python -m pytest apps/api/tests -q
+      - name: Run tests with coverage gate
+        # Fails the job if total coverage drops below COVERAGE_FAIL_UNDER. Emits a
+        # terminal summary plus coverage.xml and htmlcov/ for the artifact upload.
+        run: >-
+          python -m pytest apps/api/tests
+          --cov=apps/api
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-report=html
+          --cov-fail-under=${COVERAGE_FAIL_UNDER}
+      - name: Upload coverage artifacts
+        if: ${{ always() }}   # keep the report even when the gate fails, to aid triage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: warn
 
   # Dependency vulnerability audit. Non-blocking for now (a single transitive
   # advisory should surface, not wedge every PR); triage findings and pin/upgrade.

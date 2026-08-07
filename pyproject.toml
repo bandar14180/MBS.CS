@@ -1,0 +1,43 @@
+# Phase 1.7 -- Coverage & CI gate configuration.
+#
+# pytest + coverage.py config live here (repo root) so both local runs and CI discover the
+# same settings. Coverage is NOT forced into the default pytest run (keeps `pytest -q` fast
+# and dependency-light); enable it explicitly with `pytest --cov` or via the Makefile /
+# CI target. The failure threshold is `fail_under` below and is overridable in CI with
+# `--cov-fail-under=<n>` (env COVERAGE_FAIL_UNDER).
+
+[tool.pytest.ini_options]
+# Keep the default invocation unchanged (no --cov here); coverage is opt-in per run.
+testpaths = ["apps/api/tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+# Measure the application package only; the branch flag makes the gate meaningful.
+source = ["apps/api"]
+branch = true
+omit = [
+    "apps/api/tests/*",          # don't count the tests themselves
+    "apps/api/dr/__main__.py",   # thin CLI shim (argv dispatch)
+    "apps/api/dr/cli.py",        # exercised via service-level tests, not argv parsing
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+# The coverage GATE. Default 80% (configurable: edit here, or pass --cov-fail-under=<n>).
+fail_under = 80
+show_missing = true
+skip_covered = false
+precision = 2
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"
