@@ -8,6 +8,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.core.events import ScanCompleted, emit as emit_event, subscribe as subscribe_event
+from apps.api.core.observability import record_ai_decision, record_scan_result, record_tool_failure
 from apps.api.modules.assets.models import Asset
 from apps.api.modules.assets.service import upsert_asset
 from apps.api.modules.attack.service import sync_attack_mappings
@@ -58,6 +59,65 @@ async def _claim_scan(db: AsyncSession, scan_id: uuid.UUID) -> bool:
     claimed = result.first() is not None
     await db.commit()  # make the claim durable + visible to other workers
     return claimed
+
+
+async def reap_orphaned_scans(db: AsyncSession, timeout_seconds: int) -> int:
+    """Recover scans stuck in 'running' past `timeout_seconds` -- a worker that claimed
+    the scan (M4.6.2) then crashed/was lost, so acks_late redelivery just skips it and
+    the scan would otherwise stay 'running' forever (Phase 1.2 / F3b).
+
+    A SINGLE atomic conditional UPDATE marks them 'failed': it touches ONLY over-threshold
+    'running' scans -- never completed/failed/cancelled or recently-started ones -- with
+    no per-row race. Returns how many were recovered.
+
+    Why 'failed' and NOT re-queue: the reaper never re-dispatches a task, so it can never
+    create a duplicate execution. If a marked scan is later retried, the atomic claim
+    (queued/failed only) still guarantees at-most-one executor. If the 'crashed' worker
+    was merely slow and still alive, it simply overwrites this 'failed' with its true
+    terminal status on completion -- again, only ONE execution ever ran."""
+    result = await db.execute(
+        text(
+            "UPDATE scans SET status = 'failed', completed_at = now() "
+            "WHERE status = 'running' AND started_at < now() - make_interval(secs => :secs) "
+            "RETURNING id"
+        ),
+        {"secs": int(timeout_seconds)},
+    )
+    reaped = len(result.fetchall())
+    await db.commit()
+    return reaped
+
+
+async def _is_cancelled(db: AsyncSession, scan_id: uuid.UUID) -> bool:
+    """Cooperative-cancellation probe (Phase 1.5). A fresh single-statement read of the
+    scan's status; under READ COMMITTED it sees a concurrent API cancel committed on
+    another connection. Used between tool executions so an in-flight scan stops promptly
+    instead of running every remaining tool after the user cancelled."""
+    row = (await db.execute(
+        text("SELECT status FROM scans WHERE id = :id"), {"id": str(scan_id)}
+    )).first()
+    return bool(row and row[0] == "cancelled")
+
+
+async def _finalize_status(db: AsyncSession, scan: Scan, new_status: str) -> bool:
+    """Atomically move a scan from 'running' to a terminal status (Phase 1.5).
+
+    The write is CONDITIONAL on status still being 'running' (mirrors the atomic claim),
+    so it can NEVER clobber a scan that was cancelled (or otherwise moved terminal)
+    concurrently by the API. Returns True iff THIS caller performed the terminal write;
+    False means someone else already finalized it (e.g. a cancel) and the caller must not
+    overwrite. Refreshes the ORM object so callers see the authoritative status."""
+    result = await db.execute(
+        text(
+            "UPDATE scans SET status = :st, completed_at = now() "
+            "WHERE id = :id AND status = 'running' RETURNING id"
+        ),
+        {"st": new_status, "id": str(scan.id)},
+    )
+    won = result.first() is not None
+    await db.commit()
+    await db.refresh(scan)
+    return won
 
 
 async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
@@ -170,6 +230,16 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             # Findings accumulate across the pipeline so later tools build on earlier
             # ones (httpx probes subfinder's subdomains; nmap deep-scans naabu ports).
             for runner in runners:
+                # Cooperative cancellation (Phase 1.5): stop launching further tools the
+                # moment the scan is cancelled. The terminal write below then loses the
+                # atomic race and leaves the 'cancelled' state intact.
+                if await _is_cancelled(db, scan.id):
+                    logger.info(
+                        "scan.cancelled_stop scan=%s tool=%s (skipping remaining tools)", scan.id, runner.name,
+                        extra={"event": "scan.cancelled_stop", "scan_id": str(scan.id),
+                               "reason": "cancelled", "tool": runner.name},
+                    )
+                    break
                 if runner.applicable_target_types is not None and target_row.type not in runner.applicable_target_types:
                     continue
                 # Active-testing gate: tools that send payloads run only when the
@@ -203,35 +273,58 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         #   completed_with_errors -> at least one tool failed or ran partial
         #   completed             -> all executed tools succeeded (or none ran)
         if tool_statuses and all(s == "failed" for s in tool_statuses):
-            scan.status = "failed"
+            new_status = "failed"
         elif any(s in ("failed", "partial") for s in tool_statuses):
-            scan.status = "completed_with_errors"
+            new_status = "completed_with_errors"
         else:
-            scan.status = "completed"
+            new_status = "completed"
 
         # Best-effort AI attack-path narrative over all of this scan's findings.
         # Fully fail-soft: an AI failure never changes the scan status or aborts.
         await _synthesize_attack_narrative(db, scan)
     except Exception as exc:
-        scan.status = "failed"
-        scan.completed_at = datetime.now(timezone.utc)
-        await db.commit()
+        _duration = time.monotonic() - scan_started
+        # Atomic terminal write: only running -> failed. If a cancel landed concurrently
+        # (Phase 1.5), we lose the race and MUST NOT overwrite 'cancelled'.
+        won = await _finalize_status(db, scan, "failed")
+        if not won and scan.status == "cancelled":
+            logger.info(
+                "scan.cancelled_during_run scan=%s -- leaving cancelled, not retrying", scan.id,
+                extra={"event": "scan.cancelled_during_run", "scan_id": str(scan.id),
+                       "reason": "cancelled", "duration_s": round(_duration, 2)},
+            )
+            return  # user cancellation is terminal; do not retry a cancelled scan
+        record_scan_result("failed", _duration)  # Phase 1.3 metric (real lifecycle event)
         logger.error(
             "scan.failed scan=%s duration=%.2fs error=%s",
-            scan.id, time.monotonic() - scan_started, exc, exc_info=True,
+            scan.id, _duration, exc,
+            extra={"event": "scan.failed", "scan_id": str(scan.id), "status": "failed",
+                   "duration_s": round(_duration, 2), "reason": type(exc).__name__},
+            exc_info=True,
         )
         await _publish_scan_completed(db, scan)
         raise
 
-    scan.completed_at = datetime.now(timezone.utc)
-    await db.commit()
+    _duration = time.monotonic() - scan_started
+    # Atomic terminal write: only running -> terminal, so a scan cancelled mid-run (or
+    # already finalized) is never clobbered back to completed (Phase 1.5).
+    won = await _finalize_status(db, scan, new_status)
+    if not won:
+        logger.info(
+            "scan.finalize_skipped scan=%s status=%s -- already terminal, not overwriting",
+            scan.id, scan.status,
+            extra={"event": "scan.finalize_skipped", "scan_id": str(scan.id),
+                   "status": scan.status, "reason": "already_terminal"},
+        )
+        return
+    record_scan_result(scan.status, _duration)  # Phase 1.3: success/failed + duration; wires outcomes
     logger.info(
         "scan.finished scan=%s status=%s duration=%.2fs tools_run=%d",
         # tool_statuses is populated by BOTH branches (the agent path returns it,
         # the deterministic path appends to it), so it is the correct count here.
-        # `runners` is only bound in the deterministic branch -- referencing it on
-        # an agent-driven scan raised NameError after the row was already committed.
-        scan.id, scan.status, time.monotonic() - scan_started, len(tool_statuses),
+        scan.id, scan.status, _duration, len(tool_statuses),
+        extra={"event": "scan.finished", "scan_id": str(scan.id), "status": scan.status,
+               "duration_s": round(_duration, 2), "tools_run": len(tool_statuses)},
     )
     await _publish_scan_completed(db, scan)
 
@@ -400,6 +493,16 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
         exploitation -- that stays deterministic and gated in the outer round."""
         nonlocal step_no, ai_calls, stall
         while step_no < settings.agent_max_steps:
+            # Cooperative cancellation (Phase 1.5): break out of the reasoning loop as soon
+            # as the scan is cancelled, before spending another AI call or tool run. The
+            # outer atomic terminal write then leaves the 'cancelled' state intact.
+            if await _is_cancelled(db, scan.id):
+                logger.info(
+                    "scan.cancelled_stop scan=%s (agent loop, step=%d)", scan.id, step_no,
+                    extra={"event": "scan.cancelled_stop", "scan_id": str(scan.id),
+                           "reason": "cancelled", "step_no": step_no},
+                )
+                break
             # Deterministic budget stop (checked before spending an AI call). Recorded as
             # a finish decision so the termination reason is auditable in agent_decisions.
             budget_stop = _budget_stop_reason()
@@ -452,6 +555,7 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
                     available=available,
                 )
             ai_calls += 1
+            record_ai_decision(decision.action)  # Phase 1.3: agent decisions by action
             await persist_ai_usage(usage)
 
             if decision.action != "run_tool" or not decision.tool:
@@ -784,9 +888,14 @@ async def _run_single_tool(
         tool_run.completed_at = datetime.now(timezone.utc)
         tool_run.error_message = f"{type(exc).__name__}: {exc}"[:2000]
         await db.commit()
+        record_tool_failure(runner.name)  # Phase 1.3 metric
         logger.error(
             "tool.failed scan=%s tool=%s duration=%.2fs error=%s",
-            scan.id, runner.name, time.monotonic() - started, exc, exc_info=True,
+            scan.id, runner.name, time.monotonic() - started, exc,
+            extra={"event": "tool.failed", "scan_id": str(scan.id), "tool": runner.name,
+                   "status": "failed", "duration_s": round(time.monotonic() - started, 2),
+                   "reason": type(exc).__name__},
+            exc_info=True,
         )
         return [], "failed"
 
@@ -903,6 +1012,8 @@ async def _run_single_tool(
     tool_run.completed_at = datetime.now(timezone.utc)
     await db.commit()
 
+    if status == "failed":
+        record_tool_failure(runner.name)  # Phase 1.3: non-zero exit with no usable output
     logger.info(
         "tool.done scan=%s tool=%s status=%s exit=%s duration=%.2fs "
         "assets=%d vulnerabilities=%d evidence=%s",

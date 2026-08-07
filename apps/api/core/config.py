@@ -176,6 +176,44 @@ class Settings(BaseSettings):
     agent_max_ai_calls: int = 0                   # cap on decide() calls (0 = off)
     agent_stall_limit: int = 0                    # stop after N consecutive tool runs with no new evidence (0 = off)
     agent_max_rounds: int = 1                     # recon<->exploitation re-entry rounds (M4.4.4; 1 = current)
+    # Phase 1.2 -- orphan scan recovery. A scan stuck in 'running' past the timeout
+    # (worker crashed/lost after the atomic claim) is safely marked 'failed' by a
+    # periodic reaper. Timeout must exceed the longest legitimate scan to avoid false
+    # positives. The reaper never re-dispatches, so it cannot cause duplicate execution.
+    scan_orphan_recovery_enabled: bool = True         # master switch for the reaper
+    scan_orphan_timeout_seconds: int = 7200           # 2h; 'running' older than this is an orphan
+    scan_orphan_reaper_interval_seconds: int = 300    # reaper cadence (beat), default 5 min
+
+    # Phase 1.5 -- graceful shutdown & worker reliability. Celery task time limits BOUND
+    # a scan so a hung/very-long run can't block warm shutdown forever (which would force
+    # a SIGKILL -> orphaned 'running' scan). The SOFT limit fires first and raises
+    # SoftTimeLimitExceeded *inside* the task, so the orchestrator can mark the scan
+    # 'failed' cleanly (reclaimable via the atomic claim); the HARD limit is the
+    # last-resort force-kill and MUST be greater than the soft limit. Both stay BELOW the
+    # orphan timeout so a self-terminated scan never has to wait on the reaper -- the
+    # reaper remains the unchanged final fallback for a truly lost worker.
+    celery_task_soft_time_limit_seconds: int = 3600   # 1h; raises SoftTimeLimitExceeded in-task
+    celery_task_time_limit_seconds: int = 3900        # soft + 5min; hard SIGKILL backstop
+    # Recycle a worker child after this many tasks so long-lived scanner subprocesses
+    # (nmap/nuclei/katana) can't leak memory unbounded. 0 disables recycling.
+    celery_worker_max_tasks_per_child: int = 50
+
+    # Phase 1.6 -- backup & disaster recovery. Additive + OPT-IN: the scheduled backup
+    # task is OFF by default (backup_enabled) so it never runs unexpectedly in dev/CI.
+    # Every artifact is timestamped (never overwrites), checksummed, and verified.
+    # Retention prunes by age but ALWAYS keeps >= backup_min_keep newest sets and NEVER
+    # the newest -- a burst of failures can't erase the last good backup. Credentials come
+    # from the existing DATABASE_URL / S3_* settings and are never logged.
+    backup_enabled: bool = False                  # master switch for the scheduled backup
+    backup_directory: str = "/srv/backups"        # root dir holding timestamped backup sets
+    backup_interval_seconds: int = 86400          # scheduled cadence (beat), default daily
+    backup_retention_days: int = 7                # prune sets older than N days
+    backup_min_keep: int = 3                      # always keep >= this many newest sets
+    backup_include_objects: bool = True           # also back up object storage (evidence+reports)
+    backup_compression: bool = True               # gzip the object archive (db.dump is already -Fc compressed)
+    backup_verification_enabled: bool = True      # verify each set after creation / before restore
+    backup_pg_dump_cmd: str = "pg_dump"           # override to an absolute path / wrapper
+    backup_pg_restore_cmd: str = "pg_restore"     # override to an absolute path / wrapper
 
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
