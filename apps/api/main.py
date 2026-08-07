@@ -109,6 +109,12 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
 
+    # Phase 1.4: consistent error contract for every error path (additive; preserves
+    # the existing ``detail`` field, adds a stable error code + correlation id).
+    from apps.api.core.errors import register_exception_handlers
+
+    register_exception_handlers(app)
+
     for router in _ROUTERS:
         app.include_router(router, prefix=settings.api_v1_prefix)
 
