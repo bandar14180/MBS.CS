@@ -152,6 +152,13 @@ class Settings(BaseSettings):
     # is off (M4.6.1 / F2). Do NOT set this for convenience -- it turns off a security
     # control; document the incident/reason whenever it is used.
     scan_enforce_derived_scope_ack: bool = False
+    # M4.6.4 (F1): explicit deny-list of discovered hosts that must NOT be actively
+    # probed even when they fall within the target's name-based scope (e.g. a subdomain
+    # CNAME'd to third-party infra). An entry matches an exact host or a parent suffix
+    # (e.g. "cdn.example.com" excludes "assets.cdn.example.com" too). Empty by default
+    # -> the name-based authorization model is unchanged. NARROWING-ONLY: an exclude can
+    # never authorize a host the scope check would otherwise reject.
+    scan_derived_scope_excludes: list[str] = []
 
     # --- Autonomous red-team agent -----------------------------------------
     # Deployment-wide safety ceiling the per-engagement RoE can restrict but never

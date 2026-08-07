@@ -19,11 +19,23 @@ reuses net_guard's host parser / resolver. It can only NARROW what gets probed.
 """
 import ipaddress
 
+from apps.api.core.config import get_settings
 from apps.api.scanner_engine import net_guard
 
 
 def _norm(host: str | None) -> str:
     return (str(host).strip().lower().rstrip(".")) if host else ""
+
+
+def _host_excluded(host: str) -> bool:
+    """True if `host` is on the operator's explicit derived-scope exclude list
+    (M4.6.4 / F1): an exact host or a parent suffix. A pure deny-list that only
+    NARROWS -- it can never authorize a host the name/CIDR check would reject."""
+    for entry in get_settings().scan_derived_scope_excludes:
+        e = _norm(entry)
+        if e and (host == e or host.endswith("." + e)):
+            return True
+    return False
 
 
 def _target_domain(target_value: str) -> str:
@@ -59,6 +71,10 @@ def host_in_scope(target_type: str, target_value: str, host: str | None) -> bool
     FAIL CLOSED: an empty/undeterminable host is never in scope."""
     host = _norm(host)
     if not host:
+        return False
+    # M4.6.4 (F1): an explicit exclude always wins (narrowing-only) -- applies to every
+    # target type, before the name/CIDR authorization check.
+    if _host_excluded(host):
         return False
     if target_type == "domain":
         d = _target_domain(target_value)

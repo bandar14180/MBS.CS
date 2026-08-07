@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from apps.api.core.config import get_settings
 from apps.api.scanner_engine import net_guard, scope_guard
 from apps.api.scanner_engine.scope_guard import (
     extract_host,
@@ -67,6 +68,33 @@ def test_host_in_scope_ip_hostname_resolution(monkeypatch):
 
 def test_unknown_target_type_is_out_of_scope():
     assert host_in_scope("repo", "example.com", "example.com") is False
+
+
+# --- M4.6.4 / F1: explicit exclude deny-list (narrowing-only) ---
+
+def test_exclude_removes_in_domain_host_but_not_apex_or_others(monkeypatch):
+    monkeypatch.setattr(get_settings(), "scan_derived_scope_excludes", ["cdn.example.com"])
+    assert host_in_scope("domain", "example.com", "cdn.example.com") is False         # exact match excluded
+    assert host_in_scope("domain", "example.com", "assets.cdn.example.com") is False  # parent-suffix excluded
+    assert host_in_scope("domain", "example.com", "api.example.com") is True          # unrelated in-scope host kept
+    assert host_in_scope("domain", "example.com", "example.com") is True              # apex NOT excluded
+
+
+def test_exclude_applies_to_ip_range(monkeypatch):
+    monkeypatch.setattr(get_settings(), "scan_derived_scope_excludes", ["10.0.0.5"])
+    assert host_in_scope("ip_range", "10.0.0.0/24", "10.0.0.5") is False   # excluded
+    assert host_in_scope("ip_range", "10.0.0.0/24", "10.0.0.6") is True    # not excluded
+
+
+def test_exclude_is_narrowing_only_cannot_authorize(monkeypatch):
+    # An exclude entry can never bring an out-of-scope host INTO scope.
+    monkeypatch.setattr(get_settings(), "scan_derived_scope_excludes", ["evil.com"])
+    assert host_in_scope("domain", "example.com", "evil.com") is False     # still out (name check)
+
+
+def test_exclude_empty_default_preserves_name_based_scope(monkeypatch):
+    monkeypatch.setattr(get_settings(), "scan_derived_scope_excludes", [])
+    assert host_in_scope("domain", "example.com", "api.example.com") is True   # unchanged default
 
 
 # --- extract_host across asset types ---

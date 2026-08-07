@@ -136,3 +136,37 @@ def test_out_of_scope_discovery_is_recorded_as_observation(monkeypatch):
     # The returned findings carry the same tags (they flow into the graph downstream).
     tags = {f.value: f.metadata.get("in_scope") for f in findings}
     assert tags == {"api.example.com": True, "evil.attacker.com": False}
+
+
+def test_explicitly_excluded_subdomain_blocked_from_active_tool(monkeypatch):
+    """M4.6.4 (F1): a subdomain that is in the target's name-based scope but on the
+    operator's explicit exclude list is recorded but NEVER handed to an active tool."""
+    monkeypatch.setattr(get_settings(), "scan_derived_scope_excludes", ["cdn.example.com"])
+    captured: dict = {}
+
+    async def _capture_run(self, target_value, config, prior_findings):
+        captured["prior"] = [f.value for f in prior_findings]
+        return RawToolOutput(command="httpx (mock)", stdout="", stderr="", exit_code=0)
+
+    monkeypatch.setattr(HttpxRunner, "run", _capture_run)
+
+    prior = [
+        CommonFinding("subdomain", "cdn.example.com", {"source": "subfinder"}),   # in-domain but EXCLUDED
+        CommonFinding("subdomain", "api.example.com", {"source": "subfinder"}),   # in scope
+    ]
+
+    async def scenario():
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url, poolclass=StaticPool)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                _ws, scan, _proj, _tgt = await _seed_domain(s)
+                await _run_single_tool(s, scan, HttpxRunner(), DOMAIN, prior, "medium", "domain")
+                await s.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+    assert captured["prior"] == ["api.example.com"]     # excluded subdomain not probed
+    assert "cdn.example.com" not in captured["prior"]
