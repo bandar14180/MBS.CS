@@ -96,3 +96,32 @@ class AIPlanRead(BaseModel):
     model_version: str
     prompt_version: str
     created_at: datetime
+
+
+class ScanTimelineEvent(BaseModel):
+    """One chronological scan event (Phase 1.3): scan started, tool executed, finding
+    generated, agent decision, scan completed. No secrets -- statuses/tool names/titles
+    only (the operator's own data)."""
+
+    ts: datetime | None
+    event: str
+    tool: str | None = None
+    status: str | None = None
+    detail: str | None = None
+
+
+class AgentDecisionTraceRead(BaseModel):
+    """Read-only agent-decision trace (Phase 1.3). Exposes only curated, non-sensitive
+    fields -- prompts are NEVER stored in agent_decisions, and raw evidence/candidate
+    blobs are intentionally not surfaced here (reasoning summary only)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    step_no: int
+    phase: str
+    action: str                       # decision type: run_tool | finish
+    selected_tool: str | None = None
+    selected_confidence: float | None = None
+    rationale: str | None = None      # short reasoning summary (model output, bounded)
+    stop_reason: str | None = None
+    created_at: datetime

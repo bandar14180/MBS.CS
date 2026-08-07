@@ -10,9 +10,18 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.modules.agent.models import EngagementState
+from apps.api.core.pagination import Pagination, paginate
+from apps.api.modules.agent.models import AgentDecision, EngagementState
 
 
 async def get_engagement(db: AsyncSession, scan_id: uuid.UUID) -> EngagementState | None:
     """The engagement state for a scan (None for a non-agent scan). RLS-scoped."""
     return await db.scalar(select(EngagementState).where(EngagementState.scan_id == scan_id))
+
+
+async def list_agent_decisions(db: AsyncSession, scan_id: uuid.UUID, page: Pagination):
+    """Paginated structured agent-decision trace for a scan (Phase 1.3), ordered by
+    step_no. FORCE-RLS on agent_decisions scopes this to the request's workspace; the
+    caller additionally verifies scan ownership. Returns (rows, total)."""
+    query = select(AgentDecision).where(AgentDecision.scan_id == scan_id).order_by(AgentDecision.step_no)
+    return await paginate(db, query, page)

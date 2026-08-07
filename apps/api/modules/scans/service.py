@@ -170,6 +170,41 @@ async def list_tool_runs(
     return list(result)
 
 
+async def get_scan_timeline(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, scan_id: uuid.UUID, page: Pagination
+) -> tuple[list[dict], int]:
+    """Chronological scan event stream (Phase 1.3): scan started, tool executions,
+    findings, agent decisions/actions, scan completed. Ownership is enforced by
+    get_scan (404 out-of-scope); the underlying tool_runs / agent_steps /
+    vulnerabilities are FORCE-RLS, so the request's workspace GUC scopes them too.
+    Bounded per scan; paginated in memory over the merged, time-ordered events."""
+    from apps.api.modules.agent.models import AgentStep
+    from apps.api.modules.vulnerabilities.models import Vulnerability
+
+    scan = await get_scan(db, workspace_id, project_id, scan_id)
+    events: list[dict] = []
+    if scan.started_at:
+        events.append({"ts": scan.started_at, "event": "scan.started", "tool": None, "status": "running", "detail": None})
+    for tr in await db.scalars(select(ToolRun).where(ToolRun.scan_id == scan_id)):
+        events.append({"ts": tr.started_at, "event": "tool.executed", "tool": tr.tool_name,
+                       "status": tr.status, "detail": (tr.error_message or None) and tr.error_message[:300]})
+    for st in await db.scalars(select(AgentStep).where(AgentStep.scan_id == scan_id)):
+        events.append({"ts": st.created_at, "event": f"agent.{st.action_type}", "tool": st.tool_or_module,
+                       "status": st.status, "detail": (st.result_summary or None) and st.result_summary[:300]})
+    for v in await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan_id)):
+        events.append({"ts": v.created_at, "event": "finding.generated", "tool": None,
+                       "status": v.severity, "detail": (v.title or "")[:300]})
+    if scan.completed_at:
+        events.append({"ts": scan.completed_at, "event": "scan.completed", "tool": None,
+                       "status": scan.status, "detail": None})
+
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    events.sort(key=lambda e: e["ts"] or _epoch)
+    total = len(events)
+    window = events[page.offset: page.offset + page.limit]
+    return window, total
+
+
 async def list_evidence(
     db: AsyncSession,
     workspace_id: uuid.UUID,
