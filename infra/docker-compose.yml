@@ -59,6 +59,9 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+    # Graceful shutdown (Phase 1.5): on `docker stop`, uvicorn (PID 1, exec form) gets
+    # SIGTERM and drains in-flight HTTP requests before exit. 30s is ample for API calls.
+    stop_grace_period: 30s
     # Migrations live in ../db and are applied via `docker compose exec api ...`;
     # keep this mount in both dev and prod. The application CODE is baked into the
     # image (prod) and bind-mounted only in the dev override.
@@ -76,6 +79,12 @@ services:
     command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "scans,default", "--loglevel=info"]
     env_file:
       - ../.env
+    # Graceful shutdown (Phase 1.5): celery is PID 1 (exec form) and gets SIGTERM =
+    # WARM shutdown -- it stops prefetching and finishes the in-flight scan. This window
+    # lets a running scan tool wrap up cleanly; scans that outlast it are bounded by the
+    # Celery soft/hard time limits and, in the worst case (worker SIGKILLed), recovered by
+    # the orphan reaper. Raise if your typical scan needs longer to drain on deploy.
+    stop_grace_period: 120s
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,6 +101,9 @@ services:
     command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "beat", "--loglevel=info"]
     env_file:
       - ../.env
+    # Beat is a stateless emitter (PID 1, exec form); SIGTERM stops it cleanly and any
+    # missed tick is re-emitted next interval. A short grace is plenty (Phase 1.5).
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
