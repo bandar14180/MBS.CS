@@ -25,7 +25,8 @@ def _patch_delay(monkeypatch):
     from apps.api.celery_app.tasks import scan_tasks
 
     calls: list[str] = []
-    monkeypatch.setattr(scan_tasks.run_scan_task, "delay", lambda sid: (calls.append(sid), _FakeResult())[1])
+    monkeypatch.setattr(scan_tasks.run_scan_task, "delay",
+                        lambda sid, **kw: (calls.append(sid), _FakeResult())[1])
     return calls
 
 

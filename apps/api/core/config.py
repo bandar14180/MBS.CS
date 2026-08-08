@@ -193,6 +193,14 @@ class Settings(BaseSettings):
     scan_queued_relay_enabled: bool = True
     scan_queued_relay_seconds: int = 300              # 5 min; 'queued' + no task id older than this
 
+    # Phase 4.1 -- worker observability. The Celery worker runs scans (record_scan_result,
+    # tool/AI/reaper/relay metrics), but /metrics is served by the API process only. This
+    # starts a best-effort Prometheus endpoint IN the worker so those metrics are scrapable.
+    # Best-effort: a bind failure never aborts worker startup. When PROMETHEUS_MULTIPROC_DIR
+    # is set on the worker container, the endpoint aggregates all prefork children.
+    worker_metrics_enabled: bool = True
+    worker_metrics_port: int = 9100
+
     # Phase 1.5 -- graceful shutdown & worker reliability. Celery task time limits BOUND
     # a scan so a hung/very-long run can't block warm shutdown forever (which would force
     # a SIGKILL -> orphaned 'running' scan). The SOFT limit fires first and raises

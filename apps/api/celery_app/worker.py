@@ -79,3 +79,16 @@ if settings.backup_enabled:
     }
 
 celery_app.conf.timezone = "UTC"
+
+
+# Phase 4.1: start the worker's Prometheus metrics endpoint once the worker is up. Registered
+# unconditionally (the handler no-ops in the API process -- the signal only fires in a worker)
+# and is fully best-effort, so it can never block worker startup.
+from celery.signals import worker_ready  # noqa: E402
+
+
+@worker_ready.connect
+def _start_worker_metrics(**_kwargs) -> None:
+    from apps.api.celery_app.metrics import start_worker_metrics_server
+
+    start_worker_metrics_server()

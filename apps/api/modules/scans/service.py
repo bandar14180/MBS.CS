@@ -104,8 +104,12 @@ async def create_scan(
     # this keeps the API process from needing a live Celery/Redis connection
     # just to import the scans module.
     from apps.api.celery_app.tasks.scan_tasks import run_scan_task
+    from apps.api.core.observability import get_correlation_id
 
-    async_result = run_scan_task.delay(str(scan.id))
+    # Propagate the request correlation id (Phase 4.1) so the worker's scan logs can be
+    # joined to the API request that created the scan. For a scheduled dispatch (worker/beat
+    # context, no request) this is the ambient "-", which the task replaces with a fresh id.
+    async_result = run_scan_task.delay(str(scan.id), correlation_id=get_correlation_id())
     scan.celery_task_id = async_result.id
 
     from apps.api.modules.audit import service as audit

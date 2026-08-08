@@ -124,14 +124,22 @@ def _record_dlq(scan_id: str, exc: Exception, *, task_id: str | None = None, ret
     retry_jitter=True,
     max_retries=3,
 )
-def run_scan_task(self, scan_id: str) -> str:
+def run_scan_task(self, scan_id: str, correlation_id: str | None = None) -> str:
     """Execute a scan. Retries with exponential backoff on failure (transient DB /
     storage / network issues recover); after retries are exhausted the task is
     dead-lettered for inspection. The scan itself is idempotent -- the orchestrator
     skips a scan that already reached a terminal state -- so acks_late redelivery
-    after a worker crash is safe."""
+    after a worker crash is safe.
+
+    correlation_id (Phase 4.1): the originating API request's id, propagated so worker/scan
+    logs can be joined to the request that created the scan. Optional/back-compatible -- a
+    missing id (relay/redelivery/older callers) gets a freshly generated one so worker logs
+    remain correlatable within this execution."""
     import time as _time
 
+    from apps.api.core.observability import new_correlation_id, set_correlation_id
+
+    set_correlation_id(correlation_id or new_correlation_id())
     _started = _time.monotonic()
     try:
         asyncio.run(_run(scan_id))
@@ -230,6 +238,9 @@ async def _relay_queued() -> int:
                 relayed += 1
 
         if relayed:
+            from apps.api.core.observability import record_scan_relayed
+
+            record_scan_relayed(relayed)
             logging.getLogger("mbs.scan").warning(
                 "scan.relay redispatched %d undelivered queued scan(s) older than %ds",
                 relayed, settings.scan_queued_relay_seconds,

@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.observability import record_schedule_launched
 from apps.api.modules.projects.service import get_target
 from apps.api.modules.schedules.models import ScanSchedule
 
@@ -180,6 +181,7 @@ async def run_due_schedules(db: AsyncSession, now: datetime | None = None) -> in
             )
             await db.commit()
             launched += 1
+            record_schedule_launched("launched")
             logger.info("schedule.fired schedule=%s -> scan=%s", sched.id, scan.id)
         except Exception as exc:  # quota/scope/dispatch/etc. -- record, keep going (last_error preserved)
             await db.rollback()  # discard any partial create_scan session state
@@ -188,6 +190,7 @@ async def run_due_schedules(db: AsyncSession, now: datetime | None = None) -> in
                 {"err": f"{type(exc).__name__}: {exc}"[:1000], "id": sched.id},
             )
             await db.commit()
+            record_schedule_launched("failed")
             logger.warning("schedule.skipped schedule=%s error=%s", sched.id, exc)
 
     return launched

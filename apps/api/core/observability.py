@@ -59,6 +59,13 @@ if _PROM:
     # Phase 1.4: API error responses by stable error type (low-cardinality; never a
     # path/scan_id/message).
     API_ERRORS = Counter("mbs_api_errors_total", "API error responses", ["type"])
+    # Phase 4.1: reliability-path counters. Low-cardinality labels only.
+    SCHEDULE_LAUNCHED = Counter(
+        "mbs_schedule_launched_total", "Scheduled scans dispatched by the beat scheduler", ["result"]
+    )
+    SCAN_RELAYED = Counter(
+        "mbs_scan_relayed_total", "Undelivered 'queued' scans re-dispatched by the queued relay"
+    )
 
 
 def record_http_metrics(method: str, path: str, status: int, duration_s: float) -> None:
@@ -119,6 +126,19 @@ def record_api_error(error_type: str) -> None:
     Low-cardinality by construction -- never a path/scan_id/message."""
     if _PROM:
         API_ERRORS.labels(error_type).inc()
+
+
+def record_schedule_launched(result: str) -> None:
+    """Phase 4.1: count a scheduled-scan dispatch outcome (result: launched | failed).
+    Low-cardinality label; recorded in the worker/beat process."""
+    if _PROM:
+        SCHEDULE_LAUNCHED.labels(result).inc()
+
+
+def record_scan_relayed(count: int) -> None:
+    """Phase 4.1: count undelivered 'queued' scans the relay re-dispatched (worker process)."""
+    if _PROM and count:
+        SCAN_RELAYED.inc(count)
 
 
 def metrics_response_body() -> bytes:
