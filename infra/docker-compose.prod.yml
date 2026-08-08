@@ -37,6 +37,29 @@ services:
       - openrouter_api_key
       - s3_secret_key
 
+  # Production monitoring (Phase 4.2). Scrapes api:8000/metrics (x-metrics-token read from the
+  # mounted metrics_token secret) and worker:9100 over the internal compose network. Config in
+  # ./prometheus/. Published to LOCALHOST ONLY -- never exposed publicly.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    secrets:
+      - metrics_token
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - api
+
+volumes:
+  prometheus_data:
+
 secrets:
   jwt_secret_key:
     file: ./secrets/jwt_secret_key.txt
