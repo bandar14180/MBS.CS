@@ -136,7 +136,7 @@ jobs:
       - name: Build api image
         run: docker build -f infra/docker/Dockerfile.api -t mbs-api:ci .
       - name: Trivy scan (gate on CRITICAL, fixed only)
-        uses: aquasecurity/trivy-action@v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: mbs-api:ci
           format: table
@@ -146,7 +146,7 @@ jobs:
           exit-code: "1"          # fail the job on a CRITICAL, fixed vuln
       - name: Trivy report (HIGH+CRITICAL, informational)
         if: ${{ always() }}
-        uses: aquasecurity/trivy-action@v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: mbs-api:ci
           format: json
@@ -172,7 +172,7 @@ jobs:
       - name: Build worker image
         run: docker build -f infra/docker/Dockerfile.worker -t mbs-worker:ci .
       - name: Trivy scan (worker, report only)
-        uses: aquasecurity/trivy-action@v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: mbs-worker:ci
           format: table

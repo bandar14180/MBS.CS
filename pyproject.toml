@@ -15,6 +15,11 @@ addopts = "-q"
 # Measure the application package only; the branch flag makes the gate meaningful.
 source = ["apps/api"]
 branch = true
+# The Starlette TestClient runs the ASGI app in a portal WORKER THREAD, and SQLAlchemy's
+# async engine bridges via GREENLETs. Without declaring these concurrency models, coverage
+# (py3.12 default core) does not trace those contexts, undercounting async endpoint/service
+# code. Declaring them measures the app's real execution accurately.
+concurrency = ["thread", "greenlet"]
 omit = [
     "apps/api/tests/*",          # don't count the tests themselves
     "apps/api/dr/__main__.py",   # thin CLI shim (argv dispatch)
