@@ -15,6 +15,9 @@ celery_app = Celery(
         "apps.api.celery_app.tasks.scan_tasks",
         "apps.api.celery_app.tasks.schedule_tasks",
         "apps.api.celery_app.tasks.backup_tasks",
+        # Phase 5.2: registered so the worker knows the task. NOT beat-scheduled -- it runs
+        # only when invoked manually, and is double-gated OFF (retention_enabled + dry_run).
+        "apps.api.celery_app.tasks.retention_tasks",
     ],
 )
 celery_app.conf.broker_connection_retry_on_startup = True

@@ -232,6 +232,25 @@ class Settings(BaseSettings):
     backup_pg_dump_cmd: str = "pg_dump"           # override to an absolute path / wrapper
     backup_pg_restore_cmd: str = "pg_restore"     # override to an absolute path / wrapper
 
+    # Phase 5.2 -- retention purge FOUNDATION. Additive + DOUBLE-GATED OFF: nothing is ever
+    # deleted unless retention_enabled is flipped true AND retention_dry_run is set false.
+    # Ships enabled=False + dry_run=True so any manual/scheduled run only ever PLANS (logs +
+    # meters what it *would* delete) and touches no data. batch_size/min_keep bound the blast
+    # radius the same way backup retention does. Windows are in DAYS (a scan is measured from
+    # completion, evidence from its scan, the rest from created_at). The actual eligibility
+    # query + deletion is Phase 5.3 -- this block only configures the foundation.
+    retention_enabled: bool = False               # master switch; False -> purge is a no-op
+    retention_dry_run: bool = True                # True -> plan only, never delete (belt + suspenders)
+    retention_batch_size: int = 500               # max rows/objects touched per resource per run
+    retention_min_keep: int = 10                  # always keep >= this many newest per resource
+    retention_evidence_days: int = 90             # raw scan evidence objects + rows
+    retention_scan_days: int = 180                # scan records + non-finding subtree
+    retention_ai_usage_days: int = 180            # AI cost/usage log
+    retention_report_days: int = 365              # generated reports (rows + PDFs)
+    retention_refresh_token_grace_days: int = 7   # expired refresh tokens, N days past expiry
+    retention_notification_days: int = 90         # in-app notifications
+    retention_audit_days: int = 730               # audit events (long compliance window)
+
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
     # check (dev only). Set explicit hostnames in production.
