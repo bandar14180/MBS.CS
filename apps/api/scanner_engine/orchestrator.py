@@ -74,14 +74,32 @@ async def reap_orphaned_scans(db: AsyncSession, timeout_seconds: int) -> int:
     create a duplicate execution. If a marked scan is later retried, the atomic claim
     (queued/failed only) still guarantees at-most-one executor. If the 'crashed' worker
     was merely slow and still alive, it simply overwrites this 'failed' with its true
-    terminal status on completion -- again, only ONE execution ever ran."""
+    terminal status on completion -- again, only ONE execution ever ran.
+
+    A clear failure reason is persisted into config.recovery (reason/recovered_at/
+    running_timeout_seconds) in the SAME atomic statement -- additive JSONB, no schema or
+    API change (ScanRead already exposes config), so the orphaned outcome is queryable and
+    visible without altering the lifecycle."""
+    reason = (
+        f"orphaned: scan remained RUNNING beyond the {int(timeout_seconds)}s recovery "
+        f"threshold with no worker completion; worker/process presumed dead"
+    )
+    # Explicit ::text/::int casts are REQUIRED: params used only inside jsonb_build_object
+    # (which accepts "any") have no inferable type for asyncpg. A distinct :timeout_val
+    # (vs :secs for make_interval) avoids one param serving two type contexts.
     result = await db.execute(
         text(
-            "UPDATE scans SET status = 'failed', completed_at = now() "
+            "UPDATE scans SET status = 'failed', completed_at = now(), "
+            "config = coalesce(config, '{}'::jsonb) || jsonb_build_object("
+            "  'recovery', jsonb_build_object("
+            "    'reason', :reason ::text, 'recovered_at', now(), "
+            "    'running_timeout_seconds', :timeout_val ::int"
+            "  )"
+            ") "
             "WHERE status = 'running' AND started_at < now() - make_interval(secs => :secs) "
             "RETURNING id"
         ),
-        {"secs": int(timeout_seconds)},
+        {"reason": reason, "timeout_val": int(timeout_seconds), "secs": int(timeout_seconds)},
     )
     reaped = len(result.fetchall())
     await db.commit()

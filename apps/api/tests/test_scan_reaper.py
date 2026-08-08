@@ -17,7 +17,7 @@ from apps.api.modules.projects.models import Project, Target
 from apps.api.modules.scans.models import Scan
 from apps.api.modules.users.models import User
 from apps.api.modules.workspaces.models import Workspace
-from apps.api.scanner_engine.orchestrator import _claim_scan, reap_orphaned_scans
+from apps.api.scanner_engine.orchestrator import _claim_scan, _finalize_status, reap_orphaned_scans
 
 TIMEOUT = 7200  # 2h
 OLD = datetime.now(timezone.utc) - timedelta(hours=3)      # past the timeout -> orphan
@@ -54,6 +54,10 @@ async def _status(session, scan_id):
     return await session.scalar(select(Scan.status).where(Scan.id == scan_id))
 
 
+async def _config(session, scan_id):
+    return await session.scalar(select(Scan.config).where(Scan.id == scan_id))
+
+
 # --- 1 & 2: old running recovered; recent running untouched (deterministic together) ---
 
 def test_reaper_recovers_old_and_spares_recent():
@@ -78,7 +82,7 @@ def test_reaper_recovers_old_and_spares_recent():
     assert recent == "running"               # (2) recent running left alone
 
 
-# --- 3: completed / failed / cancelled scans are never touched ---
+# --- 3 & 4: completed / FAILED / cancelled scans are never touched ---
 
 def test_reaper_ignores_terminal_scans():
     async def scenario():
@@ -87,7 +91,8 @@ def test_reaper_ignores_terminal_scans():
         try:
             async with maker() as s:
                 ids = {}
-                for st in ("completed", "cancelled", "completed_with_errors"):
+                # includes 'failed' (scenario 4): an already-failed scan stays failed.
+                for st in ("completed", "failed", "cancelled", "completed_with_errors"):
                     _w, sid = await _seed_scan(s, st, OLD)  # OLD but not 'running'
                     ids[st] = sid
                 await reap_orphaned_scans(s, TIMEOUT)
@@ -97,7 +102,80 @@ def test_reaper_ignores_terminal_scans():
             await engine.dispose()
 
     out = asyncio.run(scenario())
-    assert out == {"completed": "completed", "cancelled": "cancelled", "completed_with_errors": "completed_with_errors"}
+    assert out == {
+        "completed": "completed", "failed": "failed",
+        "cancelled": "cancelled", "completed_with_errors": "completed_with_errors",
+    }
+
+
+# --- 7: the orphaned scan gets a clear, persisted failure reason ---
+
+def test_reaper_persists_failure_reason():
+    async def scenario():
+        engine = _engine()
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                _w, sid = await _seed_scan(s, "running", OLD)
+                await reap_orphaned_scans(s, TIMEOUT)
+                return await _status(s, sid), await _config(s, sid)
+        finally:
+            await engine.dispose()
+
+    status, config = asyncio.run(scenario())
+    assert status == "failed"
+    recovery = (config or {}).get("recovery")
+    assert recovery, "failure reason (config.recovery) was not persisted"
+    assert "orphaned" in recovery["reason"].lower()
+    assert recovery["running_timeout_seconds"] == TIMEOUT
+    assert recovery.get("recovered_at")
+
+
+# --- 5: running the reaper twice is safe (idempotent) for a given scan ---
+
+def test_reaper_is_idempotent_across_runs():
+    async def scenario():
+        engine = _engine()
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                _w, sid = await _seed_scan(s, "running", OLD)
+                first = await reap_orphaned_scans(s, TIMEOUT)          # recovers our orphan
+                status1, config1 = await _status(s, sid), await _config(s, sid)
+                await reap_orphaned_scans(s, TIMEOUT)                  # our scan no longer 'running'
+                status2, config2 = await _status(s, sid), await _config(s, sid)
+            return first, status1, status2, config1, config2
+        finally:
+            await engine.dispose()
+
+    first, status1, status2, config1, config2 = asyncio.run(scenario())
+    assert first >= 1
+    assert status1 == status2 == "failed"                 # 2nd run does not re-touch it
+    assert config1["recovery"] == config2["recovery"]     # reason not rewritten/corrupted
+
+
+# --- 6: a scan that completes first (race) is NOT overwritten by the reaper ---
+
+def test_reaper_does_not_overwrite_a_completing_scan():
+    async def scenario():
+        engine = _engine()
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                _w, sid = await _seed_scan(s, "running", OLD)   # old enough to be a reap candidate
+                scan = await s.get(Scan, sid)
+                # the worker finishes FIRST: running -> completed (atomic conditional write)
+                won = await _finalize_status(s, scan, "completed")
+                # the reaper then runs -- it must NOT clobber the just-completed scan
+                await reap_orphaned_scans(s, TIMEOUT)
+                return won, await _status(s, sid), await _config(s, sid)
+        finally:
+            await engine.dispose()
+
+    won, status, config = asyncio.run(scenario())
+    assert won is True
+    assert status == "completed"                    # reaper left the completed scan alone
+    assert "recovery" not in (config or {})         # no orphan reason falsely attached
 
 
 # --- 4: a recovered scan cannot be double-executed ---
