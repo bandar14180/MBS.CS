@@ -1,0 +1,5 @@
+# Phase 1.8 -- supply-chain / security CI tooling (NOT runtime deps; runtime lives in
+# requirements.txt and is intentionally untouched). Pinned for reproducible CI. Trivy and
+# gitleaks are provided by their GitHub Actions, not pip.
+pip-audit==2.7.3
+cyclonedx-bom==4.6.1

@@ -1,0 +1,48 @@
+# Phase 1.8 -- gitleaks secret-scanning config for the CI secret-scan job.
+#
+# Extends the bundled ruleset and adds a project allowlist for KNOWN NON-SECRETS: local
+# dev defaults (minioadmin, the mbs/mbs dev DB creds), placeholder values, and test
+# fixtures. Real credentials live in .env (gitignored, never checked out in CI) or in
+# Docker/Vault secrets, so they are never in the scanned tree. Keep this allowlist tight
+# and justified -- do NOT add broad patterns that could mask a real leak.
+
+title = "MBS.SC gitleaks config"
+
+[extend]
+# Start from gitleaks' built-in rules, then layer the allowlist below.
+useDefault = true
+
+[allowlist]
+description = "Dev defaults, placeholders, and test fixtures -- not real secrets."
+
+# Paths that never contain committed production secrets.
+paths = [
+  '''\.env$''',
+  '''\.env\..*''',
+  '''node_modules/''',
+  '''\.venv/''',
+  '''venv/''',
+  '''apps/web/\.next/''',
+  '''htmlcov/''',
+  '''infra/secrets/''',            # example secret files referenced by docker-compose.prod.yml
+]
+
+# Values that are intentionally in the repo and are NOT secrets.
+regexes = [
+  '''minioadmin''',                                  # local MinIO dev default (docker-compose.yml)
+  '''mbs:mbs@''',                                    # local Postgres dev creds in DATABASE_URL
+  '''change-me-in-\.env''',                          # JWT placeholder (core/config.py)
+  '''change-me-generate-a-real-secret''',            # JWT placeholder (core/config.py)
+  '''correct horse battery staple''',                # test-user password fixture
+  '''sk-test-dummy''',                               # dummy AI key used in tests
+]
+
+# If a candidate secret contains one of these tokens, treat it as a non-secret.
+stopwords = [
+  "example",
+  "placeholder",
+  "dummy",
+  "changeme",
+  "change-me",
+  "minioadmin",
+]

@@ -1,0 +1,12 @@
+# Phase 1.8 -- pip-audit accepted-advisory allowlist.
+#
+# One advisory ID per line (PYSEC-XXXX-XX or GHSA-xxxx-xxxx-xxxx). CI passes each as
+# `--ignore-vuln <ID>`, so a NEW advisory still fails the gate while a triaged/accepted one
+# does not wedge every PR. Blank lines and `#` comments are ignored.
+#
+# Every entry MUST be justified here (advisory, why accepted, review-by date) so the
+# allowlist stays auditable and is periodically re-evaluated:
+#
+#   GHSA-xxxx-xxxx-xxxx  # <package> <=<ver>: <why accepted, e.g. not reachable / no fix yet>. review-by YYYY-MM-DD
+#
+# (empty = no accepted advisories; the gate is fully enforced)

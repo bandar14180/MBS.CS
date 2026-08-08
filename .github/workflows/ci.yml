@@ -62,20 +62,136 @@ jobs:
             htmlcov/
           if-no-files-found: warn
 
-  # Dependency vulnerability audit. Non-blocking for now (a single transitive
-  # advisory should surface, not wedge every PR); triage findings and pin/upgrade.
-  deps-audit:
+  # Supply-chain security (Phase 1.8): GATED dependency vulnerability audit + SBOM.
+  # Blocking, but an auditable allowlist (.security/pip-audit-ignore.txt) keeps a
+  # triaged/accepted advisory from wedging every PR while a NEW advisory still fails.
+  supply-chain:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install pip-audit
-        run: pip install pip-audit
-      - name: Audit dependencies
-        run: pip-audit -r apps/api/requirements.txt --strict --desc
+      - name: Install security tooling
+        run: pip install --no-cache-dir -r apps/api/requirements-dev.txt
+      - name: Dependency vulnerability audit (gated, with allowlist)
+        # Build --ignore-vuln args from the allowlist file (skip blanks/comments), then
+        # audit the runtime requirements. Non-zero exit fails the job.
+        run: |
+          ignore_args=""
+          while IFS= read -r line; do
+            id="${line%%#*}"; id="$(echo "$id" | tr -d '[:space:]')"
+            [ -n "$id" ] && ignore_args="$ignore_args --ignore-vuln $id"
+          done < .security/pip-audit-ignore.txt
+          echo "pip-audit ignore args:${ignore_args:- (none)}"
+          pip-audit -r apps/api/requirements.txt --strict --desc $ignore_args
+      - name: Dependency audit report (JSON artifact)
+        if: ${{ always() }}   # keep the report even when the gate fails, for triage
+        run: pip-audit -r apps/api/requirements.txt --format json -o pip-audit-report.json || true
+      - name: Generate SBOM (CycloneDX JSON)
+        # `--of JSON` is REQUIRED: without it the CLI can emit XML into a .json file.
+        # Verified against the pinned cyclonedx-bom 4.6.1 (`--of {JSON,XML}`). Invoked via
+        # `python -m` so it never depends on a console-script being on PATH.
+        run: python -m cyclonedx_py requirements apps/api/requirements.txt --of JSON -o sbom.cdx.json
+      - name: Upload supply-chain artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain
+          path: |
+            pip-audit-report.json
+            sbom.cdx.json
+          if-no-files-found: warn
+
+  # Container image vulnerability scan (Phase 1.8). GATES on CRITICAL + fixed only
+  # (--ignore-unfixed) for the small api image, honoring .trivyignore -- practical, so a
+  # non-actionable/low-confidence CVE never wedges CI. A full HIGH/CRITICAL report is
+  # uploaded for visibility, and the heavy worker image is scanned informationally only.
+  image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build api image
+        run: docker build -f infra/docker/Dockerfile.api -t mbs-api:ci .
+      - name: Trivy scan (gate on CRITICAL, fixed only)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: mbs-api:ci
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: "1"          # fail the job on a CRITICAL, fixed vuln
+      - name: Trivy report (HIGH+CRITICAL, informational)
+        if: ${{ always() }}
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: mbs-api:ci
+          format: json
+          output: trivy-api-report.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"          # report only -- HIGH does not block at this stage
+      - name: Upload image-scan report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-scan
+          path: trivy-api-report.json
+          if-no-files-found: warn
+
+  # Worker image scan -- INFORMATIONAL only (large/slow build, already flaky like
+  # scan-doctor); reports HIGH/CRITICAL but never blocks CI.
+  image-scan-worker:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build worker image
+        run: docker build -f infra/docker/Dockerfile.worker -t mbs-worker:ci .
+      - name: Trivy scan (worker, report only)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: mbs-worker:ci
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: "0"
+
+  # Secret scanning (Phase 1.8): a pinned gitleaks CLI does a deterministic FILESYSTEM
+  # scan (--no-git) of the checked-out tree with the project allowlist (.gitleaks.toml) --
+  # identical semantics to scripts/supply_chain.sh. Uses the CLI (not gitleaks-action) so
+  # there is NO org-license dependency. Gates on real leaks (--exit-code 1).
+  secret-scan:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.18.4"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks (pinned CLI)
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tgz
+          tar -xzf gitleaks.tgz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Secret scan (filesystem, --no-git, gated)
+        run: >-
+          gitleaks detect
+          --source .
+          --no-git
+          --config .gitleaks.toml
+          --redact
+          --report-format json
+          --report-path gitleaks-report.json
+          --exit-code 1
+      - name: Upload gitleaks report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: secret-scan
+          path: gitleaks-report.json
+          if-no-files-found: warn
 
   # Scan Doctor: verify the real tool binaries run. Needs network + the worker
   # image, so it's a separate job and non-blocking (network can be flaky in CI).
