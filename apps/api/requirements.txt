@@ -1,4 +1,8 @@
-fastapi==0.115.0
+fastapi==0.141.1
+# Starlette pinned explicitly to a security-fixed release (transitive via FastAPI).
+# 0.38.6 carried PYSEC-2026-1941/2280/2281 (fixed in 0.47.2 / 1.1.0); FastAPI 0.141.1
+# requires starlette>=0.46.0, so 1.4.x is the compatible, fully-patched line.
+starlette==1.4.1
 uvicorn[standard]==0.30.6
 pydantic-settings==2.5.2
 email-validator==2.2.0
