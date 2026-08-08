@@ -15,7 +15,7 @@ from apps.api.core.middleware import (
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
 )
-from apps.api.core.observability import CONTENT_TYPE_LATEST, metrics_response_body
+from apps.api.core.observability import CONTENT_TYPE_LATEST, get_correlation_id, metrics_response_body
 from apps.api.modules.api_keys.router import router as api_keys_router
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.assistant.router import ai_router as ai_status_router
@@ -134,9 +134,17 @@ def create_app() -> FastAPI:
             async with engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
             checks["database"] = "ok"
-        except Exception as exc:  # noqa: BLE001
-            checks["database"] = f"error: {exc}"[:200]
+        except Exception:  # noqa: BLE001
+            # Generic status to the client -- never leak raw driver/topology error text on
+            # this unauthenticated probe. Full exception + correlation context to the logs.
+            checks["database"] = "error"
             ok = False
+            logger.warning(
+                "ready.check_failed component=database",
+                extra={"event": "ready.check_failed", "component": "database",
+                       "correlation_id": get_correlation_id()},
+                exc_info=True,
+            )
         try:
             import redis.asyncio as aioredis
 
@@ -144,9 +152,15 @@ def create_app() -> FastAPI:
             await client.ping()
             await client.aclose()
             checks["redis"] = "ok"
-        except Exception as exc:  # noqa: BLE001
-            checks["redis"] = f"error: {exc}"[:200]
+        except Exception:  # noqa: BLE001
+            checks["redis"] = "error"
             ok = False
+            logger.warning(
+                "ready.check_failed component=redis",
+                extra={"event": "ready.check_failed", "component": "redis",
+                       "correlation_id": get_correlation_id()},
+                exc_info=True,
+            )
         return JSONResponse({"status": "ready" if ok else "not_ready", "checks": checks},
                             status_code=200 if ok else 503)
 

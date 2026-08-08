@@ -125,8 +125,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 results = await pipe.execute()
             count = results[2]
             if count > limit:
+                # Same unified error envelope as the exception handlers ({detail, error,
+                # correlation_id}); correlation_id comes from ObservabilityMiddleware, which
+                # wraps this middleware so the id is already bound. Retry-After preserved.
+                from apps.api.core.errors import build_error_envelope
+
                 return JSONResponse(
-                    {"detail": "Rate limit exceeded. Try again later."},
+                    build_error_envelope("Rate limit exceeded. Try again later.", "rate_limited"),
                     status_code=429,
                     headers={"Retry-After": str(window)},
                 )

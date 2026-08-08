@@ -50,6 +50,14 @@ def _envelope(detail, error_type: str) -> dict:
     return {"detail": detail, "error": error_type, "correlation_id": get_correlation_id()}
 
 
+def build_error_envelope(detail, error_type: str) -> dict:
+    """Public builder for the standard error envelope, so error paths that do NOT flow
+    through the exception handlers (e.g. the rate-limit middleware short-circuit, which runs
+    before routing) can emit the identical {detail, error, correlation_id} shape without
+    duplicating the contract."""
+    return _envelope(detail, error_type)
+
+
 def _respond(status_code: int, detail, error_type: str, headers=None) -> JSONResponse:
     resp = JSONResponse(_envelope(detail, error_type), status_code=status_code, headers=headers)
     # Guarantee the correlation id is present on error responses even when the

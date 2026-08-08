@@ -164,3 +164,91 @@ def test_existing_error_responses_stay_backward_compatible(client):
     # 401 -> string detail
     r = client.get(f"/api/v1/workspaces/{uuid.uuid4()}/projects/{uuid.uuid4()}/scans")
     assert r.status_code == 401 and isinstance(r.json()["detail"], str)
+
+
+# --- Phase 3 gap closure -----------------------------------------------------------------
+
+def test_build_error_envelope_shape():
+    from apps.api.core.errors import build_error_envelope
+    from apps.api.core.observability import set_correlation_id
+
+    set_correlation_id("env-abc")
+    env = build_error_envelope("boom", "rate_limited")
+    assert env == {"detail": "boom", "error": "rate_limited", "correlation_id": "env-abc"}
+
+
+def test_ready_does_not_leak_internal_exception_strings(client, monkeypatch):
+    """A DB failure on /ready must return a GENERIC status -- never the raw driver/topology
+    exception text (this probe is unauthenticated)."""
+    secret = "db-internal-host:5432 password=SUPERSECRET"
+
+    class _BoomEngine:
+        def connect(self):
+            raise RuntimeError(f"connection to {secret} failed")
+
+    monkeypatch.setattr("apps.api.core.db.engine", _BoomEngine())
+    r = client.get("/ready")
+
+    assert r.status_code == 503                       # DB down -> not ready
+    assert r.json()["checks"]["database"] == "error"  # generic, not the exception text
+    assert "SUPERSECRET" not in r.text and "db-internal-host" not in r.text
+
+
+def test_rate_limit_429_uses_error_envelope():
+    """RateLimitMiddleware's 429 short-circuit emits the SAME envelope (error + correlation_id)
+    and preserves Retry-After, even though it runs before the exception handlers."""
+    import json
+
+    from starlette.requests import Request
+
+    from apps.api.core.middleware import RateLimitMiddleware
+    from apps.api.core.observability import set_correlation_id
+
+    set_correlation_id("rl-corr-123")
+
+    class _FakePipe:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def zremrangebyscore(self, *a, **k):
+            return self
+
+        def zadd(self, *a, **k):
+            return self
+
+        def zcard(self, *a, **k):
+            return self
+
+        def expire(self, *a, **k):
+            return self
+
+        async def execute(self):
+            return [0, 1, 999, 1]   # results[2] = zcard = 999 -> over the limit
+
+    class _FakeRedis:
+        def pipeline(self, transaction=True):
+            return _FakePipe()
+
+    mw = RateLimitMiddleware(app=None, redis_url="redis://x", default="1/minute", auth="1/minute", ai="1/minute")
+
+    async def _fake_get_redis():
+        return _FakeRedis()
+
+    mw._get_redis = _fake_get_redis
+
+    async def _call_next(_req):
+        raise AssertionError("downstream must NOT be reached when rate limited")
+
+    scope = {"type": "http", "method": "GET", "path": "/api/v1/anything",
+             "headers": [], "client": ("1.2.3.4", 5555), "query_string": b""}
+    resp = asyncio.run(mw.dispatch(Request(scope), _call_next))
+
+    assert resp.status_code == 429
+    assert resp.headers["Retry-After"] == "60"        # window preserved
+    body = json.loads(resp.body)
+    assert body["error"] == "rate_limited"
+    assert body["correlation_id"] == "rl-corr-123"
+    assert body["detail"] == "Rate limit exceeded. Try again later."
