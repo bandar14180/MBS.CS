@@ -179,8 +179,75 @@ async def _reap() -> int:
         await engine.dispose()
 
 
+async def _relay_queued() -> int:
+    """Queued-scan RELAY: re-dispatch scans that were durably committed as 'queued' but
+    never got a celery_task_id (their Celery dispatch failed -- the DB+Redis dual-write's
+    Redis side) and have sat past scan_queued_relay_seconds.
+
+    Conservative: `celery_task_id IS NULL` targets ONLY undelivered scans -- a scan already
+    in flight has a task id and is never touched. It NEVER creates a second scan row; it just
+    re-enqueues the existing scan_id, and the atomic scan claim (queued/failed -> running)
+    guarantees a relay message + any late original message cannot both execute. If the relay
+    .delay() itself fails (broker still down), celery_task_id stays NULL -> recoverable on a
+    later tick. Own short-lived engine (StaticPool); scans is RLS-exempt so no GUC needed."""
+    import logging
+
+    settings = get_settings()
+    if not settings.scan_queued_relay_enabled:
+        return 0
+    engine = create_async_engine(settings.database_url, poolclass=StaticPool)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    relayed = 0
+    try:
+        async with session_maker() as session:  # type: AsyncSession
+            rows = await session.execute(
+                text(
+                    "SELECT id FROM scans WHERE status = 'queued' AND celery_task_id IS NULL "
+                    "AND created_at < now() - make_interval(secs => :secs)"
+                ),
+                {"secs": int(settings.scan_queued_relay_seconds)},
+            )
+            ids = [r[0] for r in rows.fetchall()]
+
+            for sid in ids:
+                try:
+                    result = run_scan_task.delay(str(sid))
+                except Exception:  # noqa: BLE001 -- broker still down; leave queued+null, retry next tick
+                    logging.getLogger("mbs.scan").warning(
+                        "scan.relay_dispatch_failed scan=%s (left recoverable)", sid, exc_info=True
+                    )
+                    continue
+                # Mark dispatched so it isn't relayed again -- conditional on still being the
+                # undelivered row (a racing claim/dispatch must win instead).
+                await session.execute(
+                    text(
+                        "UPDATE scans SET celery_task_id = :tid "
+                        "WHERE id = :id AND status = 'queued' AND celery_task_id IS NULL"
+                    ),
+                    {"tid": result.id, "id": sid},
+                )
+                await session.commit()
+                relayed += 1
+
+        if relayed:
+            logging.getLogger("mbs.scan").warning(
+                "scan.relay redispatched %d undelivered queued scan(s) older than %ds",
+                relayed, settings.scan_queued_relay_seconds,
+            )
+        return relayed
+    finally:
+        await engine.dispose()
+
+
 @celery_app.task(name="scans.reap_orphans")
 def reap_orphaned_scans_task() -> int:
-    """Beat-scheduled orphan-scan reaper. Idempotent + safe to run concurrently: the
-    recovery is a single atomic UPDATE, and it never re-dispatches work."""
-    return asyncio.run(_reap())
+    """Beat-scheduled recovery: (1) orphan reaper -- 'running' scans past the timeout become
+    'failed'; (2) queued relay -- 'queued' scans never delivered to Celery are re-dispatched.
+    Both are idempotent + safe to run concurrently (atomic UPDATE / atomic scan claim), and
+    neither creates duplicate work. Returns the orphan-reaped count (unchanged contract)."""
+    async def _both() -> int:
+        reaped = await _reap()
+        await _relay_queued()
+        return reaped
+
+    return asyncio.run(_both())

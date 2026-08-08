@@ -184,6 +184,15 @@ class Settings(BaseSettings):
     scan_orphan_timeout_seconds: int = 7200           # 2h; 'running' older than this is an orphan
     scan_orphan_reaper_interval_seconds: int = 300    # reaper cadence (beat), default 5 min
 
+    # Queued-scan relay: a scan row is durably committed 'queued' BEFORE it is dispatched to
+    # Celery (create_scan), and celery_task_id is set only AFTER a successful dispatch. So a
+    # 'queued' scan with celery_task_id IS NULL past this threshold was never delivered (the
+    # DB+Redis dual-write's Redis side failed). The relay (run in the reaper task) re-dispatches
+    # it; the atomic scan claim guarantees no double-execution. Conservative: only fires for
+    # genuinely undelivered scans, never for scans already in flight (they have a task id).
+    scan_queued_relay_enabled: bool = True
+    scan_queued_relay_seconds: int = 300              # 5 min; 'queued' + no task id older than this
+
     # Phase 1.5 -- graceful shutdown & worker reliability. Celery task time limits BOUND
     # a scan so a hung/very-long run can't block warm shutdown forever (which would force
     # a SIGKILL -> orphaned 'running' scan). The SOFT limit fires first and raises
