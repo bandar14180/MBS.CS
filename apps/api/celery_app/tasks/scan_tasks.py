@@ -114,21 +114,48 @@ def _record_dlq(scan_id: str, exc: Exception, *, task_id: str | None = None, ret
         pass
 
 
+def _transient_error_types() -> tuple[type[BaseException], ...]:
+    """Infrastructure faults a retry can plausibly recover from -- transient DB / broker /
+    network blips. EVERYTHING ELSE (bad config, disallowed target, parser/programming bugs) is
+    PERMANENT: retrying just repeats the failure and its side effects, so those are dead-lettered
+    without retry (F2). Import-guarded so a missing optional dep can never break task import."""
+    types: list[type[BaseException]] = [ConnectionError, TimeoutError]  # builtin network / timeout
+    try:
+        from sqlalchemy.exc import InterfaceError, OperationalError  # DB connection / transient
+
+        types += [OperationalError, InterfaceError]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from redis.exceptions import ConnectionError as RedisConnectionError  # broker / DLQ / relay
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        types += [RedisConnectionError, RedisTimeoutError]
+    except Exception:  # noqa: BLE001
+        pass
+    return tuple(types)
+
+
+# F2: retry ONLY these transient infra faults; permanent failures go straight to the DLQ.
+TRANSIENT_ERRORS = _transient_error_types()
+
+
 @celery_app.task(
     bind=True,
     name="scans.run_scan",
     acks_late=True,
-    autoretry_for=(Exception,),
+    autoretry_for=TRANSIENT_ERRORS,   # F2: transient infra faults only -- NOT permanent errors
     retry_backoff=True,       # exponential backoff between retries
     retry_backoff_max=300,
     retry_jitter=True,
     max_retries=3,
 )
 def run_scan_task(self, scan_id: str, correlation_id: str | None = None) -> str:
-    """Execute a scan. Retries with exponential backoff on failure (transient DB /
-    storage / network issues recover); after retries are exhausted the task is
-    dead-lettered for inspection. The scan itself is idempotent -- the orchestrator
-    skips a scan that already reached a terminal state -- so acks_late redelivery
+    """Execute a scan. Retries with exponential backoff ONLY on transient infra faults
+    (TRANSIENT_ERRORS -- DB/broker/network); when those retries are exhausted the task is
+    dead-lettered. A PERMANENT failure (bad config, disallowed target, parser bug) is NOT
+    retried -- it is dead-lettered immediately (F2). The scan itself is idempotent -- the
+    orchestrator skips a scan that already reached a terminal state -- so acks_late redelivery
     after a worker crash is safe.
 
     correlation_id (Phase 4.1): the originating API request's id, propagated so worker/scan
@@ -153,9 +180,16 @@ def run_scan_task(self, scan_id: str, correlation_id: str | None = None) -> str:
         asyncio.run(_fail_scan(scan_id, "soft_time_limit_exceeded", _time.monotonic() - _started))
         _record_dlq(scan_id, exc, task_id=self.request.id, retries=self.request.retries)
         return scan_id
-    except Exception as exc:
+    except TRANSIENT_ERRORS as exc:
+        # Transient infra fault (F2): autoretry_for drives the exponential-backoff retry. Only
+        # dead-letter once the retries are exhausted, then let the failure propagate.
         if self.request.retries >= self.max_retries:
             _record_dlq(scan_id, exc, task_id=self.request.id, retries=self.request.retries)
+        raise
+    except Exception as exc:
+        # PERMANENT / deterministic failure (F2): retrying would only repeat the failure and its
+        # side effects, so do NOT retry -- dead-letter immediately for inspection/replay and fail.
+        _record_dlq(scan_id, exc, task_id=self.request.id, retries=self.request.retries)
         raise
     return scan_id
 
