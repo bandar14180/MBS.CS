@@ -22,7 +22,9 @@ def test_prometheus_scrape_config():
     jobs = {s["job_name"]: s for s in cfg["scrape_configs"]}
     assert "mbs-api" in jobs and "mbs-worker" in jobs
     assert jobs["mbs-api"]["static_configs"][0]["targets"] == ["api:8000"]
-    assert jobs["mbs-worker"]["static_configs"][0]["targets"] == ["worker:9100"]
+    # F1 topology split: both worker processes are scraped (scans on `worker`, control-plane
+    # incl. reaper/relay/schedule/retention on `worker-default`).
+    assert jobs["mbs-worker"]["static_configs"][0]["targets"] == ["worker:9100", "worker-default:9100"]
     # alert rules are wired in
     assert any("alerts.yml" in r for r in cfg["rule_files"])
 

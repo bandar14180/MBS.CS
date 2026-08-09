@@ -68,15 +68,15 @@ services:
     volumes:
       - ../db:/srv/db
 
+  # DEDICATED SCAN worker (F1): consumes ONLY the heavy `scans` queue (routed via task_routes),
+  # so long-running scans can never starve the control-plane tasks -- those run on
+  # `worker-default`. acks_late (Celery config) re-delivers a killed worker's task.
   worker:
     build:
       context: ..
       dockerfile: infra/docker/Dockerfile.worker
     restart: unless-stopped
-    # Consume both named queues: `scans` (heavy scan jobs, routed via task_routes)
-    # and `default` (everything else, e.g. schedules.enqueue_due). acks_late is set
-    # in the Celery config so a killed worker's task is re-delivered.
-    command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "scans,default", "--loglevel=info"]
+    command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "scans", "--loglevel=info"]
     env_file:
       - ../.env
     # Graceful shutdown (Phase 1.5): celery is PID 1 (exec form) and gets SIGTERM =
@@ -85,6 +85,25 @@ services:
     # Celery soft/hard time limits and, in the worst case (worker SIGKILLed), recovered by
     # the orphan reaper. Raise if your typical scan needs longer to drain on deploy.
     stop_grace_period: 120s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # DEDICATED DEFAULT worker (F1): consumes ONLY the `default` queue -- schedules.enqueue_due,
+  # scans.reap_orphans, backup.run, retention.purge. Isolated from scan load so the orphan reaper
+  # and scheduler always run on time even when every scan slot on `worker` is busy. Same image /
+  # env; exec form keeps celery as PID 1 for a warm SIGTERM shutdown.
+  worker-default:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+    restart: unless-stopped
+    command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "default", "--loglevel=info"]
+    env_file:
+      - ../.env
+    stop_grace_period: 60s
     depends_on:
       postgres:
         condition: service_healthy

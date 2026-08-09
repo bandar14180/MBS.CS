@@ -21,9 +21,11 @@ scrape_configs:
     static_configs:
       - targets: ['api:8000']
 
-  # Worker process: scan/tool/AI/reaper/relay/schedule counters + liveness (Phase 4.1
-  # endpoint). Unauthenticated but reachable only inside the compose network (never published).
+  # Worker processes: scan/tool/AI counters (on `worker`, the scans queue) + reaper/relay/
+  # schedule/retention counters (on `worker-default`, the default queue) + liveness (Phase 4.1
+  # endpoint). Both scraped since the F1 topology split spread these metrics across the two
+  # worker processes. Unauthenticated but reachable only inside the compose network.
   - job_name: mbs-worker
     metrics_path: /
     static_configs:
-      - targets: ['worker:9100']
+      - targets: ['worker:9100', 'worker-default:9100']
