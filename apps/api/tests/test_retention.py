@@ -46,6 +46,7 @@ def test_disabled_retention_does_nothing(monkeypatch):
     assert result.mode == "disabled"
     assert result.plans == []          # never even builds a plan
     assert result.total_eligible == 0
+    assert result.total_deleted == 0
 
 
 # --- dry-run never deletes -----------------------------------------------------------------
@@ -57,9 +58,8 @@ def test_dry_run_plans_but_deletes_nothing(monkeypatch):
     result = service.run_purge(s)
     assert result.mode == "dry_run"
     assert result.dry_run is True
-    # foundation performs no DB access -> nothing is ever counted as eligible yet
-    assert result.total_eligible == 0
-    assert {p.resource for p in result.plans} == {p.resource for p in service.POLICIES}
+    assert result.total_deleted == 0                      # dry-run reads counts but NEVER deletes
+    assert {p.resource for p in result.plans} == set(service.PROCESSED)
 
 
 def test_dry_run_flag_overrides_settings(monkeypatch):
@@ -69,16 +69,7 @@ def test_dry_run_flag_overrides_settings(monkeypatch):
     # ...but an explicit dry_run=True must win and stay safe
     result = service.run_purge(s, dry_run=True)
     assert result.mode == "dry_run"
-
-
-def test_live_run_is_refused_until_phase_5_3(monkeypatch):
-    """The single most important safety test: an enabled, non-dry-run pass must NOT silently
-    delete or no-op -- deletion isn't built yet, so it fails LOUD."""
-    s = get_settings()
-    monkeypatch.setattr(s, "retention_enabled", True)
-    monkeypatch.setattr(s, "retention_dry_run", False)
-    with pytest.raises(NotImplementedError):
-        service.run_purge(s, dry_run=False)
+    assert result.total_deleted == 0
 
 
 # --- plan / cutoff math --------------------------------------------------------------------

@@ -1,11 +1,12 @@
 """Phase 5.2 -- retention manual entry point (mirrors the apps.api.dr CLI). Read-only /
 dry-run only in this phase; it never deletes.
 
-  python -m apps.api.retention plan       # print the retention plan (windows + cutoffs)
-  python -m apps.api.retention dry-run     # run a dry-run purge (logs what WOULD be deleted)
+  python -m apps.api.retention plan       # print the retention plan (windows + cutoffs); no DB
+  python -m apps.api.retention dry-run     # count eligible per resource; delete nothing
+  python -m apps.api.retention run         # LIVE purge -- honors retention_enabled + retention_dry_run
 
-Exit code is 0 (nothing to fail in the foundation). Eligibility counting + real deletion
-arrive in Phase 5.3, so `would_delete` is 0 here by construction.
+`run` deletes only when retention_enabled=True AND retention_dry_run=False (the gates are never
+bypassed); otherwise it is a no-op / dry-run. `plan` is pure (no DB); `dry-run`/`run` touch the DB.
 """
 import argparse
 import sys
@@ -18,7 +19,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="apps.api.retention", description="MBS retention (foundation)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("plan", help="print the retention plan (per-resource window + cutoff); no deletion")
-    sub.add_parser("dry-run", help="execute a dry-run purge (logs what would be deleted; deletes nothing)")
+    sub.add_parser("dry-run", help="count eligible per resource; deletes nothing")
+    sub.add_parser("run", help="LIVE purge -- honors retention_enabled + retention_dry_run gates")
 
     args = parser.parse_args(argv)
     settings = get_settings()
@@ -43,6 +45,14 @@ def main(argv=None) -> int:
         print(f"mode={result.mode} dry_run={result.dry_run} total_would_delete={result.total_eligible}")
         for p in result.plans:
             print(f"  {p.resource:<14} would_delete={p.eligible}  (older than {p.cutoff.date()})")
+        return 0
+
+    if args.cmd == "run":
+        # Honors the settings gates: live only when retention_enabled AND not retention_dry_run.
+        result = service.run_purge(settings)
+        print(f"mode={result.mode} total_eligible={result.total_eligible} total_deleted={result.total_deleted}")
+        for p in result.plans:
+            print(f"  {p.resource:<14} eligible={p.eligible}  deleted={p.deleted}")
         return 0
 
     return 2
