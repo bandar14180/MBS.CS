@@ -1,12 +1,29 @@
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 
-from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
+from apps.api.core.deps import CurrentUserDep, DbDep, WorkspaceContextDep, require_permission
+from apps.api.core.pagination import PaginationDep, set_page_headers
+from apps.api.modules.attack import service as attack_service
+from apps.api.modules.attack.schemas import AttackGraphRead, KillChainRead, TacticMatrixRead
 from apps.api.modules.scans import service
-from apps.api.modules.scans.schemas import AIPlanRead, EvidenceRead, ScanCreate, ScanRead, ToolRunRead
+from apps.api.modules.scans.schemas import (
+    AgentDecisionTraceRead, AIPlanRead, EvidenceRead, ScanCreate, ScanRead, ScanTimelineEvent, ToolRunRead,
+)
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/projects/{project_id}/scans", tags=["scans"])
+
+# Scanner capabilities are global (not tenant-specific): which target types can
+# actually be scanned + which tools run for each. Lets clients avoid submitting a
+# target type that has no engine (no hollow scans).
+capabilities_router = APIRouter(prefix="/scan-capabilities", tags=["scans"])
+
+
+@capabilities_router.get("")
+async def get_scan_capabilities(current_user: CurrentUserDep) -> dict:
+    from apps.api.scanner_engine.capabilities import capability_map
+
+    return capability_map()
 
 
 @router.post(
@@ -25,6 +42,9 @@ async def create_scan(project_id: uuid.UUID, payload: ScanCreate, db: DbDep, ctx
         payload.scan_type,
         payload.requested_modules,
         payload.use_ai_planner,
+        payload.use_agent,
+        payload.exploitation_enabled,
+        payload.approved_hosts,
     )
     return ScanRead.model_validate(scan)
 
@@ -34,8 +54,11 @@ async def create_scan(project_id: uuid.UUID, payload: ScanCreate, db: DbDep, ctx
     response_model=list[ScanRead],
     dependencies=[Depends(require_permission("scan:read"))],
 )
-async def list_scans(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> list[ScanRead]:
-    scans = await service.list_scans(db, ctx.workspace_id, project_id)
+async def list_scans(
+    project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep, response: Response, page: PaginationDep
+) -> list[ScanRead]:
+    scans, total = await service.list_scans(db, ctx.workspace_id, project_id, page)
+    set_page_headers(response, total=total, page=page)
     return [ScanRead.model_validate(s) for s in scans]
 
 
@@ -89,3 +112,97 @@ async def list_evidence(
 async def get_ai_plan(project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> AIPlanRead:
     plan = await service.get_ai_plan(db, ctx.workspace_id, project_id, scan_id)
     return AIPlanRead.model_validate(plan)
+
+
+@router.get(
+    "/{scan_id}/attack-matrix",
+    response_model=list[TacticMatrixRead],
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_attack_matrix(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> list[TacticMatrixRead]:
+    """MITRE ATT&CK coverage for this scan: tactics -> techniques with hit counts."""
+    await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
+    matrix = await attack_service.attack_matrix_for_scan(db, scan_id)
+    return [TacticMatrixRead.model_validate(t) for t in matrix]
+
+
+@router.get(
+    "/{scan_id}/kill-chain",
+    response_model=KillChainRead,
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_kill_chain(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> KillChainRead:
+    """The scan's Cyber Kill Chain view -- the AI Correlator's attack-path
+    narrative when available, else the deterministic mapping."""
+    await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
+    return KillChainRead.model_validate(await attack_service.kill_chain_for_scan(db, scan_id))
+
+
+@router.get(
+    "/{scan_id}/attack-graph",
+    response_model=AttackGraphRead,
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_attack_graph(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> AttackGraphRead:
+    """The scan's evidence-driven attack graph (M4.4.5): the ACTUAL persisted
+    EngagementState.attack_graph -- read-only, never recomputed or writable here. A
+    non-agent scan returns an empty graph (has_engagement=False), not a 404. Scope +
+    workspace isolation via get_scan (404s out-of-scope) + RLS on engagement_state."""
+    from apps.api.modules.agent.service import get_engagement
+
+    await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
+    eng = await get_engagement(db, scan_id)
+    if eng is None:
+        return AttackGraphRead(has_engagement=False, graph={})
+    return AttackGraphRead(
+        has_engagement=True,
+        status=eng.status,
+        current_phase=eng.current_phase,
+        objective=eng.objective,
+        graph=eng.attack_graph or {},
+    )
+
+
+@router.get(
+    "/{scan_id}/timeline",
+    response_model=list[ScanTimelineEvent],
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_scan_timeline(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep,
+    page: PaginationDep, response: Response,
+) -> list[ScanTimelineEvent]:
+    """Chronological scan events (Phase 1.3): scan started, tool executed, finding
+    generated, agent decision, scan completed. Read-only; RBAC (scan:read) + workspace
+    isolation via get_scan (404 out-of-scope) + FORCE-RLS on the source tables. Paginated
+    (X-Total-Count/X-Limit/X-Offset/X-Has-More headers)."""
+    events, total = await service.get_scan_timeline(db, ctx.workspace_id, project_id, scan_id, page)
+    set_page_headers(response, total=total, page=page)
+    return [ScanTimelineEvent(**e) for e in events]
+
+
+@router.get(
+    "/{scan_id}/agent-decisions",
+    response_model=list[AgentDecisionTraceRead],
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_agent_decisions(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep,
+    page: PaginationDep, response: Response,
+) -> list[AgentDecisionTraceRead]:
+    """Structured agent-decision trace (Phase 1.3): decision type/action, selected tool,
+    reasoning summary, timestamp -- ordered by step_no. Prompts are never stored, and
+    raw evidence/candidate blobs are not surfaced (no sensitive prompt leakage). RBAC
+    (scan:read) + get_scan ownership (404 out-of-scope) + FORCE-RLS on agent_decisions."""
+    from apps.api.modules.agent.service import list_agent_decisions
+
+    await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
+    rows, total = await list_agent_decisions(db, scan_id, page)
+    set_page_headers(response, total=total, page=page)
+    return [AgentDecisionTraceRead.model_validate(r) for r in rows]

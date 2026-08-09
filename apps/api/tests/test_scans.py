@@ -23,6 +23,52 @@ def _auth(tokens: dict) -> dict:
     return {"Authorization": f"Bearer {tokens['access_token']}"}
 
 
+def test_scan_capabilities_endpoint(client: TestClient) -> None:
+    owner = _register(client, "Owner")
+    resp = client.get("/api/v1/scan-capabilities", headers=_auth(owner))
+    assert resp.status_code == 200
+    caps = resp.json()
+    assert caps["domain"]["supported"] is True
+    assert caps["repo"]["supported"] is False
+    assert "subfinder" in caps["domain"]["scanners"]
+
+
+def test_private_ip_target_rejected_at_creation(client: TestClient) -> None:
+    # SSRF guard wired into target creation: a private CIDR is refused with 400.
+    owner = _register(client, "Owner")
+    headers = _auth(owner)
+    ws = client.post("/api/v1/workspaces", headers=headers, json={"name": "WS"}).json()["id"]
+    proj = client.post(f"/api/v1/workspaces/{ws}/projects", headers=headers, json={"name": "P"}).json()["id"]
+    resp = client.post(
+        f"/api/v1/workspaces/{ws}/projects/{proj}/targets",
+        headers=headers,
+        json={"type": "ip_range", "value": "10.0.0.0/24"},
+    )
+    assert resp.status_code == 400
+    assert "SSRF" in resp.json()["detail"] or "not permitted" in resp.json()["detail"]
+
+
+def test_unsupported_target_type_scan_is_rejected(client: TestClient, no_celery_dispatch) -> None:
+    # A repo/api/cloud_account target has no scanner engine yet -> creating a scan
+    # must fail clearly at creation, never "complete" having assessed nothing.
+    owner = _register(client, "Owner")
+    headers = _auth(owner)
+    ws = client.post("/api/v1/workspaces", headers=headers, json={"name": "WS"}).json()["id"]
+    proj = client.post(f"/api/v1/workspaces/{ws}/projects", headers=headers, json={"name": "P"}).json()["id"]
+    tgt = client.post(
+        f"/api/v1/workspaces/{ws}/projects/{proj}/targets",
+        headers=headers,
+        json={"type": "repo", "value": "github.com/example/repo"},
+    ).json()["id"]
+    resp = client.post(
+        f"/api/v1/workspaces/{ws}/projects/{proj}/scans",
+        headers=headers,
+        json={"target_id": tgt, "scan_type": "web", "requested_modules": ["nmap"]},
+    )
+    assert resp.status_code == 400
+    assert "not supported" in resp.json()["detail"]
+
+
 def _make_target(client: TestClient, headers: dict) -> tuple[str, str, str]:
     ws = client.post("/api/v1/workspaces", headers=headers, json={"name": "Scan WS"})
     workspace_id = ws.json()["id"]
@@ -126,11 +172,14 @@ def test_scan_created_when_target_verified(client: TestClient, no_celery_dispatc
 def test_use_ai_planner_flag_persisted_to_config(client: TestClient, no_celery_dispatch, monkeypatch) -> None:
     # Regression: the use_ai_planner flag must reach scan.config, or the
     # orchestrator's AI-planning branch is unreachable (dead code).
-    # AI planning now requires a configured key at creation time, so provide a
-    # dummy one (the scan is never dispatched here, so Claude is never called).
+    # AI planning now requires a configured key for the active provider at
+    # creation time, so provide a dummy one (the scan is never dispatched here, so
+    # the provider is never actually called). Default provider is openrouter.
     from apps.api.core.config import get_settings
 
-    monkeypatch.setattr(get_settings(), "anthropic_api_key", "sk-test-dummy")
+    # Pin the provider so the test is deterministic regardless of the dev's .env.
+    monkeypatch.setattr(get_settings(), "ai_provider", "openrouter")
+    monkeypatch.setattr(get_settings(), "openrouter_api_key", "sk-test-dummy")
 
     owner = _register(client, "Owner")
     workspace_id, project_id, target_id = _make_target(client, _auth(owner))
@@ -151,10 +200,15 @@ def test_use_ai_planner_flag_persisted_to_config(client: TestClient, no_celery_d
 
 
 def test_use_ai_planner_without_key_is_rejected(client: TestClient, no_celery_dispatch, monkeypatch) -> None:
-    # With no ANTHROPIC_API_KEY, requesting the AI planner must be rejected at
-    # creation (clear 400) rather than creating a scan that instantly fail-fasts.
+    # With no API key for the active provider, requesting the AI planner must be
+    # rejected at creation (clear 400) rather than creating a scan that instantly
+    # fail-fasts. Default provider is openrouter.
     from apps.api.core.config import get_settings
 
+    # Pin the provider so the test is deterministic regardless of the dev's .env
+    # (AI_PROVIDER=local is key-less-but-enabled and would not reject).
+    monkeypatch.setattr(get_settings(), "ai_provider", "openrouter")
+    monkeypatch.setattr(get_settings(), "openrouter_api_key", "")
     monkeypatch.setattr(get_settings(), "anthropic_api_key", "")
 
     owner = _register(client, "Owner")
@@ -172,7 +226,7 @@ def test_use_ai_planner_without_key_is_rejected(client: TestClient, no_celery_di
         },
     )
     assert resp.status_code == 400
-    assert "ANTHROPIC_API_KEY" in resp.json()["detail"]
+    assert "AI planner requires" in resp.json()["detail"]
 
 
 def test_outsider_cannot_read_scans(client: TestClient, no_celery_dispatch) -> None:

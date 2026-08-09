@@ -31,16 +31,57 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Bake the Nuclei template set into the image (installs to /root/nuclei-templates)
-# so scans don't depend on GitHub egress at runtime, and a locked-down sandbox
-# can't be starved of templates later. No `|| true`: if this can't fetch
-# templates, the image is not fit to run vuln scans -- fail the build loudly.
-RUN nuclei -update-templates
-
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
 RUN pip install --no-cache-dir -r apps/api/requirements.txt
 
-COPY apps/__init__.py ./apps/__init__.py
-COPY apps/api ./apps/api
+# Run scans as an unprivileged user. The default recon config uses connect scans
+# (naabu/nmap) which do NOT need root/raw sockets, so no capabilities are lost.
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
+# Docker does NOT reset $HOME when USER changes -- it stays at the builder default
+# (/root), so `nuclei -update-templates` below would write templates into a dir
+# the runtime appuser cannot read. Pin HOME to appuser's home so templates install
+# exactly where the runtime user's nuclei looks. NUCLEI_TEMPLATES_DIR is read by
+# the nuclei runner (via Settings) so template discovery never depends on ambient
+# $HOME at scan time either.
+ENV HOME=/home/appuser \
+    NUCLEI_TEMPLATES_DIR=/home/appuser/nuclei-templates
+
+# Bake the Nuclei template set into the image so scans don't depend on GitHub
+# egress at runtime. Fail the build if templates did not land, readable, under
+# appuser's HOME -- an image that cannot vuln-scan is not fit to ship (no `|| true`).
+# This sits BEFORE the app COPY so iterating on application code doesn't bust the
+# (large, slow) template layer.
+RUN nuclei -update-templates \
+    && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ]
+
+# DAST enhancement: the app-layer coverage the signature pipeline lacks.
+#   katana  -- crawler (release zip), feeds discovered URLs to the fuzzer.
+#   arjun   -- HTTP parameter discovery (pip), turns crawled endpoint paths into
+#              fuzzable param URLs so nuclei-dast can inject SQLi/XSS/LFI probes.
+# Installed as their OWN layer AFTER the slow nuclei-templates layer so adding
+# them never busts that (large) cache. Needs root for /usr/local/bin + site-packages.
+USER root
+ARG KATANA_VERSION=1.1.2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl unzip \
+    && curl -sSfL "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_amd64.zip" -o /tmp/katana.zip \
+    && unzip -o /tmp/katana.zip -d /tmp/katana && mv /tmp/katana/katana /usr/local/bin/katana \
+    && chmod +x /usr/local/bin/katana \
+    && rm -rf /tmp/katana* \
+    && pip install --no-cache-dir arjun==2.2.7 \
+    && apt-get purge -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+USER appuser
+
+# Warm httpx's tech-detection ("dit") model into the image so scans don't download
+# ~92MB at runtime (P2-15). Best-effort: if the build network can't fetch it, we
+# fall back to the runtime download (unchanged behavior) rather than failing.
+RUN echo "https://example.com" | httpx-pd -tech-detect -silent -timeout 20 >/dev/null 2>&1 || true
+
+# Application code last: it changes most often, so keeping it after the template
+# layer keeps rebuilds fast. Owned by the runtime user (COPY runs as root).
+COPY --chown=appuser:appuser apps/__init__.py ./apps/__init__.py
+COPY --chown=appuser:appuser apps/api ./apps/api
 
 CMD ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "--loglevel=info"]

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from apps.api.ai_agent.claude_client import ClaudeClient, SupportsComplete
+from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
 from apps.api.ai_agent.prompts.assistant import (
     ASSISTANT_PROMPT_VERSION,
     ASSISTANT_SYSTEM,
@@ -20,7 +20,7 @@ class SecurityAssistant:
     is unit-testable without a key and fails soft (503) when no key is set."""
 
     def __init__(self, client: SupportsComplete | None = None):
-        self._client = client or ClaudeClient()
+        self._client = client or get_ai_client()
 
     def answer(self, question: str, context: str | None = None) -> AssistantResult:
         user = ASSISTANT_USER_TEMPLATE.format(question=question, context=context or "(none)")

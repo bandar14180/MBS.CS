@@ -5,6 +5,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
 from apps.api.modules.authorization_scope.service import require_verified_target
 from apps.api.modules.projects.service import get_target
 from apps.api.modules.scans.models import Scan
@@ -21,8 +22,24 @@ async def create_scan(
     scan_type: str,
     requested_modules: list[str],
     use_ai_planner: bool = False,
+    use_agent: bool = False,
+    exploitation_enabled: bool = False,
+    approved_hosts: list[str] | None = None,
 ) -> Scan:
-    await get_target(db, workspace_id, project_id, target_id)  # 404s if target isn't in this project/workspace
+    target = await get_target(db, workspace_id, project_id, target_id)  # 404s if not in this project/workspace
+
+    from apps.api.scanner_engine import capabilities
+
+    # Refuse target types with no scanner engine -- otherwise the scan would
+    # "complete" having run nothing. The capability registry is the source of truth.
+    if not capabilities.is_supported(target.type):
+        supported = sorted(capabilities.supported_target_types())
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Target type '{target.type}' is not supported for scanning yet "
+            f"(supported: {', '.join(supported) or 'none'}). Refusing to start a scan "
+            f"that would assess nothing.",
+        )
 
     from apps.api.modules.billing import service as billing
 
@@ -38,11 +55,13 @@ async def create_scan(
     if use_ai_planner:
         from apps.api.core.config import get_settings
 
-        if not get_settings().anthropic_api_key:
+        settings = get_settings()
+        if not settings.ai_enabled:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                "AI planner requires ANTHROPIC_API_KEY to be configured. Turn off "
-                "'Use AI planner' to run the scan without AI, or set a key in .env.",
+                f"AI planner requires an API key for the configured AI provider "
+                f"('{settings.ai_provider}'). Turn off 'Use AI planner' to run the scan "
+                f"without AI, or set the provider's API key.",
             )
 
     # The guardrail: no verified authorization scope, no scan. See
@@ -68,7 +87,13 @@ async def create_scan(
         initiated_by=initiated_by,
         scan_type=scan_type,
         status="queued",
-        config={"requested_modules": requested_modules, "use_ai_planner": use_ai_planner},
+        config={
+            "requested_modules": requested_modules,
+            "use_ai_planner": use_ai_planner,
+            "use_agent": use_agent,
+            "exploitation_enabled": exploitation_enabled,
+            "approved_hosts": approved_hosts or [],
+        },
     )
     db.add(scan)
     await db.commit()
@@ -79,8 +104,12 @@ async def create_scan(
     # this keeps the API process from needing a live Celery/Redis connection
     # just to import the scans module.
     from apps.api.celery_app.tasks.scan_tasks import run_scan_task
+    from apps.api.core.observability import get_correlation_id
 
-    async_result = run_scan_task.delay(str(scan.id))
+    # Propagate the request correlation id (Phase 4.1) so the worker's scan logs can be
+    # joined to the API request that created the scan. For a scheduled dispatch (worker/beat
+    # context, no request) this is the ambient "-", which the task replaces with a fresh id.
+    async_result = run_scan_task.delay(str(scan.id), correlation_id=get_correlation_id())
     scan.celery_task_id = async_result.id
 
     from apps.api.modules.audit import service as audit
@@ -95,13 +124,15 @@ async def create_scan(
     return scan
 
 
-async def list_scans(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID) -> list[Scan]:
-    result = await db.scalars(
+async def list_scans(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, page: Pagination | None = None
+) -> tuple[list[Scan], int]:
+    query = (
         select(Scan)
         .where(Scan.workspace_id == workspace_id, Scan.project_id == project_id)
-        .order_by(Scan.created_at.desc())
+        .order_by(Scan.created_at.desc(), Scan.id)
     )
-    return list(result)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def get_scan(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, scan_id: uuid.UUID) -> Scan:
@@ -141,6 +172,41 @@ async def list_tool_runs(
     await get_scan(db, workspace_id, project_id, scan_id)
     result = await db.scalars(select(ToolRun).where(ToolRun.scan_id == scan_id).order_by(ToolRun.started_at))
     return list(result)
+
+
+async def get_scan_timeline(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, scan_id: uuid.UUID, page: Pagination
+) -> tuple[list[dict], int]:
+    """Chronological scan event stream (Phase 1.3): scan started, tool executions,
+    findings, agent decisions/actions, scan completed. Ownership is enforced by
+    get_scan (404 out-of-scope); the underlying tool_runs / agent_steps /
+    vulnerabilities are FORCE-RLS, so the request's workspace GUC scopes them too.
+    Bounded per scan; paginated in memory over the merged, time-ordered events."""
+    from apps.api.modules.agent.models import AgentStep
+    from apps.api.modules.vulnerabilities.models import Vulnerability
+
+    scan = await get_scan(db, workspace_id, project_id, scan_id)
+    events: list[dict] = []
+    if scan.started_at:
+        events.append({"ts": scan.started_at, "event": "scan.started", "tool": None, "status": "running", "detail": None})
+    for tr in await db.scalars(select(ToolRun).where(ToolRun.scan_id == scan_id)):
+        events.append({"ts": tr.started_at, "event": "tool.executed", "tool": tr.tool_name,
+                       "status": tr.status, "detail": (tr.error_message or None) and tr.error_message[:300]})
+    for st in await db.scalars(select(AgentStep).where(AgentStep.scan_id == scan_id)):
+        events.append({"ts": st.created_at, "event": f"agent.{st.action_type}", "tool": st.tool_or_module,
+                       "status": st.status, "detail": (st.result_summary or None) and st.result_summary[:300]})
+    for v in await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan_id)):
+        events.append({"ts": v.created_at, "event": "finding.generated", "tool": None,
+                       "status": v.severity, "detail": (v.title or "")[:300]})
+    if scan.completed_at:
+        events.append({"ts": scan.completed_at, "event": "scan.completed", "tool": None,
+                       "status": scan.status, "detail": None})
+
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    events.sort(key=lambda e: e["ts"] or _epoch)
+    total = len(events)
+    window = events[page.offset: page.offset + page.limit]
+    return window, total
 
 
 async def list_evidence(

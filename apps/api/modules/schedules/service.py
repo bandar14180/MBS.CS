@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.observability import record_schedule_launched
 from apps.api.modules.projects.service import get_target
 from apps.api.modules.schedules.models import ScanSchedule
 
@@ -125,7 +126,7 @@ async def run_due_schedules(db: AsyncSession, now: datetime | None = None) -> in
     revoked scope, ...) is recorded on that row and never blocks the others.
     Returns the number of scans launched."""
     now = now or datetime.now(timezone.utc)
-    due = list(
+    candidates = list(
         await db.scalars(
             select(ScanSchedule).where(
                 ScanSchedule.enabled.is_(True), ScanSchedule.next_run_at <= now
@@ -135,7 +136,26 @@ async def run_due_schedules(db: AsyncSession, now: datetime | None = None) -> in
     launched = 0
     from apps.api.modules.scans.service import create_scan
 
-    for sched in due:
+    for sched in candidates:
+        next_run = compute_next_run(now, sched.interval_minutes)
+        # ATOMIC CLAIM (mirrors the scan atomic claim): a single conditional UPDATE advances
+        # next_run_at/last_run_at ONLY if the schedule is still due. Two concurrent runners
+        # (overlapping beat ticks / acks_late redelivery) race here -- exactly ONE matches
+        # (RETURNING a row); the loser gets 0 rows and skips, so a due occurrence is never
+        # dispatched twice. Commit immediately to make the claim durable + visible.
+        claimed = (
+            await db.execute(
+                text(
+                    "UPDATE scan_schedules SET last_run_at = :now, next_run_at = :next "
+                    "WHERE id = :id AND enabled = true AND next_run_at <= :now RETURNING id"
+                ),
+                {"now": now, "next": next_run, "id": sched.id},
+            )
+        ).first() is not None
+        await db.commit()
+        if not claimed:
+            continue  # another runner already claimed this occurrence
+
         try:
             # Bootstrap RLS to this schedule's workspace before touching
             # projects/targets (FORCE RLS) via create_scan.
@@ -153,16 +173,24 @@ async def run_due_schedules(db: AsyncSession, now: datetime | None = None) -> in
                 requested_modules=list(sched.requested_modules or []),
                 use_ai_planner=sched.use_ai_planner,
             )
-            sched.last_scan_id = scan.id
-            sched.last_error = None
-            launched += 1
-            logger.info("schedule.fired schedule=%s -> scan=%s", sched.id, scan.id)
-        except Exception as exc:  # quota/scope/etc. -- record, keep going
-            sched.last_error = f"{type(exc).__name__}: {exc}"[:1000]
-            logger.warning("schedule.skipped schedule=%s error=%s", sched.id, exc)
-        finally:
-            sched.last_run_at = now
-            sched.next_run_at = compute_next_run(now, sched.interval_minutes)
+            # Record success on the already-claimed row (raw UPDATE: the ORM `sched` is stale
+            # after the claim, and next_run_at must NOT be reverted).
+            await db.execute(
+                text("UPDATE scan_schedules SET last_scan_id = :sid, last_error = NULL WHERE id = :id"),
+                {"sid": scan.id, "id": sched.id},
+            )
             await db.commit()
+            launched += 1
+            record_schedule_launched("launched")
+            logger.info("schedule.fired schedule=%s -> scan=%s", sched.id, scan.id)
+        except Exception as exc:  # quota/scope/dispatch/etc. -- record, keep going (last_error preserved)
+            await db.rollback()  # discard any partial create_scan session state
+            await db.execute(
+                text("UPDATE scan_schedules SET last_error = :err WHERE id = :id"),
+                {"err": f"{type(exc).__name__}: {exc}"[:1000], "id": sched.id},
+            )
+            await db.commit()
+            record_schedule_launched("failed")
+            logger.warning("schedule.skipped schedule=%s error=%s", sched.id, exc)
 
     return launched

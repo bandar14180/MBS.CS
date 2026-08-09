@@ -5,6 +5,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
 from apps.api.modules.vulnerabilities.models import Vulnerability, VulnerabilityEvidence
 from apps.api.scanner_engine.tool_runners.base import VulnerabilityFinding
 
@@ -93,14 +94,15 @@ async def list_vulnerabilities(
     project_id: uuid.UUID,
     severity: str | None = None,
     status_filter: str | None = None,
-) -> list[Vulnerability]:
+    page: Pagination | None = None,
+) -> tuple[list[Vulnerability], int]:
     query = select(Vulnerability).where(Vulnerability.project_id == project_id)
     if severity:
         query = query.where(Vulnerability.severity == severity)
     if status_filter:
         query = query.where(Vulnerability.status == status_filter)
-    result = await db.scalars(query.order_by(Vulnerability.cvss_score.desc().nullslast(), Vulnerability.created_at))
-    return list(result)
+    query = query.order_by(Vulnerability.cvss_score.desc().nullslast(), Vulnerability.created_at, Vulnerability.id)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def get_vulnerability(

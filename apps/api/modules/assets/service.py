@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
 from apps.api.modules.assets.models import Asset
 
 
@@ -43,11 +44,11 @@ async def upsert_asset(
     await db.execute(stmt)
 
 
-async def list_assets(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID) -> list[Asset]:
-    result = await db.scalars(
-        select(Asset).where(Asset.project_id == project_id).order_by(Asset.first_seen)
-    )
-    return list(result)
+async def list_assets(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, page: Pagination | None = None
+) -> tuple[list[Asset], int]:
+    query = select(Asset).where(Asset.project_id == project_id).order_by(Asset.first_seen, Asset.id)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def get_asset(db: AsyncSession, workspace_id: uuid.UUID, asset_id: uuid.UUID) -> Asset:

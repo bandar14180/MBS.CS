@@ -4,6 +4,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
 from apps.api.modules.projects.models import Project, Target
 
 
@@ -20,11 +21,11 @@ async def create_project(
     return project
 
 
-async def list_projects(db: AsyncSession, workspace_id: uuid.UUID) -> list[Project]:
-    result = await db.scalars(
-        select(Project).where(Project.workspace_id == workspace_id).order_by(Project.created_at)
-    )
-    return list(result)
+async def list_projects(
+    db: AsyncSession, workspace_id: uuid.UUID, page: Pagination | None = None
+) -> tuple[list[Project], int]:
+    query = select(Project).where(Project.workspace_id == workspace_id).order_by(Project.created_at, Project.id)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def get_project(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID) -> Project:
@@ -73,6 +74,16 @@ async def create_target(
 ) -> Target:
     await get_project(db, workspace_id, project_id)  # 404s if project isn't in this workspace
 
+    # SSRF guard: refuse a target that is (or resolves to) a private/reserved/
+    # metadata address unless the on-prem allowlist explicitly permits it. The
+    # authoritative re-check happens again at scan time (DNS-rebinding defense).
+    from apps.api.scanner_engine.net_guard import TargetNotAllowed, validate_target_value
+
+    try:
+        validate_target_value(target_type, value)
+    except TargetNotAllowed as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
     from apps.api.modules.billing import service as billing
 
     await billing.enforce_target_quota(db, workspace_id)
@@ -95,12 +106,12 @@ async def update_target_criticality(
     return target
 
 
-async def list_targets(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID) -> list[Target]:
+async def list_targets(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, page: Pagination | None = None
+) -> tuple[list[Target], int]:
     await get_project(db, workspace_id, project_id)
-    result = await db.scalars(
-        select(Target).where(Target.project_id == project_id).order_by(Target.created_at)
-    )
-    return list(result)
+    query = select(Target).where(Target.project_id == project_id).order_by(Target.created_at, Target.id)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def get_target(

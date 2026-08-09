@@ -4,6 +4,7 @@ import uuid
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
 from apps.api.modules.notifications.models import Notification
 
 logger = logging.getLogger(__name__)
@@ -78,13 +79,13 @@ async def notify_scan_finished(db: AsyncSession, scan) -> None:
 
 
 async def list_notifications(
-    db: AsyncSession, workspace_id: uuid.UUID, unread_only: bool = False, limit: int = 50
-) -> list[Notification]:
+    db: AsyncSession, workspace_id: uuid.UUID, unread_only: bool = False, page: Pagination | None = None
+) -> tuple[list[Notification], int]:
     query = select(Notification).where(Notification.workspace_id == workspace_id)
     if unread_only:
         query = query.where(Notification.read.is_(False))
-    result = await db.scalars(query.order_by(Notification.created_at.desc()).limit(limit))
-    return list(result)
+    query = query.order_by(Notification.created_at.desc(), Notification.id)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def unread_count(db: AsyncSession, workspace_id: uuid.UUID) -> int:

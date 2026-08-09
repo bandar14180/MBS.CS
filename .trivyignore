@@ -1,0 +1,10 @@
+# Phase 1.8 -- Trivy triaged/accepted container CVEs (image scan).
+#
+# One CVE ID per line (e.g. CVE-2024-12345). The image-scan job gates on CRITICAL +
+# --ignore-unfixed only, so this file is for the rare CRITICAL-with-fix that has been
+# reviewed and accepted (e.g. not reachable in our usage) pending an upstream base-image
+# bump. Justify + set a review-by date so it stays auditable:
+#
+#   CVE-2024-12345  # <pkg>: accepted -- <reason>. review-by YYYY-MM-DD
+#
+# (empty = no accepted CVEs; CRITICAL fixed findings block CI)

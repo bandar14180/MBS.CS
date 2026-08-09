@@ -1,0 +1,47 @@
+# Keep secrets, VCS metadata, docs, caches, and local artifacts out of the Docker
+# build context (nothing here is COPYed into an image; this hardens against
+# accidental secret leakage and shrinks/speeds the context). Do NOT exclude apps/
+# or db/ -- the images/build need them.
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Python caches / test artifacts
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.egg-info/
+
+# Node (web app deps are installed in its own image layer)
+**/node_modules/
+
+# Docs / planning (not needed at runtime)
+docs/
+*.md
+!apps/web/README.md
+
+# Editor / OS
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local model / tool caches
+**/.dit/
+**/nuclei-templates/

@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.projects.service import get_project
+from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
 from apps.api.modules.reports import render, storage
 from apps.api.modules.reports.data import gather_report_data
 from apps.api.modules.reports.models import Report
@@ -55,12 +56,12 @@ async def create_report(
     return report
 
 
-async def list_reports(db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID) -> list[Report]:
+async def list_reports(
+    db: AsyncSession, workspace_id: uuid.UUID, project_id: uuid.UUID, page: Pagination | None = None
+) -> tuple[list[Report], int]:
     await get_project(db, workspace_id, project_id)
-    result = await db.scalars(
-        select(Report).where(Report.project_id == project_id).order_by(Report.generated_at.desc())
-    )
-    return list(result)
+    query = select(Report).where(Report.project_id == project_id).order_by(Report.generated_at.desc(), Report.id)
+    return await paginate(db, query, page or Pagination(limit=MAX_LIMIT, offset=0))
 
 
 async def get_report(

@@ -1,7 +1,8 @@
 import asyncio
 import json
 
-from apps.api.scanner_engine.tool_runners._net import resolve_scan_host
+from apps.api.core.config import get_settings
+from apps.api.scanner_engine.tool_runners._web import web_targets
 from apps.api.scanner_engine.tool_runners.base import (
     BaseToolRunner,
     CommonFinding,
@@ -10,7 +11,13 @@ from apps.api.scanner_engine.tool_runners.base import (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 300
-DEFAULT_TAGS = "misconfig"  # focused, fast; reliably fires (e.g. missing security headers) on generic HTTP servers
+# A broader-but-still-safe default template set for a professional web pentest:
+# common misconfigurations, known CVEs, sensitive exposures, default credentials,
+# subdomain takeovers, and tech fingerprinting. All are gated by
+# `requires_active_testing` (they send payloads). Override per-scan via
+# config["nuclei_tags"]; the richer classifications (CWE/CVE/tags) also drive the
+# ATT&CK / kill-chain mapping downstream.
+DEFAULT_TAGS = "misconfig,cve,exposure,default-login,takeover,tech"
 
 
 class NucleiRunner(BaseToolRunner):
@@ -18,25 +25,26 @@ class NucleiRunner(BaseToolRunner):
     version = "3.11.0"
     requires_active_testing = True  # sends template payloads -> gated on active_testing_allowed (§7)
     phase = 50  # last: runs against http services discovered earlier in the pipeline
+    kill_chain_phase = "delivery"      # delivers detection probes/payloads
+    safety_tier = "active_safe"        # DETECTION templates only (no exploitation)
 
     def _target_urls(self, target_value: str, prior_findings: list[CommonFinding]) -> list[str]:
-        """Scan the HTTP services httpx confirmed; fall back to http(s) on the
-        resolved target if httpx didn't run."""
-        urls = [f.value for f in prior_findings if f.asset_type == "http_service" and f.value]
-        if urls:
-            seen: set[str] = set()
-            return [u for u in urls if not (u in seen or seen.add(u))]
-        try:
-            ip = resolve_scan_host(target_value)
-        except Exception:
-            ip = target_value
-        return [f"http://{ip}", f"https://{ip}"]
+        """What nuclei scans: httpx-confirmed HTTP services, else the open ports
+        naabu/nmap discovered (so a web app on a non-standard port like :3000 --
+        which httpx's default 80/443 probe never sees -- is still scanned), else
+        http(s) on the bare target. See tool_runners._web.web_targets."""
+        return web_targets(target_value, prior_findings)
 
     async def run(self, target_value: str, config: dict, prior_findings: list[CommonFinding]) -> RawToolOutput:
         urls = self._target_urls(target_value, prior_findings)
         tags = config.get("nuclei_tags", DEFAULT_TAGS)
 
         command = ["nuclei", "-jsonl", "-silent", "-disable-update-check", "-no-color"]
+        # Point nuclei at the baked-in template set explicitly (see
+        # Dockerfile.worker) so discovery never depends on the ambient $HOME.
+        templates_dir = get_settings().nuclei_templates_dir
+        if templates_dir:
+            command += ["-templates", templates_dir]
         if tags:
             command += ["-tags", tags]
 

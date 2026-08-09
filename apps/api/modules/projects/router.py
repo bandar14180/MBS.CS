@@ -1,8 +1,9 @@
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 
 from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
+from apps.api.core.pagination import PaginationDep, set_page_headers
 from apps.api.modules.projects import service
 from apps.api.modules.projects.schemas import (
     ProjectCreate,
@@ -32,8 +33,11 @@ async def create_project(payload: ProjectCreate, db: DbDep, ctx: WorkspaceContex
     response_model=list[ProjectRead],
     dependencies=[Depends(require_permission("project:read"))],
 )
-async def list_projects(db: DbDep, ctx: WorkspaceContextDep) -> list[ProjectRead]:
-    projects = await service.list_projects(db, ctx.workspace_id)
+async def list_projects(
+    db: DbDep, ctx: WorkspaceContextDep, response: Response, page: PaginationDep
+) -> list[ProjectRead]:
+    projects, total = await service.list_projects(db, ctx.workspace_id, page)
+    set_page_headers(response, total=total, page=page)
     return [ProjectRead.model_validate(p) for p in projects]
 
 
@@ -100,6 +104,9 @@ async def update_target(
     response_model=list[TargetRead],
     dependencies=[Depends(require_permission("target:read"))],
 )
-async def list_targets(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> list[TargetRead]:
-    targets = await service.list_targets(db, ctx.workspace_id, project_id)
+async def list_targets(
+    project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep, response: Response, page: PaginationDep
+) -> list[TargetRead]:
+    targets, total = await service.list_targets(db, ctx.workspace_id, project_id, page)
+    set_page_headers(response, total=total, page=page)
     return [TargetRead.model_validate(t) for t in targets]

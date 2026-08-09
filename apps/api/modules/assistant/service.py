@@ -2,6 +2,7 @@ import uuid
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from apps.api.modules.assistant.schemas import AssistantAnswer
 from apps.api.modules.vulnerabilities.service import get_vulnerability
@@ -41,11 +42,25 @@ async def ask(
         grounded = True
 
     from apps.api.ai_agent.assistant import SecurityAssistant
+    from apps.api.ai_agent.providers.usage import collect_ai_usage
+    from apps.api.ai_agent.usage_repo import persist_ai_usage
+    from apps.api.core.observability import get_correlation_id
 
     try:
-        result = SecurityAssistant().answer(question, context)
-    except RuntimeError as exc:  # ANTHROPIC_API_KEY not set
+        # Capture token/cost usage for this call and persist it (best-effort) after.
+        with collect_ai_usage(
+            agent_role="assistant",
+            workspace_id=workspace_id,
+            correlation_id=get_correlation_id(),
+        ) as usage_records:
+            # Run the (synchronous) provider call off the event loop so heavy AI
+            # use never blocks the API. Usage collection still works: the context
+            # is copied into the worker thread and the sink list is shared.
+            result = await run_in_threadpool(SecurityAssistant().answer, question, context)
+    except RuntimeError as exc:  # no provider key configured -> fail soft (503)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+
+    await persist_ai_usage(usage_records)
 
     return AssistantAnswer(
         answer=result.answer,

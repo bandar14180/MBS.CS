@@ -3,6 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, Response, status
 
 from apps.api.core.deps import DbDep, WorkspaceContextDep, require_permission
+from apps.api.core.pagination import PaginationDep, set_page_headers
 from apps.api.modules.reports import service
 from apps.api.modules.reports.schemas import ReportCreate, ReportRead
 
@@ -34,8 +35,11 @@ async def create_report(
     response_model=list[ReportRead],
     dependencies=[Depends(require_permission("report:read"))],
 )
-async def list_reports(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> list[ReportRead]:
-    reports = await service.list_reports(db, ctx.workspace_id, project_id)
+async def list_reports(
+    project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep, response: Response, page: PaginationDep
+) -> list[ReportRead]:
+    reports, total = await service.list_reports(db, ctx.workspace_id, project_id, page)
+    set_page_headers(response, total=total, page=page)
     return [ReportRead.model_validate(r) for r in reports]
 
 

@@ -13,6 +13,8 @@ class NaabuRunner(BaseToolRunner):
     version = "2.6.1"
     requires_active_testing = False  # passive/recon per blueprint §7 -- gated on verified only
     phase = 30  # after subfinder (10) + httpx (20), before nmap (40)
+    kill_chain_phase = "reconnaissance"
+    safety_tier = "active_safe"  # connect-scan port discovery (no state change)
 
     def _host_set(self, target_value: str, prior_findings: list[CommonFinding]) -> list[str]:
         """Original target plus any live hosts httpx confirmed, else any

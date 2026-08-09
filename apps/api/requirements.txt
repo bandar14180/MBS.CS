@@ -1,4 +1,8 @@
-fastapi==0.115.0
+fastapi==0.141.1
+# Starlette pinned explicitly to a security-fixed release (transitive via FastAPI).
+# 0.38.6 carried PYSEC-2026-1941/2280/2281 (fixed in 0.47.2 / 1.1.0); FastAPI 0.141.1
+# requires starlette>=0.46.0, so 1.4.x is the compatible, fully-patched line.
+starlette==1.4.1
 uvicorn[standard]==0.30.6
 pydantic-settings==2.5.2
 email-validator==2.2.0
@@ -9,10 +13,11 @@ alembic==1.13.2
 celery==5.4.0
 redis==5.0.8
 boto3==1.35.24
-pyjwt==2.9.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
+pyjwt==2.13.0
+bcrypt==4.2.1
 anthropic==0.34.2
 reportlab==4.2.2
-pytest==8.3.3
+prometheus-client==0.21.0
+pytest==9.1.1
+pytest-cov==7.1.0
 httpx==0.27.2

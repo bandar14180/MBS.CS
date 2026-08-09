@@ -1,0 +1,92 @@
+# MBS.SC alert rules (Phase 4.2). Minimal, high-value, low-noise. Every alert uses a metric
+# that already exists (core/observability.py) or Prometheus' synthetic `up` target-liveness.
+# Thresholds/windows are intentionally conservative to avoid paging on transient blips.
+groups:
+  - name: mbs-critical
+    rules:
+      - alert: MbsApiDown
+        expr: up{job="mbs-api"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "MBS API metrics endpoint unreachable"
+          description: "Prometheus cannot scrape the API /metrics ({{ $labels.instance }}) for >2m."
+
+      - alert: MbsWorkerDown
+        expr: up{job="mbs-worker"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "MBS worker unavailable (metrics endpoint unreachable)"
+          description: "Prometheus cannot scrape the worker metrics endpoint ({{ $labels.instance }}) for >2m."
+
+      - alert: MbsApiHighServerErrorRate
+        expr: >
+          sum(rate(mbs_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(mbs_http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "MBS API 5xx error rate above 5%"
+          description: "More than 5% of API responses are 5xx over the last 5m."
+
+  - name: mbs-warning
+    rules:
+      - alert: MbsHighScanFailureRatio
+        expr: >
+          sum(rate(mbs_scan_failed_total[30m]))
+            / clamp_min(sum(rate(mbs_scan_success_total[30m])) + sum(rate(mbs_scan_failed_total[30m])), 0.001) > 0.5
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "High scan failure ratio (>50%)"
+          description: "More than half of scans have failed over the last 30m."
+
+      - alert: MbsExcessiveToolFailures
+        expr: sum(rate(mbs_tool_failure_total[15m])) > 0.2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Excessive scanner tool failures"
+          description: "Scanner tool failure rate is elevated over the last 15m."
+
+      - alert: MbsAiCostHigh
+        expr: increase(mbs_ai_cost_usd_total[1h]) > 5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI spend exceeding threshold"
+          description: "Estimated AI cost rose by more than $5 in the last hour (threshold configurable in this rule)."
+
+      - alert: MbsScanRecoveryActivity
+        expr: (increase(mbs_scan_reaped_total[30m]) > 0) or (increase(mbs_scan_relayed_total[30m]) > 0)
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scan recovery paths active (backlog / worker-loss proxy)"
+          description: "The orphan reaper or queued relay fired -- indicates worker loss or queue-dispatch backlog."
+
+      # F4: reliability signals exposed by the API-side Redis-backed ReliabilityCollector.
+      - alert: MbsDlqBacklog
+        expr: mbs_dlq_depth > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scan dead-letter queue backlog"
+          description: "{{ $value }} scan(s) have sat in the dead-letter queue for >15m -- permanently failing scans need inspection/replay (python -m apps.api.celery_app.dlq list)."
+
+      - alert: MbsBackupFailing
+        expr: increase(mbs_backup_failures_total[6h]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Backup run failed"
+          description: "A scheduled backup failed in the last 6h -- disaster-recovery coverage is at risk."
+
+      - alert: MbsRetentionFailing
+        expr: increase(mbs_retention_failures_total[6h]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Retention purge failed"
+          description: "A retention purge run failed in the last 6h."

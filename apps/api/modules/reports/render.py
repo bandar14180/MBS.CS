@@ -104,6 +104,70 @@ def render_executive(data: ReportData) -> bytes:
         )
     )
 
+    # MITRE ATT&CK coverage: which adversary techniques the findings map to, most
+    # frequently observed first. The per-scan kill-chain view sequences these.
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph("MITRE ATT&CK coverage", styles["H2"]))
+    if data.attack_techniques:
+        att_rows = [["Tactic", "Technique", "ID", "Findings"]]
+        for tactic, tid, tname, count in data.attack_techniques[:15]:
+            att_rows.append([_esc(tactic), Paragraph(_esc(tname), styles["Cell"]), tid, str(count)])
+        atbl = Table(att_rows, colWidths=[45 * mm, 70 * mm, 25 * mm, 20 * mm])
+        atbl.setStyle(_table_style(colors))
+        story.append(atbl)
+        story.append(
+            Paragraph(
+                "Techniques are mapped to the Cyber Kill Chain; see the scan kill-chain view for the "
+                "sequenced attack path.",
+                styles["Body"],
+            )
+        )
+    else:
+        story.append(Paragraph("No findings mapped to ATT&CK techniques.", styles["Body"]))
+
+    # Autonomous-engagement attack graph (M4.4.6): evidence-backed asset -> service ->
+    # finding -> technique -> access relationships, plus any confirmed access. Present
+    # only for agent-driven scans; fail-soft otherwise. Never reports unsupported
+    # privilege escalation / lateral movement.
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph("Autonomous engagement: attack graph", styles["H2"]))
+    ag = data.attack_graph or {}
+    if ag.get("has_data"):
+        counts = ag.get("node_counts", {})
+        story.append(
+            Paragraph(
+                "Evidence-backed graph: "
+                + ", ".join(f"{counts[t]} {t}" for t in sorted(counts))
+                + f" (across {ag.get('engagement_count', 0)} autonomous engagement(s)).",
+                styles["Body"],
+            )
+        )
+        confirmed = ag.get("confirmed_access") or []
+        if confirmed:
+            story.append(Paragraph("Confirmed access (evidence-backed):", styles["Body"]))
+            for a in confirmed[:10]:
+                story.append(
+                    Paragraph(
+                        f"&bull; {_esc(a.get('target'))} — {_esc(a.get('access_state'))} "
+                        f"(module {_esc(a.get('module'))})",
+                        styles["Body"],
+                    )
+                )
+        else:
+            story.append(Paragraph("No access was confirmed.", styles["Body"]))
+        story.append(
+            Paragraph(
+                "All graph relationships and access states are derived from collected evidence. "
+                "Host nodes are inferred from observed services; privilege escalation and lateral "
+                "movement are reported only when supported by evidence.",
+                styles["Body"],
+            )
+        )
+    else:
+        story.append(
+            Paragraph("No autonomous engagement graph for this project (non-agent scans).", styles["Body"])
+        )
+
     doc.build(story)
     return buf.getvalue()
 

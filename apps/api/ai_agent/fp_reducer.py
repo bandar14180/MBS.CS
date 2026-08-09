@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 
-from apps.api.ai_agent.claude_client import ClaudeClient, SupportsComplete
+from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
 from apps.api.ai_agent.prompts.fp_reducer import (
     FP_REDUCER_PROMPT_VERSION,
     FP_REDUCER_SYSTEM,
@@ -28,7 +28,7 @@ class FPResult:
 
 class FPReducer:
     def __init__(self, client: SupportsComplete | None = None):
-        self._client = client or ClaudeClient()
+        self._client = client or get_ai_client()
 
     def assess(self, findings: list[dict]) -> FPResult:
         """`findings`: list of dicts each with at least `id`. Returns a

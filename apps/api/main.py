@@ -1,7 +1,26 @@
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from sqlalchemy import text
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
-from apps.api.core.config import get_settings
+from apps.api.core.config import configure_networking, get_settings
+from apps.api.core.logging import configure_logging
+from apps.api.core.middleware import (
+    ObservabilityMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
+from apps.api.core.observability import (
+    CONTENT_TYPE_LATEST,
+    get_correlation_id,
+    metrics_response_body,
+    register_reliability_collector,
+)
 from apps.api.modules.api_keys.router import router as api_keys_router
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.assistant.router import ai_router as ai_status_router
@@ -15,6 +34,7 @@ from apps.api.modules.authorization_scope.router import router as authorization_
 from apps.api.modules.dashboard.router import router as dashboard_router
 from apps.api.modules.projects.router import router as projects_router
 from apps.api.modules.reports.router import router as reports_router
+from apps.api.modules.scans.router import capabilities_router as scan_capabilities_router
 from apps.api.modules.scans.router import router as scans_router
 from apps.api.modules.schedules.router import router as schedules_router
 from apps.api.modules.users.router import router as users_router
@@ -22,39 +42,162 @@ from apps.api.modules.vulnerabilities.router import router as vulnerabilities_ro
 from apps.api.modules.workspaces.router import roles_router as roles_router
 from apps.api.modules.workspaces.router import router as workspaces_router
 
-settings = get_settings()
+logger = logging.getLogger("mbs.app")
 
-app = FastAPI(title=settings.app_name)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_allow_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+_ROUTERS = (
+    auth_router, users_router, workspaces_router, roles_router, projects_router,
+    dashboard_router, authorization_scope_router, scans_router, scan_capabilities_router, schedules_router,
+    assets_router, vulnerabilities_router, reports_router, assistant_router,
+    ai_status_router, billing_router, plans_public_router, notifications_router,
+    audit_router, api_keys_router,
 )
 
-app.include_router(auth_router, prefix=settings.api_v1_prefix)
-app.include_router(users_router, prefix=settings.api_v1_prefix)
-app.include_router(workspaces_router, prefix=settings.api_v1_prefix)
-app.include_router(roles_router, prefix=settings.api_v1_prefix)
-app.include_router(projects_router, prefix=settings.api_v1_prefix)
-app.include_router(dashboard_router, prefix=settings.api_v1_prefix)
-app.include_router(authorization_scope_router, prefix=settings.api_v1_prefix)
-app.include_router(scans_router, prefix=settings.api_v1_prefix)
-app.include_router(schedules_router, prefix=settings.api_v1_prefix)
-app.include_router(assets_router, prefix=settings.api_v1_prefix)
-app.include_router(vulnerabilities_router, prefix=settings.api_v1_prefix)
-app.include_router(reports_router, prefix=settings.api_v1_prefix)
-app.include_router(assistant_router, prefix=settings.api_v1_prefix)
-app.include_router(ai_status_router, prefix=settings.api_v1_prefix)
-app.include_router(billing_router, prefix=settings.api_v1_prefix)
-app.include_router(plans_public_router, prefix=settings.api_v1_prefix)
-app.include_router(notifications_router, prefix=settings.api_v1_prefix)
-app.include_router(audit_router, prefix=settings.api_v1_prefix)
-app.include_router(api_keys_router, prefix=settings.api_v1_prefix)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    configure_logging(settings.log_level, settings.log_json)
+    # Mirror proxy / custom-CA settings into the process env for all outbound clients.
+    configure_networking(settings)
+    # Fail fast if production is misconfigured (placeholder secrets, wildcard CORS, ...).
+    settings.validate_production()
+    # Runtime security checks that need DB context (M4.6.1): refuse to start in
+    # production on a superuser DB role (would bypass FORCE RLS / workspace isolation),
+    # and warn when derived-scope enforcement is disabled. Dev warns and continues.
+    from apps.api.core.db import engine
+    from apps.api.core.startup_checks import run_startup_security_checks
+
+    await run_startup_security_checks(
+        engine,
+        is_production=settings.is_production,
+        enforce_derived_scope=settings.scan_enforce_derived_scope,
+    )
+    # Non-fatal AI configuration report (no paid call at boot).
+    logger.info(
+        "ai_configuration",
+        extra={
+            "provider": settings.ai_provider,
+            "model": settings.active_ai_model,
+            "enabled": settings.ai_enabled,
+        },
+    )
+    if not settings.ai_enabled:
+        logger.warning(
+            "AI provider '%s' has no API key; AI features will degrade gracefully (503).",
+            settings.ai_provider,
+        )
+    yield
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "service": settings.app_name, "environment": settings.environment}
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+    # --- Middleware (added innermost-first; TrustedHost ends up outermost) ---
+    if settings.security_headers_enabled:
+        app.add_middleware(SecurityHeadersMiddleware, enable_hsts=settings.enable_hsts)
+    if settings.rate_limit_enabled:
+        app.add_middleware(
+            RateLimitMiddleware,
+            redis_url=settings.redis_url,
+            default=settings.rate_limit_default,
+            auth=settings.rate_limit_auth,
+            ai=settings.rate_limit_ai,
+        )
+    app.add_middleware(ObservabilityMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_allow_origins,
+        allow_credentials=True,
+        allow_methods=["*"] if not settings.is_production else ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+    )
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
+
+    # Phase 1.4: consistent error contract for every error path (additive; preserves
+    # the existing ``detail`` field, adds a stable error code + correlation id).
+    from apps.api.core.errors import register_exception_handlers
+
+    register_exception_handlers(app)
+
+    for router in _ROUTERS:
+        app.include_router(router, prefix=settings.api_v1_prefix)
+
+    @app.get("/health")
+    def health() -> dict:
+        """Liveness: the process is up. No dependency checks (never fails on a DB blip)."""
+        return {"status": "ok", "service": settings.app_name, "environment": settings.environment}
+
+    @app.get("/ready")
+    async def ready() -> Response:
+        """Readiness: can the app actually serve? Probes Postgres and Redis; 503 if either is down."""
+        checks: dict[str, str] = {}
+        ok = True
+        try:
+            from apps.api.core.db import engine
+
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        except Exception:  # noqa: BLE001
+            # Generic status to the client -- never leak raw driver/topology error text on
+            # this unauthenticated probe. Full exception + correlation context to the logs.
+            checks["database"] = "error"
+            ok = False
+            logger.warning(
+                "ready.check_failed component=database",
+                extra={"event": "ready.check_failed", "component": "database",
+                       "correlation_id": get_correlation_id()},
+                exc_info=True,
+            )
+        try:
+            import redis.asyncio as aioredis
+
+            client = aioredis.from_url(settings.redis_url)
+            await client.ping()
+            await client.aclose()
+            checks["redis"] = "ok"
+        except Exception:  # noqa: BLE001
+            checks["redis"] = "error"
+            ok = False
+            logger.warning(
+                "ready.check_failed component=redis",
+                extra={"event": "ready.check_failed", "component": "redis",
+                       "correlation_id": get_correlation_id()},
+                exc_info=True,
+            )
+        return JSONResponse({"status": "ready" if ok else "not_ready", "checks": checks},
+                            status_code=200 if ok else 503)
+
+    @app.get("/metrics")
+    def metrics(request: Request) -> Response:
+        """Prometheus scrape endpoint. Access is governed by METRICS_MODE
+        (secure by default): disabled | token | authenticated | public."""
+        mode = settings.metrics_mode
+        if mode == "disabled":
+            return Response(status_code=404)
+        if mode == "authenticated":
+            from apps.api.core.security import decode_access_token
+
+            authz = request.headers.get("authorization", "")
+            token = authz[7:] if authz[:7].lower() == "bearer " else ""
+            try:
+                decode_access_token(token)
+            except Exception:  # noqa: BLE001
+                return Response("Unauthorized", status_code=401)
+        elif mode != "public":  # "token" (default) or any unknown value -> fail closed
+            import hmac
+
+            supplied = request.headers.get("x-metrics-token", "")
+            if not settings.metrics_token or not hmac.compare_digest(supplied, settings.metrics_token):
+                return Response("Forbidden", status_code=403)
+        return Response(metrics_response_body(), media_type=CONTENT_TYPE_LATEST)
+
+    # F4: expose the Redis-backed reliability signals (DLQ depth + backup/retention failures) on
+    # this API process's /metrics only (idempotent; the worker's :9100 must not double-expose them).
+    register_reliability_collector()
+
+    return app
+
+
+app = create_app()

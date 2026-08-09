@@ -1,23 +1,18 @@
 import uuid
 
 from apps.api.core.config import get_settings
-# Reuse the object-storage client/bucket helpers from the evidence store rather
-# than duplicating boto3 setup.
-from apps.api.scanner_engine.evidence_store import _ensure_bucket, _get_s3_client
+from apps.api.scanner_engine.storage_provider import get_storage_provider
 
 
 def store_report(report_id: uuid.UUID, content: bytes, content_type: str = "application/pdf") -> str:
-    settings = get_settings()
-    client = _get_s3_client()
-    _ensure_bucket(client, settings.s3_bucket_reports)
+    """Persist a rendered report to object storage via the StorageProvider
+    interface (no dependency on another module's private client helpers)."""
+    bucket = get_settings().s3_bucket_reports
     key = f"reports/{report_id}.pdf"
-    client.put_object(Bucket=settings.s3_bucket_reports, Key=key, Body=content, ContentType=content_type)
-    return f"s3://{settings.s3_bucket_reports}/{key}"
+    return get_storage_provider(bucket).put(key, content, content_type)
 
 
 def fetch_report(storage_uri: str) -> bytes:
-    client = _get_s3_client()
     _, _, rest = storage_uri.partition("s3://")
     bucket, _, key = rest.partition("/")
-    obj = client.get_object(Bucket=bucket, Key=key)
-    return obj["Body"].read()
+    return get_storage_provider(bucket).get(key)
