@@ -16,8 +16,10 @@ boto3==1.35.24
 pyjwt==2.13.0
 bcrypt==4.2.1
 # MFA (Sprint 1): TOTP codes + Fernet encryption of the stored MFA secret.
+# cryptography pinned >=49.0.0: 43.0.1 carried 6 advisories (PYSEC-2026-35/1284/2141/3553/3554,
+# GHSA-537c-gmf6-5ccf); 49.0.0 is the first release fixing all of them.
 pyotp==2.9.0
-cryptography==43.0.1
+cryptography==49.0.0
 anthropic==0.34.2
 reportlab==4.2.2
 prometheus-client==0.21.0
