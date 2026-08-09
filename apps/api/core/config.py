@@ -231,6 +231,11 @@ class Settings(BaseSettings):
     backup_verification_enabled: bool = True      # verify each set after creation / before restore
     backup_pg_dump_cmd: str = "pg_dump"           # override to an absolute path / wrapper
     backup_pg_restore_cmd: str = "pg_restore"     # override to an absolute path / wrapper
+    # Phase F5: per-task Celery time limits so a large backup isn't cut off by the scan-tuned
+    # global limit. soft raises SoftTimeLimitExceeded in-task (graceful log + F4 metric); hard is
+    # the SIGKILL backstop and MUST exceed soft (enforced at wiring time).
+    backup_task_soft_time_limit_seconds: int = 7200   # 2h
+    backup_task_time_limit_seconds: int = 7800        # soft + 10min
 
     # Phase 5.2 -- retention purge FOUNDATION. Additive + DOUBLE-GATED OFF: nothing is ever
     # deleted unless retention_enabled is flipped true AND retention_dry_run is set false.
@@ -251,6 +256,11 @@ class Settings(BaseSettings):
     retention_refresh_token_grace_days: int = 7   # expired refresh tokens, N days past expiry
     retention_notification_days: int = 90         # in-app notifications
     retention_audit_days: int = 730               # audit events (long compliance window)
+    # Phase F5: per-task Celery time limits (independent of the scan-tuned global limit). soft <
+    # hard enforced at wiring time; a soft timeout is handled gracefully (per-workspace commits
+    # mean partial progress is kept and the next run resumes).
+    retention_task_soft_time_limit_seconds: int = 5400   # 90min
+    retention_task_time_limit_seconds: int = 6000        # soft + 10min
 
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
