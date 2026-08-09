@@ -81,6 +81,22 @@ if settings.backup_enabled:
         "schedule": float(settings.backup_interval_seconds),
     }
 
+
+# Phase 5.3.3: scheduled retention purge. Mirrors the backup gating -- the beat entry is added
+# ONLY when retention_enabled, so a disabled deployment never ticks it. The existing 5.2/5.3.2
+# `retention.purge` task ALSO self-gates (retention_enabled + retention_dry_run), so even a
+# stray tick can never delete unexpectedly. Runs on the default queue (never `scans`). Extracted
+# into a helper purely so the enabled/disabled branch is unit-testable without reloading here.
+def register_retention_schedule(app, cfg) -> None:
+    if cfg.retention_enabled:
+        app.conf.beat_schedule["retention-purge"] = {
+            "task": "retention.purge",
+            "schedule": float(cfg.retention_interval_seconds),
+        }
+
+
+register_retention_schedule(celery_app, settings)
+
 celery_app.conf.timezone = "UTC"
 
 

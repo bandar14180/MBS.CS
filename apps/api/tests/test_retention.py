@@ -1,10 +1,11 @@
-"""Phase 5.2 -- retention purge FOUNDATION tests.
+"""Phase 5.2 / 5.3.3 -- retention purge FOUNDATION + scheduling tests.
 
 Pure/offline: no DB, no broker. Proves the double-gated safety contract (disabled = no-op,
-dry-run never deletes, a live run is refused until 5.3), the config defaults, task
-registration, and the metrics/logging hooks. NOTHING here deletes or reads production data.
+dry-run never deletes), config defaults, task registration, the metrics/logging hooks, and the
+Phase 5.3.3 beat gating. NOTHING here deletes or reads production data.
 """
 import logging
+import types
 from datetime import datetime, timezone
 
 import pytest
@@ -149,3 +150,82 @@ def test_cli_dry_run_exits_zero_and_deletes_nothing(capsys):
     assert cli.main(["dry-run"]) == 0
     out = capsys.readouterr().out
     assert "mode=" in out and "total_would_delete=0" in out
+
+
+# --- Phase 5.3.3: beat scheduling ----------------------------------------------------------
+
+def test_retention_interval_default_present():
+    assert get_settings().retention_interval_seconds > 0
+
+
+def test_register_retention_schedule_gates_on_enabled():
+    """The beat entry is added ONLY when retention_enabled, and points at the EXISTING task
+    (no duplicate). Uses a throwaway app so the real celery_app.beat_schedule is untouched."""
+    from apps.api.celery_app.worker import register_retention_schedule
+
+    disabled_app = types.SimpleNamespace(conf=types.SimpleNamespace(beat_schedule={}))
+    register_retention_schedule(
+        disabled_app, types.SimpleNamespace(retention_enabled=False, retention_interval_seconds=86400)
+    )
+    assert "retention-purge" not in disabled_app.conf.beat_schedule  # safe default: no entry
+
+    enabled_app = types.SimpleNamespace(conf=types.SimpleNamespace(beat_schedule={}))
+    register_retention_schedule(
+        enabled_app, types.SimpleNamespace(retention_enabled=True, retention_interval_seconds=123.0)
+    )
+    entry = enabled_app.conf.beat_schedule["retention-purge"]
+    assert entry["task"] == "retention.purge"   # reuses the existing task, no new one
+    assert entry["schedule"] == 123.0
+
+
+def test_default_deployment_has_no_retention_beat_entry():
+    # With retention_enabled=False (default), the real worker must not schedule a purge.
+    from apps.api.celery_app.worker import celery_app
+
+    assert "retention-purge" not in celery_app.conf.beat_schedule
+
+
+def test_scheduled_task_disabled_skips_purge_entirely(monkeypatch):
+    from apps.api.celery_app.tasks import retention_tasks
+    from apps.api.retention import service as svc
+
+    s = get_settings()
+    monkeypatch.setattr(s, "retention_enabled", False)
+
+    reached_db = {"async": False}
+
+    async def _boom(*a, **k):  # run_purge must short-circuit BEFORE any async/DB work
+        reached_db["async"] = True
+        return {}
+
+    monkeypatch.setattr(svc, "_run_async", _boom)
+    out = retention_tasks.retention_purge_task.run()
+    assert out["mode"] == "disabled"
+    assert reached_db["async"] is False  # zero DB deletion path when disabled
+
+
+def test_scheduled_task_dry_run_deletes_nothing(monkeypatch):
+    from apps.api.celery_app.tasks import retention_tasks
+
+    s = get_settings()
+    monkeypatch.setattr(s, "retention_enabled", True)
+    monkeypatch.setattr(s, "retention_dry_run", True)
+    out = retention_tasks.retention_purge_task.run()
+    assert out["mode"] == "dry_run" and out["dry_run"] is True  # counts only, never deletes
+
+
+def test_scheduled_task_enabled_invokes_existing_purge_service(monkeypatch):
+    """Enabled mode delegates to the EXISTING 5.3.2 service -- the task adds no deletion logic."""
+    from apps.api.celery_app.tasks import retention_tasks
+    from apps.api.retention import service as svc
+
+    calls: list = []
+
+    def _spy(*a, **k):
+        calls.append((a, k))
+        return svc.RetentionRunResult(mode="live", dry_run=False, plans=[])
+
+    monkeypatch.setattr(svc, "run_purge", _spy)
+    out = retention_tasks.retention_purge_task.run()
+    assert len(calls) == 1            # the task calls the service exactly once
+    assert out["mode"] == "live"

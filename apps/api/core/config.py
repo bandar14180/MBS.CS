@@ -241,6 +241,7 @@ class Settings(BaseSettings):
     # query + deletion is Phase 5.3 -- this block only configures the foundation.
     retention_enabled: bool = False               # master switch; False -> purge is a no-op
     retention_dry_run: bool = True                # True -> plan only, never delete (belt + suspenders)
+    retention_interval_seconds: int = 86400       # Phase 5.3.3 beat cadence (default daily); only ticks when enabled
     retention_batch_size: int = 500               # max rows/objects touched per resource per run
     retention_min_keep: int = 10                  # always keep >= this many newest per resource
     retention_evidence_days: int = 90             # raw scan evidence objects + rows
