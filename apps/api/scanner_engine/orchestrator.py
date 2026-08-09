@@ -412,6 +412,27 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
     roe = RulesOfEngagement.from_config(scan.config)
     agent = RedTeamAgent()
 
+    # GET-OR-CREATE (F3.3): the engagement is one-per-scan (uq_engagement_state_scan). On a
+    # re-run (F2 transient retry / reaper reclaim / DLQ replay) one already exists -- REUSE it and
+    # SKIP the expensive AI agent loop entirely (skip-on-retry: no re-spend, no LLM calls). This
+    # also removes the IntegrityError a second INSERT would otherwise raise on retry. Finalize
+    # safely from the tool_runs the prior run already persisted, so run_scan's status aggregation
+    # reflects the real work without restarting the agent.
+    existing = await db.scalar(
+        select(EngagementState).where(EngagementState.scan_id == scan.id)
+    )
+    if existing is not None:
+        logger.info(
+            "scan.agent_engagement_reused scan=%s engagement_status=%s -- skipping AI agent loop on re-run",
+            scan.id, existing.status,
+            extra={"event": "scan.agent_engagement_reused", "scan_id": str(scan.id),
+                   "engagement_status": existing.status},
+        )
+        prior_statuses = list(
+            await db.scalars(select(ToolRun.status).where(ToolRun.scan_id == scan.id))
+        )
+        return [s for s in prior_statuses if s != "skipped_unauthorized"]
+
     state = EngagementState(
         workspace_id=scan.workspace_id,
         scan_id=scan.id,
@@ -421,6 +442,7 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
     )
     db.add(state)
     await db.flush()
+    await db.commit()  # F3.3: persist immediately so a retry reliably finds it and skips the loop
 
     discovered: list[CommonFinding] = []
     tool_statuses: list[str] = []
@@ -776,9 +798,21 @@ async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:
         from apps.api.ai_agent.usage_repo import persist_ai_usage
         from apps.api.core.config import get_settings
         from apps.api.core.observability import get_correlation_id
-        from apps.api.modules.attack.models import AttackMapping
+        from apps.api.modules.attack.models import AttackMapping, AttackNarrative
         from apps.api.modules.attack.service import kill_chain_steps, save_attack_narrative
         from apps.api.modules.vulnerabilities.models import Vulnerability
+
+        # IDEMPOTENCY (F3.2): a re-run (F2 transient retry / reaper reclaim / DLQ replay) must not
+        # re-invoke the AI correlator. The narrative is one-per-scan (uq_attack_narrative_scan); if
+        # it already exists, skip -- no duplicate AI charge, no duplicate ai_usage row. The
+        # deterministic ATT&CK mapping + kill-chain fallback are unchanged, so coverage is unaffected.
+        if await db.scalar(select(AttackNarrative.id).where(AttackNarrative.scan_id == scan.id)) is not None:
+            logger.info(
+                "scan.attack_narrative_reused scan=%s (already synthesized; skipping AI correlator)",
+                scan.id,
+                extra={"event": "scan.attack_narrative_reused", "scan_id": str(scan.id)},
+            )
+            return
 
         settings = get_settings()
         vulns = list(
