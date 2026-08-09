@@ -124,6 +124,11 @@ def run_backup(settings, *, store=None, runner=None) -> BackupResult:
 
     duration = time.monotonic() - started
     m.record_backup("full", success=ok, duration_s=duration)
+    if not ok:
+        # F4: reliability signal exposed via the API /metrics ReliabilityCollector (best-effort).
+        from apps.api.core.observability import record_backup_failure
+
+        record_backup_failure()
     m.logger.info(
         "backup.completed set=%s ok=%s duration=%.2fs", set_dir.name, ok, duration,
         extra={"event": "backup.completed" if ok else "backup.failed", "set": set_dir.name,

@@ -15,7 +15,12 @@ from apps.api.core.middleware import (
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
 )
-from apps.api.core.observability import CONTENT_TYPE_LATEST, get_correlation_id, metrics_response_body
+from apps.api.core.observability import (
+    CONTENT_TYPE_LATEST,
+    get_correlation_id,
+    metrics_response_body,
+    register_reliability_collector,
+)
 from apps.api.modules.api_keys.router import router as api_keys_router
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.assistant.router import ai_router as ai_status_router
@@ -187,6 +192,10 @@ def create_app() -> FastAPI:
             if not settings.metrics_token or not hmac.compare_digest(supplied, settings.metrics_token):
                 return Response("Forbidden", status_code=403)
         return Response(metrics_response_body(), media_type=CONTENT_TYPE_LATEST)
+
+    # F4: expose the Redis-backed reliability signals (DLQ depth + backup/retention failures) on
+    # this API process's /metrics only (idempotent; the worker's :9100 must not double-expose them).
+    register_reliability_collector()
 
     return app
 

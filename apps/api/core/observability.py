@@ -143,3 +143,94 @@ def record_scan_relayed(count: int) -> None:
 
 def metrics_response_body() -> bytes:
     return generate_latest() if _PROM else b""
+
+
+# --- F4: reliability signals (DLQ depth + backup/retention failures) -----------------------
+# These read from a SHARED source (Redis) at scrape time and are exposed on the API /metrics
+# endpoint, so they surface across processes WITHOUT the worker prefork/multiprocess machinery.
+# Additive: nothing above changes. Registered API-side only (see register_reliability_collector),
+# so they appear once, on the mbs-api scrape target.
+DLQ_REDIS_KEY = "dlq:scans.run_scan"                          # must match scan_tasks.DLQ_KEY
+BACKUP_FAILURES_KEY = "mbs:reliability:backup_failures_total"
+RETENTION_FAILURES_KEY = "mbs:reliability:retention_failures_total"
+
+
+def _reliability_redis():
+    """Best-effort Redis client for the reliability signals; None if redis/config is unavailable."""
+    try:
+        import redis
+
+        from apps.api.core.config import get_settings
+
+        return redis.from_url(get_settings().redis_url)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _incr_reliability(key: str) -> None:
+    client = _reliability_redis()
+    if client is None:
+        return
+    try:
+        client.incr(key)
+    except Exception:  # noqa: BLE001 -- reliability accounting must never break the caller
+        pass
+
+
+def record_backup_failure() -> None:
+    """Count one failed backup run (F4). Best-effort Redis INCR; never raises."""
+    _incr_reliability(BACKUP_FAILURES_KEY)
+
+
+def record_retention_failure() -> None:
+    """Count one failed retention purge run (F4). Best-effort Redis INCR; never raises."""
+    _incr_reliability(RETENTION_FAILURES_KEY)
+
+
+if _PROM:
+    from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+
+    class ReliabilityCollector:
+        """Yields DLQ depth + backup/retention failure counters read from Redis at scrape time.
+        Fully best-effort: any Redis error yields nothing and never breaks a /metrics scrape."""
+
+        def collect(self):
+            client = _reliability_redis()
+            if client is None:
+                return
+            try:
+                depth = int(client.llen(DLQ_REDIS_KEY) or 0)
+                backup_failures = int(client.get(BACKUP_FAILURES_KEY) or 0)
+                retention_failures = int(client.get(RETENTION_FAILURES_KEY) or 0)
+            except Exception:  # noqa: BLE001
+                return
+            dlq = GaugeMetricFamily("mbs_dlq_depth", "Scan dead-letter queue depth (LLEN)", labels=["queue"])
+            dlq.add_metric(["scans.run_scan"], float(depth))
+            yield dlq
+            cb = CounterMetricFamily("mbs_backup_failures", "Backup runs that failed (reliability signal)")
+            cb.add_metric([], float(backup_failures))
+            yield cb
+            cr = CounterMetricFamily("mbs_retention_failures", "Retention purge runs that failed (reliability signal)")
+            cr.add_metric([], float(retention_failures))
+            yield cr
+
+
+_reliability_registered = False
+
+
+def register_reliability_collector() -> bool:
+    """Register the Redis-backed ReliabilityCollector on the default Prometheus registry.
+    Idempotent + best-effort. Call from the API process ONLY (not the worker, whose :9100 also
+    serves the default registry) so the signals appear once, on api:8000/metrics. Returns True
+    iff a collector was registered by THIS call."""
+    global _reliability_registered
+    if not _PROM or _reliability_registered:
+        return False
+    try:
+        from prometheus_client import REGISTRY
+
+        REGISTRY.register(ReliabilityCollector())
+        _reliability_registered = True
+        return True
+    except Exception:  # noqa: BLE001 -- never break app startup on a metrics-wiring issue
+        return False

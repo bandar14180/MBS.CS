@@ -53,6 +53,8 @@ def test_alert_rules_present_and_well_formed():
         "MbsApiDown", "MbsWorkerDown", "MbsApiHighServerErrorRate",
         "MbsHighScanFailureRatio", "MbsExcessiveToolFailures", "MbsAiCostHigh",
         "MbsScanRecoveryActivity",
+        # F4 reliability alerts
+        "MbsDlqBacklog", "MbsBackupFailing", "MbsRetentionFailing",
     ):
         assert expected in names, f"missing alert {expected}"
     assert {"critical", "warning"} <= severities
@@ -64,7 +66,9 @@ def test_alert_expressions_reference_existing_metrics():
     # every metric referenced is one we actually export (core/observability.py) or `up`
     for metric in ("mbs_http_requests_total", "mbs_scan_failed_total", "mbs_scan_success_total",
                    "mbs_tool_failure_total", "mbs_ai_cost_usd_total",
-                   "mbs_scan_reaped_total", "mbs_scan_relayed_total"):
+                   "mbs_scan_reaped_total", "mbs_scan_relayed_total",
+                   # F4 reliability metrics (exposed by the API ReliabilityCollector)
+                   "mbs_dlq_depth", "mbs_backup_failures_total", "mbs_retention_failures_total"):
         assert metric in exprs
     assert 'up{job="mbs-api"}' in exprs and 'up{job="mbs-worker"}' in exprs
 

@@ -167,7 +167,15 @@ def run_purge(
                "batch_size": settings.retention_batch_size, "min_keep": settings.retention_min_keep},
     )
 
-    agg = asyncio.run(_run_async(settings, effective_dry_run, cutoffs))
+    try:
+        agg = asyncio.run(_run_async(settings, effective_dry_run, cutoffs))
+    except Exception:
+        # F4: record a reliability signal (exposed via the API /metrics ReliabilityCollector)
+        # then re-raise -- a failed purge must still surface to the caller / Celery.
+        from apps.api.core.observability import record_retention_failure
+
+        record_retention_failure()
+        raise
 
     plans: list[ResourcePlan] = []
     for res in PROCESSED:

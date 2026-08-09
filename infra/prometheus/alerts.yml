@@ -65,3 +65,28 @@ groups:
         annotations:
           summary: "Scan recovery paths active (backlog / worker-loss proxy)"
           description: "The orphan reaper or queued relay fired -- indicates worker loss or queue-dispatch backlog."
+
+      # F4: reliability signals exposed by the API-side Redis-backed ReliabilityCollector.
+      - alert: MbsDlqBacklog
+        expr: mbs_dlq_depth > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scan dead-letter queue backlog"
+          description: "{{ $value }} scan(s) have sat in the dead-letter queue for >15m -- permanently failing scans need inspection/replay (python -m apps.api.celery_app.dlq list)."
+
+      - alert: MbsBackupFailing
+        expr: increase(mbs_backup_failures_total[6h]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Backup run failed"
+          description: "A scheduled backup failed in the last 6h -- disaster-recovery coverage is at risk."
+
+      - alert: MbsRetentionFailing
+        expr: increase(mbs_retention_failures_total[6h]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Retention purge failed"
+          description: "A retention purge run failed in the last 6h."
