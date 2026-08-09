@@ -1,6 +1,7 @@
 import uuid
 from dataclasses import dataclass
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
@@ -72,6 +73,23 @@ class AIPlanner:
         active_testing_allowed: bool,
         prior_findings_summary: str = "",
     ) -> PlanResult:
+        # IDEMPOTENCY (F3.1): a scan can be re-run -- Celery F2 transient retry, reaper reclaim,
+        # or DLQ replay all re-execute run_scan for a scan that already ran the planner. Reuse
+        # the persisted plan instead of calling the LLM again: no duplicate AI charge, no
+        # duplicate ai_plans row, and (no provider call -> collect_ai_usage sink stays empty) no
+        # duplicate ai_usage row. Newest-first so a legacy scan with pre-F3 duplicate plans reuses
+        # the latest. A first-run scan has no plan -> unchanged behavior (falls through to the LLM).
+        existing = await db.scalar(
+            select(AIPlan).where(AIPlan.scan_id == scan_id).order_by(AIPlan.created_at.desc()).limit(1)
+        )
+        if existing is not None:
+            return PlanResult(
+                tool_sequence=list(existing.tool_sequence or []),
+                reasoning_summary=existing.reasoning_summary or "",
+                model_version=existing.model_version,
+                prompt_version=existing.prompt_version,
+            )
+
         user = PLANNER_USER_TEMPLATE.format(
             target_type=target_type,
             target_value=target_value,

@@ -38,6 +38,11 @@ class FakeDB:
     async def flush(self):
         pass
 
+    async def scalar(self, *args, **kwargs):
+        # F3.1: the planner now checks for an existing AIPlan first; a fresh scan has none,
+        # so this stub returns None -> the first-run path (LLM called, plan persisted).
+        return None
+
 
 # --- ClaudeClient JSON extraction (pure) ---
 
