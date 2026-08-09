@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     mfa_issuer: str = "MBS.CS"
     mfa_challenge_ttl_seconds: int = 300
     mfa_encryption_key: str = ""
+    # Per-user MFA brute-force protection (Step 3, Redis-backed, independent of IP rate limiting).
+    mfa_max_attempts: int = 5           # failed second-factor attempts before a temporary lockout
+    mfa_lockout_seconds: int = 900      # lockout window (15 min); the failure counter's TTL
 
     # --- AI Agent Service ---------------------------------------------------
     # Which provider the AI layer uses. Business logic never reads this -- only
@@ -381,6 +384,9 @@ class Settings(BaseSettings):
             problems.append("RATE_LIMIT_ENABLED must be true in production (unrestricted limits are unsafe).")
         if self.metrics_mode == "public":
             problems.append("METRICS_MODE must not be 'public' in production.")
+        # MFA Step 3: production must be able to encrypt TOTP secrets at rest.
+        if not self.mfa_encryption_key:
+            problems.append("MFA_ENCRYPTION_KEY must be set in production (MFA cannot function without it).")
         # M4.6.1 / F2: refuse to run in production with derived-target authorization
         # enforcement disabled (unless explicitly, emergency-acknowledged).
         from apps.api.core.startup_checks import derived_scope_problem

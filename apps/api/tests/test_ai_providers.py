@@ -151,6 +151,7 @@ def _hardened(**overrides) -> Settings:
         ai_provider="openrouter",
         rate_limit_enabled=True,
         metrics_mode="token",
+        mfa_encryption_key="a-real-mfa-encryption-key",
     )
     base.update(overrides)
     return Settings(**base)
@@ -158,6 +159,14 @@ def _hardened(**overrides) -> Settings:
 
 def test_validate_production_accepts_hardened_config() -> None:
     _hardened().validate_production()  # must not raise
+
+
+def test_validate_production_requires_mfa_encryption_key() -> None:
+    import pytest
+
+    with pytest.raises(RuntimeError) as exc:
+        _hardened(mfa_encryption_key="").validate_production()
+    assert "MFA_ENCRYPTION_KEY" in str(exc.value)
 
 
 def test_validate_production_requires_rate_limiting() -> None:
