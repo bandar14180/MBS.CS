@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,6 +13,8 @@ class AIPlan(Base):
     (blueprint §5). One plan per scan; the scan references it via scan_id."""
 
     __tablename__ = "ai_plans"
+    # F3.4: one AI plan per scan -- the DB backstop to the F3.1 planner-reuse guard.
+    __table_args__ = (UniqueConstraint("scan_id", name="uq_ai_plans_scan"),)
 
     id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scan_id: Mapped[uuid.UUID] = mapped_column(
