@@ -16,6 +16,7 @@ _FILE_BACKED_SECRETS = (
     "ANTHROPIC_API_KEY",
     "OPENROUTER_API_KEY",
     "METRICS_TOKEN",
+    "MFA_ENCRYPTION_KEY",
 )
 
 # Placeholder / insecure defaults that must never survive into production.
@@ -60,6 +61,15 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "change-me-in-.env"
     jwt_access_token_ttl_minutes: int = 15
     jwt_refresh_token_ttl_days: int = 7
+
+    # MFA (Sprint 1 foundation). mfa_encryption_key is the master secret used to derive a Fernet
+    # key that encrypts each user's TOTP secret at rest (mfa_secret_encrypted); it supports the
+    # <NAME>_FILE convention via _FILE_BACKED_SECRETS (Docker Secrets / Vault). Empty by default
+    # -- MFA helpers raise a clear error if used unconfigured. No login behavior depends on these
+    # yet (foundation only). mfa_challenge_ttl_seconds bounds the interim MFA-challenge token.
+    mfa_issuer: str = "MBS.CS"
+    mfa_challenge_ttl_seconds: int = 300
+    mfa_encryption_key: str = ""
 
     # --- AI Agent Service ---------------------------------------------------
     # Which provider the AI layer uses. Business logic never reads this -- only

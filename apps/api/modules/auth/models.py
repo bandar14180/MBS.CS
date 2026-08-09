@@ -22,3 +22,19 @@ class RefreshToken(Base):
     replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("refresh_tokens.id", ondelete="SET NULL"), nullable=True
     )
+
+
+class MfaRecoveryCode(Base):
+    """One-time MFA recovery code, stored HASHED (Sprint 1 foundation). User-scoped like
+    refresh_tokens -- deliberately NOT workspace-RLS, since auth happens before any workspace
+    context. Redeemed by setting used_at; code_hash is unique+indexed for O(1) lookup."""
+
+    __tablename__ = "mfa_recovery_codes"
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
