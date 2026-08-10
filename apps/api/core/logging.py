@@ -2,6 +2,8 @@ import datetime as _dt
 import json
 import logging
 
+from apps.api.core.log_redaction import redact_text, redact_value
+
 # Standard LogRecord attributes -- anything NOT in here that a caller passed via
 # `logger.info(..., extra={...})` is emitted as a structured field.
 _RESERVED = {
@@ -29,14 +31,23 @@ class JSONLogFormatter(logging.Formatter):
             "ts": _dt.datetime.fromtimestamp(record.created, _dt.timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            # Centralized redaction: never emit a secret/PII, whatever the call site passed.
+            "message": redact_text(record.getMessage()),
         }
         for key, value in record.__dict__.items():
             if key not in _RESERVED and not key.startswith("_") and key not in payload:
-                payload[key] = value
+                payload[key] = redact_value(key, value)
         if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
+            payload["exc_info"] = redact_text(self.formatException(record.exc_info))
         return json.dumps(payload, default=str)
+
+
+class RedactingTextFormatter(logging.Formatter):
+    """Plain-text (dev) formatter that runs the fully rendered line through the same
+    redaction pass as the JSON path, so local logs never leak secrets/PII either."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_text(super().format(record))
 
 
 def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
@@ -52,6 +63,6 @@ def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
         handler.setFormatter(JSONLogFormatter())
     else:
         handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s [%(correlation_id)s] %(message)s")
+            RedactingTextFormatter("%(asctime)s %(levelname)s %(name)s [%(correlation_id)s] %(message)s")
         )
     root.addHandler(handler)
