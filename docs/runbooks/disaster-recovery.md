@@ -70,3 +70,65 @@ does not interfere with scan execution. Disabled by default (no beat tick when o
 The runtime must have the postgres client (`pg_dump`/`pg_restore`) on `PATH`, or point
 `BACKUP_PG_DUMP_CMD` / `BACKUP_PG_RESTORE_CMD` at an absolute path / wrapper. Object storage
 uses the app's existing `S3_*` credentials (never logged, never passed on argv).
+
+---
+
+# Production hardening (DR-1 … DR-4)
+
+All additive, feature-flagged, and default-OFF. Enabling them does not change the set layout or
+the CLI above; encryption/off-site are transparent to `verify`/`restore`.
+
+## DR-1 — Durable backup storage
+`worker-default` (which runs `backup.run`) mounts the **`backup_data` named volume** at
+`/srv/backups`, so backup sets **survive container recreation/redeploy**. The production overlay
+sets `BACKUP_ENABLED=true` (and gives `beat` the same flag so it registers the tick). Bind
+`backup_data` to a durable/off-host path for real deployments, and pair with DR-3.
+
+## DR-2 — Encryption at rest (AES-256-GCM)
+`BACKUP_ENCRYPTION_ENABLED=true` encrypts each set's `db.dump` + `objects.tar.gz` **in place**
+(same filenames; content becomes ciphertext with an `MBSENC1` header). The key is derived from
+`BACKUP_ENCRYPTION_KEY` (supports `BACKUP_ENCRYPTION_KEY_FILE` — Docker Secrets / Vault).
+`verify`/`restore` decrypt transparently; a **wrong key fails closed** (GCM tag mismatch →
+verification returns false, restore aborts). Existing unencrypted sets stay readable. Production
+must set the key (enforced by `validate_production`). Config: `BACKUP_ENCRYPTION_ENABLED`,
+`BACKUP_ENCRYPTION_KEY(_FILE)`.
+
+## DR-3 — Off-site replication (provider-agnostic)
+After a **verified** set, `BACKUP_OFFSITE_ENABLED=true` replicates it off-host. Providers:
+`local` (copy to a mounted/off-host dir, `BACKUP_OFFSITE_DIR`) or `s3` (upload to **any**
+S3-compatible endpoint — AWS/MinIO/Wasabi/B2 — via `BACKUP_OFFSITE_BUCKET`,
+`BACKUP_OFFSITE_PREFIX`, `BACKUP_OFFSITE_ENDPOINT_URL`, and credentials that fall back to the
+app's `S3_*`). Best-effort: a replication failure is metered (`mbs_backup_offsite_failed_total`)
+but never fails the backup. Extend by implementing `OffsiteTarget` in `apps/api/dr/offsite.py`.
+
+## DR-4 — Reliability monitoring + recovery evidence
+- **Freshness:** each successful backup stamps a Redis timestamp; the API `/metrics`
+  `ReliabilityCollector` exposes **`mbs_backup_age_seconds`**. Alert **`MbsBackupStale`**
+  (`> 30h`) catches a silently stalled pipeline (metrics counters: also
+  `mbs_backup_offsite_*`, `mbs_dr_drill_*`).
+- **Manual DR drill (evidence):**
+  ```bash
+  python -m apps.api.dr drill [--set <set_dir>] --target-db-url <SCRATCH_DB> [--objects]
+  ```
+  Restores the latest (or given) **verified** set into a **scratch** DB (refuses the live
+  `DATABASE_URL`), runs smoke checks (connect, tables, RLS policies, FORCE-RLS tables), and
+  writes a JSON **evidence artifact** to `<BACKUP_DIRECTORY>/drills/drill-<ts>.json`. Exit
+  `0`/`1`. Restore drills are **not auto-scheduled** at this stage (run in CI/cron manually).
+  Config: `BACKUP_DRILL_DATABASE_URL` (optional default scratch target).
+
+## Recovery evidence — the four required scenarios
+- **Database loss** → `dr restore` / `dr drill` (pg_restore into a clean DB; migration-consistent).
+- **Object storage failure** → object verify + `restore --objects` (faithful metadata).
+- **Accidental data deletion** → timestamped retained sets (`min_keep` never erases the newest);
+  restore point-in-time-of-backup. *(MinIO versioning/object-lock recommended — see DR-5.)*
+- **Infrastructure failure** → durable volume (DR-1) + off-site copy (DR-3) survive host loss.
+
+## DR-5 — Future production evolution (NOT implemented)
+Deferred, larger-scope items for a future phase:
+- **PITR** — PostgreSQL WAL archiving + base backups to shrink RPO from the dump interval (~24h)
+  toward minutes/seconds. Requires archive storage + a WAL pipeline (e.g. pgBackRest/wal-g).
+- **MinIO versioning + object-lock (WORM)** — defend the live buckets against accidental
+  deletion/ransomware directly, independent of the periodic backup.
+- **Scheduled automated restore drills** — promote the manual `dr drill` to a gated periodic job
+  once a dedicated scratch environment exists.
+- **RTO/RPO targets** — formalize and measure during drills.

@@ -83,6 +83,17 @@ groups:
           summary: "Backup run failed"
           description: "A scheduled backup failed in the last 6h -- disaster-recovery coverage is at risk."
 
+      # DR-4: freshness. Catches a SILENTLY stalled pipeline (no explicit failure, just no new
+      # successful set) -- e.g. beat stopped or the task never ran. 30h tolerates a daily cadence
+      # plus slack. mbs_backup_age_seconds is only emitted once a backup has ever succeeded.
+      - alert: MbsBackupStale
+        expr: mbs_backup_age_seconds > 108000
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful backup in over 30h"
+          description: "The last successful backup is {{ $value | humanizeDuration }} old -- the backup pipeline may be stalled (beat/worker-default down or task erroring)."
+
       - alert: MbsRetentionFailing
         expr: increase(mbs_retention_failures_total[6h]) > 0
         for: 5m

@@ -104,6 +104,12 @@ services:
     env_file:
       - ../.env
     stop_grace_period: 60s
+    # DR-1: the scheduled backup (backup.run) writes timestamped sets under BACKUP_DIRECTORY
+    # (default /srv/backups). Mount a NAMED VOLUME so backup artifacts SURVIVE container
+    # recreation/redeploy (a container-local path would be wiped). In production, bind this to a
+    # durable/off-host path and pair with off-site replication (DR-3).
+    volumes:
+      - backup_data:/srv/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -160,3 +166,5 @@ volumes:
   postgres_data:
   minio_data:
   web_node_modules:
+  # DR-1: durable storage for backup sets so they persist across worker-default recreation.
+  backup_data:

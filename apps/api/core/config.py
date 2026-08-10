@@ -17,6 +17,10 @@ _FILE_BACKED_SECRETS = (
     "OPENROUTER_API_KEY",
     "METRICS_TOKEN",
     "MFA_ENCRYPTION_KEY",
+    # DR-2 / DR-3: backup encryption key + off-site replication secret (same Vault/Docker
+    # Secrets seam). Empty by default; only required when the matching feature is enabled.
+    "BACKUP_ENCRYPTION_KEY",
+    "BACKUP_OFFSITE_SECRET_KEY",
 )
 
 # Placeholder / insecure defaults that must never survive into production.
@@ -250,6 +254,29 @@ class Settings(BaseSettings):
     backup_task_soft_time_limit_seconds: int = 7200   # 2h
     backup_task_time_limit_seconds: int = 7800        # soft + 10min
 
+    # DR-2 -- backup encryption at rest. Additive + OPT-IN (default OFF -> unencrypted sets,
+    # identical to prior behavior). When enabled, each set's db.dump + objects archive are
+    # encrypted in place with AES-256-GCM; the key is derived from BACKUP_ENCRYPTION_KEY
+    # (supports the <NAME>_FILE convention). verify/restore transparently decrypt; a wrong key
+    # fails closed (authentication tag mismatch). Existing unencrypted sets stay readable.
+    backup_encryption_enabled: bool = False
+    backup_encryption_key: str = ""
+    # DR-3 -- off-site replication. Provider-agnostic: after a verified set, replicate it to an
+    # off-host target. Default OFF. `local` copies to a mounted/off-host directory; `s3` uploads
+    # to ANY S3-compatible endpoint (AWS, MinIO, Wasabi, ...) -- never hard-coded to one cloud.
+    backup_offsite_enabled: bool = False
+    backup_offsite_provider: str = "local"        # local | s3
+    backup_offsite_dir: str = ""                  # local provider: destination base directory
+    backup_offsite_bucket: str = ""               # s3 provider: destination bucket
+    backup_offsite_prefix: str = "mbs-backups"    # s3 provider: key prefix
+    backup_offsite_endpoint_url: str = ""         # s3 provider: custom endpoint (blank -> AWS default)
+    backup_offsite_access_key: str = ""           # s3 provider: falls back to S3_ACCESS_KEY if blank
+    backup_offsite_secret_key: str = ""           # s3 provider: falls back to S3_SECRET_KEY if blank
+    backup_offsite_region: str = "us-east-1"
+    # DR-4 -- manual DR drill scratch database. run_drill restores the latest verified set here
+    # and refuses to touch the live DATABASE_URL. Empty -> a target must be passed on the CLI.
+    backup_drill_database_url: str = ""
+
     # Phase 5.2 -- retention purge FOUNDATION. Additive + DOUBLE-GATED OFF: nothing is ever
     # deleted unless retention_enabled is flipped true AND retention_dry_run is set false.
     # Ships enabled=False + dry_run=True so any manual/scheduled run only ever PLANS (logs +
@@ -387,6 +414,9 @@ class Settings(BaseSettings):
         # MFA Step 3: production must be able to encrypt TOTP secrets at rest.
         if not self.mfa_encryption_key:
             problems.append("MFA_ENCRYPTION_KEY must be set in production (MFA cannot function without it).")
+        # DR-2: if backup encryption is enabled, the key must be present (fail closed).
+        if self.backup_enabled and self.backup_encryption_enabled and not self.backup_encryption_key:
+            problems.append("BACKUP_ENCRYPTION_KEY must be set when BACKUP_ENCRYPTION_ENABLED is true.")
         # M4.6.1 / F2: refuse to run in production with derived-target authorization
         # enforcement disabled (unless explicitly, emergency-acknowledged).
         from apps.api.core.startup_checks import derived_scope_problem

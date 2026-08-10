@@ -153,6 +153,9 @@ def metrics_response_body() -> bytes:
 DLQ_REDIS_KEY = "dlq:scans.run_scan"                          # must match scan_tasks.DLQ_KEY
 BACKUP_FAILURES_KEY = "mbs:reliability:backup_failures_total"
 RETENTION_FAILURES_KEY = "mbs:reliability:retention_failures_total"
+# DR-4: unix timestamp of the last SUCCESSFUL backup set; drives mbs_backup_age_seconds so a
+# silently-stalled backup pipeline is alertable even while no explicit failure is recorded.
+BACKUP_LAST_SUCCESS_KEY = "mbs:reliability:backup_last_success_ts"
 
 
 def _reliability_redis():
@@ -187,6 +190,20 @@ def record_retention_failure() -> None:
     _incr_reliability(RETENTION_FAILURES_KEY)
 
 
+def record_backup_success(ts: int | None = None) -> None:
+    """DR-4: stamp the time of the last successful backup set. Best-effort Redis SET; never
+    raises. Read back at scrape time as mbs_backup_age_seconds."""
+    import time as _time
+
+    client = _reliability_redis()
+    if client is None:
+        return
+    try:
+        client.set(BACKUP_LAST_SUCCESS_KEY, int(ts if ts is not None else _time.time()))
+    except Exception:  # noqa: BLE001 -- reliability accounting must never break the caller
+        pass
+
+
 if _PROM:
     from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
@@ -202,6 +219,7 @@ if _PROM:
                 depth = int(client.llen(DLQ_REDIS_KEY) or 0)
                 backup_failures = int(client.get(BACKUP_FAILURES_KEY) or 0)
                 retention_failures = int(client.get(RETENTION_FAILURES_KEY) or 0)
+                last_backup_ts = int(client.get(BACKUP_LAST_SUCCESS_KEY) or 0)
             except Exception:  # noqa: BLE001
                 return
             dlq = GaugeMetricFamily("mbs_dlq_depth", "Scan dead-letter queue depth (LLEN)", labels=["queue"])
@@ -213,6 +231,14 @@ if _PROM:
             cr = CounterMetricFamily("mbs_retention_failures", "Retention purge runs that failed (reliability signal)")
             cr.add_metric([], float(retention_failures))
             yield cr
+            # DR-4: seconds since the last successful backup (only when we have ever recorded one,
+            # so a never-backed-up dev/CI target doesn't emit a misleading age).
+            if last_backup_ts > 0:
+                import time as _time
+
+                age = GaugeMetricFamily("mbs_backup_age_seconds", "Seconds since the last successful backup set")
+                age.add_metric([], max(0.0, _time.time() - last_backup_ts))
+                yield age
 
 
 _reliability_registered = False
