@@ -24,13 +24,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.core.security import hash_password, verify_password
 from apps.api.modules.api_keys.models import ApiKey
+from apps.api.modules.audit.models import AuditEvent
 from apps.api.modules.auth.mfa_guard import security_event
 from apps.api.modules.auth.models import MfaRecoveryCode, RefreshToken
+from apps.api.modules.reports.models import Report
+from apps.api.modules.scans.models import Scan
 from apps.api.modules.users.models import Role, User, WorkspaceMember
 from apps.api.modules.users.schemas import (
     DataExportResponse,
     ExportedApiKey,
+    ExportedAuditEvent,
     ExportedMembership,
+    ExportedReport,
+    ExportedScan,
     ExportProfile,
     ExportSummary,
 )
@@ -39,6 +45,10 @@ from apps.api.modules.workspaces.models import Workspace
 # Value written over a deleted user's denormalized email in the audit log. Non-PII,
 # constant, and clearly signals an erased actor while keeping actor_user_id intact.
 ANONYMIZED_ACTOR_EMAIL = "[deleted]"
+
+# Upper bound on rows per collection in an export -- keeps a data-subject export bounded in
+# memory/size. Newest-first, so the most recent activity is always included.
+EXPORT_ROW_LIMIT = 5000
 
 
 async def export_user_data(db: AsyncSession, user: User) -> DataExportResponse:
@@ -79,7 +89,12 @@ async def export_user_data(db: AsyncSession, user: User) -> DataExportResponse:
         )
         for k in keys
     ]
-    return DataExportResponse(
+
+    workspace_ids = [m.workspace_id for m in memberships]
+    scans = await _export_scans(db, user.id)
+    reports, audit_events = await _export_rls_scoped(db, user.id, workspace_ids)
+
+    response = DataExportResponse(
         generated_at=datetime.now(timezone.utc),
         profile=ExportProfile(
             id=user.id,
@@ -93,13 +108,101 @@ async def export_user_data(db: AsyncSession, user: User) -> DataExportResponse:
         ),
         workspaces=memberships,
         api_keys=api_keys,
+        scans=scans,
+        reports=reports,
+        audit_events=audit_events,
         activity_summary=ExportSummary(
             workspace_count=len(memberships),
             api_key_count=len(api_keys),
             active_api_key_count=sum(1 for k in keys if not k.revoked),
+            scan_count=len(scans),
+            report_count=len(reports),
+            audit_event_count=len(audit_events),
             last_login_at=user.last_login_at,
         ),
     )
+    # Audit the access itself (GDPR accountability). Counts only -- never the exported data.
+    security_event(
+        "account.exported", user_id=user.id,
+        scans=len(scans), reports=len(reports), audit_events=len(audit_events),
+    )
+    return response
+
+
+async def _export_scans(db: AsyncSession, user_id: uuid.UUID) -> list[ExportedScan]:
+    """Scans the user initiated. `scans` is RLS-EXEMPT by design (worker bootstrap), so it is
+    filtered explicitly by initiated_by -- returning ONLY this user's scans, never a whole
+    workspace. Metadata only; scan config/evidence/tool output are never included."""
+    rows = await db.scalars(
+        select(Scan)
+        .where(Scan.initiated_by == user_id)
+        .order_by(Scan.created_at.desc())
+        .limit(EXPORT_ROW_LIMIT)
+    )
+    return [
+        ExportedScan(
+            id=s.id,
+            workspace_id=s.workspace_id,
+            scan_type=s.scan_type,
+            status=s.status,
+            created_at=s.created_at,
+            started_at=s.started_at,
+            completed_at=s.completed_at,
+        )
+        for s in rows
+    ]
+
+
+async def _export_rls_scoped(
+    db: AsyncSession, user_id: uuid.UUID, workspace_ids: list[uuid.UUID]
+) -> tuple[list[ExportedReport], list[ExportedAuditEvent]]:
+    """Reports the user generated + audit events where the user was the actor. Both tables are
+    FORCE-RLS, so we set the workspace GUC per membership before querying (a query without the GUC
+    would be RLS-filtered to zero under a non-superuser production role). Scoping to the user's own
+    memberships + filtering by generated_by/actor_user_id preserves tenant isolation -- another
+    tenant's data can never appear. Reports exclude storage_uri; audit events exclude free-text."""
+    reports: list[ExportedReport] = []
+    audit_events: list[ExportedAuditEvent] = []
+    for ws_id in workspace_ids:
+        await db.execute(
+            text("SELECT set_config('app.current_workspace_id', :wid, true)"),
+            {"wid": str(ws_id)},
+        )
+        rrows = await db.scalars(
+            select(Report)
+            .where(Report.generated_by == user_id)
+            .order_by(Report.generated_at.desc())
+            .limit(EXPORT_ROW_LIMIT)
+        )
+        for r in rrows:
+            reports.append(
+                ExportedReport(
+                    id=r.id,
+                    project_id=r.project_id,
+                    type=r.type,
+                    format=r.format,
+                    scan_ids=[str(sid) for sid in (r.scan_ids or [])],
+                    generated_at=r.generated_at,
+                )
+            )
+        arows = await db.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.actor_user_id == user_id)
+            .order_by(AuditEvent.created_at.desc())
+            .limit(EXPORT_ROW_LIMIT)
+        )
+        for a in arows:
+            audit_events.append(
+                ExportedAuditEvent(
+                    id=a.id,
+                    workspace_id=a.workspace_id,
+                    action=a.action,
+                    resource_type=a.resource_type,
+                    resource_id=a.resource_id,
+                    created_at=a.created_at,
+                )
+            )
+    return reports, audit_events
 
 
 async def _anonymize_audit_actor(db: AsyncSession, user_id: uuid.UUID) -> None:

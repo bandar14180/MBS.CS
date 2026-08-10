@@ -62,10 +62,46 @@ class ExportedApiKey(BaseModel):
     last_used_at: datetime | None
 
 
+class ExportedScan(BaseModel):
+    # Metadata only -- no scan config, no evidence, no tool output.
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    scan_type: str
+    status: str
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+class ExportedReport(BaseModel):
+    # Metadata only -- the storage_uri (internal object path) and PDF bytes are NEVER exported.
+    id: uuid.UUID
+    project_id: uuid.UUID
+    type: str
+    format: str
+    scan_ids: list[str]
+    generated_at: datetime
+
+
+class ExportedAuditEvent(BaseModel):
+    # Safe metadata only -- the free-text `detail` is deliberately excluded (may reference
+    # other subjects/resources), preserving compliance integrity without over-sharing.
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    action: str
+    resource_type: str
+    resource_id: uuid.UUID | None
+    created_at: datetime
+
+
 class ExportSummary(BaseModel):
     workspace_count: int
     api_key_count: int
     active_api_key_count: int
+    # Additive counts (backward compatible -- default 0 so older snapshots still validate).
+    scan_count: int = 0
+    report_count: int = 0
+    audit_event_count: int = 0
     last_login_at: datetime | None
 
 
@@ -74,4 +110,8 @@ class DataExportResponse(BaseModel):
     profile: ExportProfile
     workspaces: list[ExportedMembership]
     api_keys: list[ExportedApiKey]
+    # Additive lists (default [] -> backward compatible; existing clients ignore new fields).
+    scans: list[ExportedScan] = []
+    reports: list[ExportedReport] = []
+    audit_events: list[ExportedAuditEvent] = []
     activity_summary: ExportSummary

@@ -93,10 +93,19 @@ data as JSON (GDPR Art. 15/20):
 - **profile** — id, email, full name, status, MFA state, created/last-login timestamps
 - **workspaces** — memberships with role, invited/joined timestamps
 - **api_keys** — metadata only (name, non-secret prefix, created/last-used, revoked)
-- **activity_summary** — workspace/API-key counts, last login
+- **scans** — scans the user **initiated** (id, workspace, type, status, timestamps) — metadata
+  only; scan config, evidence, and tool output are never exported
+- **reports** — reports the user **generated** (id, project, type, format, scan ids, timestamp) —
+  the `storage_uri`/PDF bytes are never exported
+- **audit_events** — events where the user was the **actor** (id, workspace, action, resource
+  type/id, timestamp) — the free-text `detail` is excluded to avoid over-sharing
+- **activity_summary** — workspace/API-key/scan/report/audit counts, last login
 
-The export contains **metadata only**; password hashes, MFA secrets, and token/key
-hashes are structurally excluded and never serialized.
+The export contains **metadata only**; password hashes, MFA secrets, token/key hashes, and
+internal storage paths are structurally excluded and never serialized. Scans/reports/audit are
+scoped to the user's **own** ownership and their **workspace memberships under RLS**, so a
+data-subject export can never surface another tenant's data. The access itself is audited
+(`account.exported`, counts only). Additive/back-compatible: the fields default to empty.
 
 ---
 
