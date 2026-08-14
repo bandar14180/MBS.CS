@@ -113,6 +113,19 @@ def _record_dlq(scan_id: str, exc: Exception, *, task_id: str | None = None, ret
     except Exception:  # noqa: BLE001
         pass
 
+    # E4: a dead-lettered scan is a reliability failure -> best-effort email alert (never raises,
+    # gated OFF unless email is enabled; no scan/evidence detail in the message).
+    try:
+        from apps.api.modules.notifications.alerts import email_system_alert
+
+        email_system_alert(
+            "reliability_dlq", "Scan permanently failed (dead-lettered)",
+            "A scan task exhausted its retries and was dead-lettered. Inspect via "
+            "`python -m apps.api.celery_app.dlq list`.",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _transient_error_types() -> tuple[type[BaseException], ...]:
     """Infrastructure faults a retry can plausibly recover from -- transient DB / broker /

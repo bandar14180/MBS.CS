@@ -21,6 +21,8 @@ _FILE_BACKED_SECRETS = (
     # Secrets seam). Empty by default; only required when the matching feature is enabled.
     "BACKUP_ENCRYPTION_KEY",
     "BACKUP_OFFSITE_SECRET_KEY",
+    # Email alerts (E1): SMTP password via the same *_FILE convention (SMTP_PASSWORD_FILE).
+    "SMTP_PASSWORD",
 )
 
 # Placeholder / insecure defaults that must never survive into production.
@@ -277,6 +279,28 @@ class Settings(BaseSettings):
     # and refuses to touch the live DATABASE_URL. Empty -> a target must be passed on the CLI.
     backup_drill_database_url: str = ""
 
+    # Email Alert System (E1..E5). Additive + default OFF: with email_enabled=False nothing is
+    # ever sent (the dispatcher and Celery task short-circuit). Delivery is ALWAYS async (the
+    # scan/backup paths only enqueue), so a slow/broken SMTP server never affects a scan. The
+    # SMTP password uses the <NAME>_FILE convention (SMTP_PASSWORD_FILE) via _FILE_BACKED_SECRETS.
+    email_enabled: bool = False
+    email_provider: str = "smtp"                  # smtp (only provider today; abstraction allows more)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True                     # STARTTLS after connect
+    smtp_timeout_seconds: int = 15
+    email_from_address: str = ""
+    # System-level alerts (backup/DLQ failures) have no workspace context -> sent to these admins.
+    email_admin_recipients: list[str] = []
+    # Dedup window: identical (category, workspace, subject) alerts inside this window are
+    # collapsed to one email, preventing storms from a flapping failure.
+    email_dedup_window_seconds: int = 300
+    email_max_retries: int = 3                     # Celery retries for transient SMTP faults
+    email_task_soft_time_limit_seconds: int = 25
+    email_task_time_limit_seconds: int = 40        # > soft; hard SIGKILL backstop
+
     # Phase 5.2 -- retention purge FOUNDATION. Additive + DOUBLE-GATED OFF: nothing is ever
     # deleted unless retention_enabled is flipped true AND retention_dry_run is set false.
     # Ships enabled=False + dry_run=True so any manual/scheduled run only ever PLANS (logs +
@@ -417,6 +441,11 @@ class Settings(BaseSettings):
         # DR-2: if backup encryption is enabled, the key must be present (fail closed).
         if self.backup_enabled and self.backup_encryption_enabled and not self.backup_encryption_key:
             problems.append("BACKUP_ENCRYPTION_KEY must be set when BACKUP_ENCRYPTION_ENABLED is true.")
+        # E1: if email alerts are enabled, SMTP host + from-address are mandatory (fail closed).
+        if self.email_enabled and self.email_provider == "smtp" and (
+            not self.smtp_host or not self.email_from_address
+        ):
+            problems.append("SMTP_HOST and EMAIL_FROM_ADDRESS must be set when EMAIL_ENABLED is true.")
         # M4.6.1 / F2: refuse to run in production with derived-target authorization
         # enforcement disabled (unless explicitly, emergency-acknowledged).
         from apps.api.core.startup_checks import derived_scope_problem

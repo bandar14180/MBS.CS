@@ -57,6 +57,8 @@ def test_alert_rules_present_and_well_formed():
         "MbsDlqBacklog", "MbsBackupFailing", "MbsRetentionFailing",
         # DR-4 backup freshness
         "MbsBackupStale",
+        # E5 email alert delivery
+        "MbsEmailDeliveryFailing",
     ):
         assert expected in names, f"missing alert {expected}"
     assert {"critical", "warning"} <= severities
@@ -72,7 +74,9 @@ def test_alert_expressions_reference_existing_metrics():
                    # F4 reliability metrics (exposed by the API ReliabilityCollector)
                    "mbs_dlq_depth", "mbs_backup_failures_total", "mbs_retention_failures_total",
                    # DR-4 backup freshness gauge
-                   "mbs_backup_age_seconds"):
+                   "mbs_backup_age_seconds",
+                   # E5 email delivery
+                   "mbs_email_failed_total"):
         assert metric in exprs
     assert 'up{job="mbs-api"}' in exprs and 'up{job="mbs-worker"}' in exprs
 

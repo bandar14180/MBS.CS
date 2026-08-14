@@ -18,6 +18,8 @@ celery_app = Celery(
         # Phase 5.2: registered so the worker knows the task. NOT beat-scheduled -- it runs
         # only when invoked manually, and is double-gated OFF (retention_enabled + dry_run).
         "apps.api.celery_app.tasks.retention_tasks",
+        # E2: async email delivery (default queue). Gated OFF unless email_enabled.
+        "apps.api.celery_app.tasks.notification_tasks",
     ],
 )
 celery_app.conf.broker_connection_retry_on_startup = True

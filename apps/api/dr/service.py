@@ -150,6 +150,17 @@ def run_backup(settings, *, store=None, runner=None, offsite=None) -> BackupResu
         record_backup_success()  # DR-4: stamps last-success time -> mbs_backup_age_seconds
     else:
         record_backup_failure()
+        # E4: best-effort email alert on backup failure (never raises; gated OFF unless enabled).
+        try:
+            from apps.api.modules.notifications.alerts import email_system_alert
+
+            email_system_alert(
+                "backup_failed", "Backup run failed",
+                "A scheduled backup run did not complete successfully. See the DR runbook "
+                "(docs/runbooks/disaster-recovery.md) to investigate.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
     m.logger.info(
         "backup.completed set=%s ok=%s duration=%.2fs", set_dir.name, ok, duration,
         extra={"event": "backup.completed" if ok else "backup.failed", "set": set_dir.name,

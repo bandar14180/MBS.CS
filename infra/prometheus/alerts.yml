@@ -101,3 +101,13 @@ groups:
         annotations:
           summary: "Retention purge failed"
           description: "A retention purge run failed in the last 6h."
+
+      # E5: alert emails are failing to deliver -> operators may be missing critical/failure
+      # notifications. Exposed by the worker-side email metrics (worker-default runs the task).
+      - alert: MbsEmailDeliveryFailing
+        expr: increase(mbs_email_failed_total[1h]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Alert email delivery failing"
+          description: "{{ $value }} alert email(s) failed to send in the last hour -- check SMTP config/credentials (docs/runbooks/email-alerts.md)."

@@ -63,6 +63,19 @@ services:
       ENVIRONMENT: production
       BACKUP_ENABLED: "true"
 
+  # Email alerts (E1..E5). Default OFF -- flip EMAIL_ENABLED=true and fill SMTP_* to turn on.
+  # The email delivery task runs on worker-default; the password is a Docker Secret (*_FILE).
+  # worker (scan queue) does not send email, but shares config for the DLQ-failure alert path.
+  # Example (commented -- provide real values before enabling):
+  #   EMAIL_ENABLED: "true"
+  #   EMAIL_PROVIDER: smtp
+  #   SMTP_HOST: smtp.example.com
+  #   SMTP_PORT: "587"
+  #   SMTP_USERNAME: alerts@example.com
+  #   SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+  #   EMAIL_FROM_ADDRESS: alerts@example.com
+  #   EMAIL_ADMIN_RECIPIENTS: '["ops@example.com"]'
+
   # Production monitoring (Phase 4.2). Scrapes api:8000/metrics (x-metrics-token read from the
   # mounted metrics_token secret) and worker:9100 over the internal compose network. Config in
   # ./prometheus/. Published to LOCALHOST ONLY -- never exposed publicly.
