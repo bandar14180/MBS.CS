@@ -41,7 +41,7 @@ def test_remediation_structures_output() -> None:
     assert r.steps == ["Set Strict-Transport-Security", "Set X-Frame-Options"]  # blank dropped
     assert r.references == [{"title": "OWASP Secure Headers", "url": "https://owasp.org/x"}]
     assert r.model_version == "test-model"
-    assert r.prompt_version == "remediation/v1"
+    assert r.prompt_version == "remediation/v2"
 
 
 def test_remediation_grounds_prompt_in_finding() -> None:

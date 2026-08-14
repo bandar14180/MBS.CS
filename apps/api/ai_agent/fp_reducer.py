@@ -1,12 +1,14 @@
 import json
 from dataclasses import dataclass
 
+from apps.api.ai_agent.guards import redact_output
 from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
 from apps.api.ai_agent.prompts.fp_reducer import (
     FP_REDUCER_PROMPT_VERSION,
     FP_REDUCER_SYSTEM,
     FP_REDUCER_USER_TEMPLATE,
 )
+from apps.api.ai_agent.sanitize import sanitize_finding_dicts, wrap_untrusted
 
 _VALID_CONFIDENCE = {"low", "medium", "high"}
 
@@ -41,7 +43,9 @@ class FPReducer:
         if not input_ids:
             return FPResult(assessments=[], model_version=self._client.model_version)
 
-        user = FP_REDUCER_USER_TEMPLATE.format(findings_json=json.dumps(findings, default=str, indent=2))
+        # AI-1 Step 1-2: defang untrusted finding fields + wrap in delimiters before templating.
+        safe_json = json.dumps(sanitize_finding_dicts(findings), default=str, indent=2)
+        user = FP_REDUCER_USER_TEMPLATE.format(findings_json=wrap_untrusted("findings", safe_json, sanitize=False))
         raw = self._client.complete_json(FP_REDUCER_SYSTEM, user)
 
         id_set = set(input_ids)
@@ -55,7 +59,7 @@ class FPReducer:
                 finding_id=fid,
                 likely_false_positive=bool(a.get("likely_false_positive", False)),
                 confidence=confidence if confidence in _VALID_CONFIDENCE else "low",
-                reasoning=str(a.get("reasoning", "")),
+                reasoning=redact_output(str(a.get("reasoning", ""))),  # AI-1 Step 3: scrub free-text
             )
 
         # Any input finding the model didn't assess -> conservative not-FP default.
@@ -63,7 +67,13 @@ class FPReducer:
             by_id.setdefault(
                 fid, FPAssessment(fid, likely_false_positive=False, confidence="low", reasoning="not assessed")
             )
-        return FPResult(
-            assessments=[by_id[fid] for fid in input_ids],
-            model_version=self._client.model_version,
+        assessments = [by_id[fid] for fid in input_ids]
+
+        from apps.api.ai_agent.audit import ai_security_event
+
+        ai_security_event(
+            "ai.decision", agent="fp_reducer", decision="assess",
+            inputs=len(input_ids), flagged=sum(1 for a in assessments if a.likely_false_positive),
+            model_version=self._client.model_version, prompt_version=FP_REDUCER_PROMPT_VERSION,
         )
+        return FPResult(assessments=assessments, model_version=self._client.model_version)

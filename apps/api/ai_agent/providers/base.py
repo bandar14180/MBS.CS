@@ -57,10 +57,15 @@ def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) ->
     return round((prompt_tokens / 1000) * in_rate + (completion_tokens / 1000) * out_rate, 6)
 
 
+# Upper bound on a model response we will parse -- guards against a runaway/oversized output
+# inflating logs/latency or the JSON parser (AI-1 Step 3 / G7). Generous vs. any real answer.
+_MAX_RAW_CHARS = 200_000
+
+
 def extract_json(text: str) -> dict[str, Any]:
     """Parse a JSON object out of the model's text, tolerating stray prose or a
     ```json fence around it (the prompt asks for bare JSON, but be forgiving)."""
-    text = text.strip()
+    text = text[:_MAX_RAW_CHARS].strip() if text else ""
     if text.startswith("```"):
         text = text.split("```", 2)[1]
         if text.startswith("json"):

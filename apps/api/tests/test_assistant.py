@@ -27,7 +27,7 @@ def test_assistant_structures_answer() -> None:
     result = agent.answer("How do I fix missing headers?")
     assert result.answer == "Enable HSTS and set secure headers."  # trimmed
     assert result.model_version == "test-model"
-    assert result.prompt_version == "assistant/v1"
+    assert result.prompt_version == "assistant/v2"
 
 
 def test_assistant_grounds_prompt_in_finding_context() -> None:

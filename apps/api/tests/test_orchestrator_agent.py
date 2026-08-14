@@ -279,7 +279,9 @@ def test_run_agent_driven_end_to_end(monkeypatch):
     first = prompts[0]
     assert "(none yet)" in first          # prior action outcomes empty
     assert "(no techniques mapped yet)" in first  # no ATT&CK yet
-    assert "Attack graph (asset -> service -> finding -> technique -> access): (empty)" in first
+    # AI-1: untrusted evidence summaries are now wrapped in <<UNTRUSTED:...>> delimiters, so the
+    # empty-state graph placeholder appears delimited. Assert the empty-state marker still shows.
+    assert "(empty)" in first and "<<UNTRUSTED:graph>>" in first
 
     # (3) The unregistered high-confidence tool was NOT executed; (4) the registered
     # httpx went through the real execution path instead.

@@ -1,12 +1,14 @@
 import json
 from dataclasses import dataclass
 
+from apps.api.ai_agent.guards import redact_output
 from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
 from apps.api.ai_agent.prompts.correlator import (
     CORRELATOR_PROMPT_VERSION,
     CORRELATOR_SYSTEM,
     CORRELATOR_USER_TEMPLATE,
 )
+from apps.api.ai_agent.sanitize import sanitize_finding_dicts, wrap_untrusted
 
 
 @dataclass
@@ -41,7 +43,9 @@ class AICorrelator:
                 prompt_version=CORRELATOR_PROMPT_VERSION,
             )
 
-        user = CORRELATOR_USER_TEMPLATE.format(findings_json=json.dumps(findings, default=str, indent=2))
+        # AI-1 Step 1-2: defang untrusted finding fields + wrap in delimiters before templating.
+        safe_json = json.dumps(sanitize_finding_dicts(findings), default=str, indent=2)
+        user = CORRELATOR_USER_TEMPLATE.format(findings_json=wrap_untrusted("findings", safe_json, sanitize=False))
         raw = self._client.complete_json(CORRELATOR_SYSTEM, user)
 
         id_set = set(input_ids)
@@ -52,13 +56,21 @@ class AICorrelator:
             if not ids:
                 continue
             assigned.update(ids)
-            groups.append(CorrelationGroup(finding_ids=ids, rationale=str(group.get("rationale", ""))))
+            # AI-1 Step 3: rationale is model free-text -> redact any leaked secret/PII/token.
+            groups.append(CorrelationGroup(finding_ids=ids, rationale=redact_output(str(group.get("rationale", "")))))
 
         # Any input finding the model failed to place -> its own group (never drop a finding).
         for fid in input_ids:
             if fid not in assigned:
                 groups.append(CorrelationGroup(finding_ids=[fid], rationale="uncorrelated (fallback)"))
 
+        from apps.api.ai_agent.audit import ai_security_event
+
+        ai_security_event(
+            "ai.decision", agent="correlator", decision="correlate",
+            inputs=len(input_ids), groups=len(groups),
+            model_version=self._client.model_version, prompt_version=CORRELATOR_PROMPT_VERSION,
+        )
         return CorrelationResult(
             groups=groups,
             model_version=self._client.model_version,
