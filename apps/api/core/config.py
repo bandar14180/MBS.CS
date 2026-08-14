@@ -15,6 +15,7 @@ _FILE_BACKED_SECRETS = (
     "S3_SECRET_KEY",
     "ANTHROPIC_API_KEY",
     "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
     "METRICS_TOKEN",
     "MFA_ENCRYPTION_KEY",
     # DR-2 / DR-3: backup encryption key + off-site replication secret (same Vault/Docker
@@ -85,7 +86,14 @@ class Settings(BaseSettings):
     # the provider factory (apps/api/ai_agent/providers/factory.py) does. All
     # providers conform to the SupportsComplete protocol, so switching is a
     # config change, not a code change.
-    ai_provider: str = "openrouter"  # openrouter | anthropic
+    ai_provider: str = "openrouter"  # openrouter | anthropic | local | deepseek
+
+    # AI-2.1 -- provider fallback. Ordered list of SECONDARY providers tried, in order, ONLY when
+    # the current provider hits an availability failure (429/402/5xx/timeout/connection). Default
+    # [] = OFF (single-provider behavior, unchanged). The primary (ai_provider) is always first;
+    # duplicates and a self-reference are dropped, and a fallback with no configured key is
+    # skipped at build time. e.g. AI_FALLBACK_PROVIDERS='["anthropic","deepseek"]'.
+    ai_fallback_providers: list[str] = []
 
     # OpenRouter (primary). OpenAI-compatible; a single integration can proxy
     # Claude/GPT/Gemini/open models -- pick the model with OPENROUTER_MODEL.
@@ -429,6 +437,12 @@ class Settings(BaseSettings):
             problems.append("TRUSTED_HOSTS must list explicit hostnames in production, not '*'.")
         if self.ai_provider not in ("openrouter", "anthropic", "local", "deepseek"):
             problems.append(f"AI_PROVIDER '{self.ai_provider}' is not a known provider.")
+        # AI-2.1: fallback providers must be known and must not include the primary.
+        for name in self.ai_fallback_providers:
+            if name not in ("openrouter", "anthropic", "local", "deepseek"):
+                problems.append(f"AI_FALLBACK_PROVIDERS contains unknown provider '{name}'.")
+            elif name == self.ai_provider:
+                problems.append(f"AI_FALLBACK_PROVIDERS must not include the primary provider '{name}'.")
         if not self.ssl_verify:
             problems.append("SSL_VERIFY is disabled; never disable TLS verification in production.")
         if not self.rate_limit_enabled:

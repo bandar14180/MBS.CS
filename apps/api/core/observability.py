@@ -56,6 +56,11 @@ if _PROM:
     SCAN_DURATION = Histogram("mbs_scan_duration_seconds", "End-to-end scan duration", ["status"])
     TOOL_FAILURE = Counter("mbs_tool_failure_total", "Tool executions that failed", ["tool"])
     AI_DECISION = Counter("mbs_ai_decision_total", "Autonomous agent decisions", ["action"])
+    # AI-2.1: provider failovers on an availability failure. Low-cardinality labels ONLY
+    # (provider names) -- never a key, endpoint, error body, or tenant id.
+    AI_FAILOVER = Counter(
+        "mbs_ai_failover_total", "AI provider failovers (availability failure)", ["from_provider", "to_provider"]
+    )
     # Phase 1.4: API error responses by stable error type (low-cardinality; never a
     # path/scan_id/message).
     API_ERRORS = Counter("mbs_api_errors_total", "API error responses", ["type"])
@@ -83,6 +88,12 @@ def record_ai_usage_metrics(usage) -> None:
     AI_TOKENS.labels(usage.provider, usage.model, "prompt").inc(usage.prompt_tokens)
     AI_TOKENS.labels(usage.provider, usage.model, "completion").inc(usage.completion_tokens)
     AI_COST.labels(usage.provider, usage.model).inc(usage.estimated_cost_usd)
+
+
+def record_ai_failover(from_provider: str, to_provider: str) -> None:
+    """AI-2.1: count one provider failover. Provider NAMES only -- never keys/endpoints/bodies."""
+    if _PROM:
+        AI_FAILOVER.labels(from_provider, to_provider).inc()
 
 
 def record_scan_outcome(status: str) -> None:

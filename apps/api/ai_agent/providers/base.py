@@ -16,7 +16,17 @@ class AIProviderError(RuntimeError):
     (planner path fails loud -> 400 / scan failed; assistant/remediation/FP
     paths fail soft -> HTTP 503). Keeping that base class means those call sites
     keep working unchanged regardless of which provider is active.
+
+    AI-2.1: `availability` is True when the failure is a PROVIDER AVAILABILITY issue
+    (429 rate-limit, 402 credits exhausted, 5xx, timeout, connection/network) -- the
+    signal a FallbackClient uses to try the next provider. It is False for config/auth/
+    invalid-request/model-not-found failures, which a second provider cannot fix, so
+    those never trigger a failover.
     """
+
+    def __init__(self, *args, availability: bool = False):
+        super().__init__(*args)
+        self.availability = availability
 
 
 class SupportsComplete(Protocol):
@@ -135,7 +145,11 @@ class BaseAIProvider(ABC):
                     continue
                 break
         # Report the attempts actually made, not the configured max -- a
-        # non-retryable failure (e.g. 402) breaks after one attempt.
+        # non-retryable failure (e.g. 422) breaks after one attempt. AI-2.1: mark the wrapped
+        # error as an availability failure when the exhausted cause was retryable (429/5xx/
+        # timeout/connection) so a fallback provider is tried; a non-retryable cause (invalid
+        # request) stays availability=False and does NOT fall over.
         raise AIProviderError(
-            f"{self.provider_name} call failed after {attempts} attempt(s): {last_exc}"
+            f"{self.provider_name} call failed after {attempts} attempt(s): {last_exc}",
+            availability=bool(last_exc is not None and self._is_retryable(last_exc)),
         ) from last_exc
