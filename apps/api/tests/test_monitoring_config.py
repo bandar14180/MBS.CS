@@ -59,6 +59,8 @@ def test_alert_rules_present_and_well_formed():
         "MbsBackupStale",
         # E5 email alert delivery
         "MbsEmailDeliveryFailing",
+        # AI-2.2A budget enforcement
+        "MbsAiBudgetBlocking",
     ):
         assert expected in names, f"missing alert {expected}"
     assert {"critical", "warning"} <= severities
@@ -76,7 +78,9 @@ def test_alert_expressions_reference_existing_metrics():
                    # DR-4 backup freshness gauge
                    "mbs_backup_age_seconds",
                    # E5 email delivery
-                   "mbs_email_failed_total"):
+                   "mbs_email_failed_total",
+                   # AI-2.2A budget enforcement
+                   "mbs_ai_budget_blocked_total"):
         assert metric in exprs
     assert 'up{job="mbs-api"}' in exprs and 'up{job="mbs-worker"}' in exprs
 

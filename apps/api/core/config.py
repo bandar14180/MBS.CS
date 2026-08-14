@@ -126,6 +126,14 @@ class Settings(BaseSettings):
     ai_request_timeout_s: float = 60.0
     ai_max_retries: int = 3
 
+    # AI-2.2A -- AI cost budget enforcement. Additive + default OFF: with ai_budget_enforce=False
+    # (or ai_daily_budget_usd<=0) nothing is ever blocked. When enabled, a per-workspace rolling
+    # DAILY estimated spend is tracked in Redis; once it reaches the cap, further AI calls for that
+    # workspace are blocked (AIBudgetExceededError) and degrade through the EXISTING contract
+    # (assistant -> 503, agent -> finish). Redis failures fail OPEN (never block AI on an outage).
+    ai_budget_enforce: bool = False
+    ai_daily_budget_usd: float = 0.0
+
     # AI correlator (attack-path narrative) latency controls. A large scan must not
     # trigger unbounded AI work: beyond ai_correlator_max_findings the AI narrative
     # is skipped (findings are STILL deterministically mapped to ATT&CK; only the

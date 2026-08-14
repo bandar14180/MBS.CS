@@ -61,6 +61,11 @@ if _PROM:
     AI_FAILOVER = Counter(
         "mbs_ai_failover_total", "AI provider failovers (availability failure)", ["from_provider", "to_provider"]
     )
+    # AI-2.2A: AI calls blocked by the per-workspace daily budget cap. Low-cardinality label ONLY
+    # (agent_role) -- NEVER a workspace id, email, key, or amount.
+    AI_BUDGET_BLOCKED = Counter(
+        "mbs_ai_budget_blocked_total", "AI calls blocked by the daily budget cap", ["agent_role"]
+    )
     # Phase 1.4: API error responses by stable error type (low-cardinality; never a
     # path/scan_id/message).
     API_ERRORS = Counter("mbs_api_errors_total", "API error responses", ["type"])
@@ -94,6 +99,13 @@ def record_ai_failover(from_provider: str, to_provider: str) -> None:
     """AI-2.1: count one provider failover. Provider NAMES only -- never keys/endpoints/bodies."""
     if _PROM:
         AI_FAILOVER.labels(from_provider, to_provider).inc()
+
+
+def record_ai_budget_blocked(agent_role: str) -> None:
+    """AI-2.2A: count one AI call blocked by the daily budget cap. Only the low-cardinality
+    agent_role label -- never a workspace id or amount."""
+    if _PROM:
+        AI_BUDGET_BLOCKED.labels(agent_role).inc()
 
 
 def record_scan_outcome(status: str) -> None:

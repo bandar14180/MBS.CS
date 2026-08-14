@@ -127,6 +127,15 @@ class BaseAIProvider(ABC):
         """Whether `exc` from `_invoke` is worth retrying (429/5xx/timeout/conn)."""
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
+        # AI-2.2A: enforce the per-workspace daily spend cap BEFORE any provider call. Reads the
+        # workspace of the AI call in progress from the collect_ai_usage contextvar. Over budget ->
+        # AIBudgetExceededError (an AIProviderError with availability=False), so callers degrade via
+        # the existing contract and the AI-2.1 fallback does NOT try another provider. No-op when
+        # enforcement is off. Lazy import avoids any import cycle (budget -> base).
+        from apps.api.ai_agent.budget import enforce_budget
+
+        enforce_budget()
+
         started = time.monotonic()
         last_exc: Exception | None = None
         attempts = 0
