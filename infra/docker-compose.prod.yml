@@ -50,18 +50,26 @@ services:
       BACKUP_ENABLED: "true"
       BACKUP_ENCRYPTION_ENABLED: "true"
       BACKUP_ENCRYPTION_KEY_FILE: /run/secrets/backup_encryption_key
+      # Retention P1 Stage 1: schedule the purge but run it PLAN-ONLY (dry-run). RETENTION_DRY_RUN
+      # stays "true" here -- the task meters what it WOULD delete and touches NO data. Flip to
+      # "false" only after validating a dry-run cycle + taking a DR backup (see
+      # docs/runbooks/retention.md). worker-default executes retention.purge.
+      RETENTION_ENABLED: "true"
+      RETENTION_DRY_RUN: "true"
     secrets:
       - openrouter_api_key
       - s3_secret_key
       - backup_encryption_key
 
-  # Beat must also see BACKUP_ENABLED=true so it registers the scheduled-backup beat entry
-  # (worker.py builds the schedule from settings at import time). It only emits the tick; the
-  # backup itself runs on worker-default.
+  # Beat must also see BACKUP_ENABLED / RETENTION_ENABLED so it registers those beat entries
+  # (worker.py builds the schedule from settings at import time). It only emits the ticks; the
+  # backup + retention tasks run on worker-default. RETENTION_DRY_RUN stays "true" (plan-only).
   beat:
     environment:
       ENVIRONMENT: production
       BACKUP_ENABLED: "true"
+      RETENTION_ENABLED: "true"
+      RETENTION_DRY_RUN: "true"
 
   # Email alerts (E1..E5). Default OFF -- flip EMAIL_ENABLED=true and fill SMTP_* to turn on.
   # The email delivery task runs on worker-default; the password is a Docker Secret (*_FILE).

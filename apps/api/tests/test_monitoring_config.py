@@ -118,3 +118,18 @@ def test_dr1_backup_durability_and_prod_enablement():
     assert "backup_encryption_key" in prod["secrets"]          # secret declared
     # beat must also see the flag so it registers the scheduled-backup tick
     assert prod["services"]["beat"]["environment"]["BACKUP_ENABLED"] == "true"
+
+
+def test_retention_p1_stage1_enabled_dry_run():
+    """P1 Stage 1: retention is SCHEDULED in production but PLAN-ONLY -- enabled on both
+    worker-default (executes) and beat (schedules), and dry-run stays true so nothing is deleted
+    until an operator explicitly flips it (see docs/runbooks/retention.md)."""
+    prod_p = REPO_ROOT / "infra" / "docker-compose.prod.yml"
+    if not prod_p.is_file():
+        pytest.skip("infra/ not bind-mounted")
+    prod = yaml.safe_load(prod_p.read_text(encoding="utf-8"))
+    for svc in ("worker-default", "beat"):
+        env = prod["services"][svc]["environment"]
+        assert env["RETENTION_ENABLED"] == "true", f"{svc} must schedule retention"
+        # Stage 1 safety: live deletion must NOT be enabled yet.
+        assert env["RETENTION_DRY_RUN"] == "true", f"{svc} must stay plan-only (dry-run)"
