@@ -132,6 +132,29 @@ def test_dr1_backup_durability_and_prod_enablement():
     assert prod["services"]["beat"]["environment"]["BACKUP_ENABLED"] == "true"
 
 
+def test_r1a_redis_durability_aof_and_volume():
+    """R1a: Redis persists across container recreation -- AOF enabled + /data on a named volume,
+    so the broker/DLQ + rate-limit/AI-budget/MFA-lockout counters + reliability freshness
+    timestamps survive a restart (previously default RDB wrote to an unmounted /data and was lost).
+    Asserted on the base compose; the prod overlay inherits it (no separate redis block)."""
+    base_p = REPO_ROOT / "infra" / "docker-compose.yml"
+    if not base_p.is_file():
+        pytest.skip("infra/ not bind-mounted")
+    base = yaml.safe_load(base_p.read_text(encoding="utf-8"))
+    redis = base["services"]["redis"]
+    raw_cmd = redis.get("command", "")
+    cmd = " ".join(raw_cmd) if isinstance(raw_cmd, list) else str(raw_cmd)
+    assert "--appendonly yes" in cmd, "Redis must enable AOF persistence"
+    assert any("redis_data:/data" in str(v) for v in redis.get("volumes", [])), \
+        "Redis must persist /data on the durable redis_data volume"
+    assert "redis_data" in base.get("volumes", {}), "redis_data named volume must be declared"
+    # durability must not be undermined by an eviction policy that could drop broker/DLQ keys
+    assert "maxmemory-policy" not in cmd or "noeviction" in cmd
+    # existing operational guarantees are preserved (not weakened by this change)
+    assert redis.get("restart") == "unless-stopped"
+    assert redis.get("healthcheck", {}).get("test")
+
+
 def test_retention_p1_stage1_enabled_dry_run():
     """P1 Stage 1: retention is SCHEDULED in production but PLAN-ONLY -- enabled on both
     worker-default (executes) and beat (schedules), and dry-run stays true so nothing is deleted

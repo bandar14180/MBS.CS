@@ -19,8 +19,18 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # R1a: durability. Redis backs the Celery broker + scan DLQ + rate-limit / AI-budget /
+    # MFA-lockout counters + reliability freshness timestamps -- all of which were previously
+    # lost on any container restart (default RDB wrote to an unmounted /data). Enable AOF
+    # (append-only file, fsync every second) and persist /data on a named volume so that state
+    # survives a restart. No maxmemory is set (default = no eviction), so broker/DLQ entries are
+    # never evicted. Additive + reversible; no consumer behavior changes (all are idempotent /
+    # fail-open, and task replay is safe via the atomic scan claim + orphan reaper).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -168,3 +178,5 @@ volumes:
   web_node_modules:
   # DR-1: durable storage for backup sets so they persist across worker-default recreation.
   backup_data:
+  # R1a: durable Redis AOF storage so the broker/DLQ + operational counters survive a restart.
+  redis_data:

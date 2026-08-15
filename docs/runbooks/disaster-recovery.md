@@ -116,12 +116,26 @@ but never fails the backup. Extend by implementing `OffsiteTarget` in `apps/api/
   `0`/`1`. Restore drills are **not auto-scheduled** at this stage (run in CI/cron manually).
   Config: `BACKUP_DRILL_DATABASE_URL` (optional default scratch target).
 
+## R1a — Durable Redis (broker / DLQ / operational state)
+Redis backs the Celery **broker + result backend**, the scan **dead-letter queue**
+(`dlq:scans.run_scan`), the **rate-limit** / **AI-budget** / **MFA-lockout** counters, and the
+**reliability freshness** timestamps (`mbs_backup_age_seconds`, `mbs_beat_age_seconds`).
+Previously these lived only in RAM (default RDB wrote to an **unmounted** `/data`), so any Redis
+restart dropped the queue, the DLQ backlog, and those counters. R1a enables **AOF**
+(`--appendonly yes --appendfsync everysec`) and mounts `/data` on the durable **`redis_data`**
+named volume, so this state **survives a restart**. No `maxmemory` is set (default = no eviction),
+so broker/DLQ entries are never evicted. Consumer behavior is unchanged — all Redis paths are
+idempotent (DLQ replay is safe via the atomic scan claim + orphan reaper) or fail-open
+(rate-limit / budget / MFA-lockout). For a real deployment, bind `redis_data` to a durable/off-host
+path. *(This is single-node durability, not HA — Redis failover/replication is deferred; see DR-5.)*
+
 ## Recovery evidence — the four required scenarios
 - **Database loss** → `dr restore` / `dr drill` (pg_restore into a clean DB; migration-consistent).
 - **Object storage failure** → object verify + `restore --objects` (faithful metadata).
 - **Accidental data deletion** → timestamped retained sets (`min_keep` never erases the newest);
   restore point-in-time-of-backup. *(MinIO versioning/object-lock recommended — see DR-5.)*
-- **Infrastructure failure** → durable volume (DR-1) + off-site copy (DR-3) survive host loss.
+- **Infrastructure failure** → durable volumes (DR-1 backups, R1a Redis) + off-site copy (DR-3)
+  survive host loss.
 
 ## DR-5 — Future production evolution (NOT implemented)
 Deferred, larger-scope items for a future phase:
