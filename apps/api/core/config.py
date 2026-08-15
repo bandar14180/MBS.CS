@@ -126,6 +126,13 @@ class Settings(BaseSettings):
     ai_request_timeout_s: float = 60.0
     ai_max_retries: int = 3
 
+    # AI-2.2B-1 -- config-driven pricing overrides for cost ESTIMATION. Maps a model-id substring
+    # to [in_per_1k_usd, out_per_1k_usd], so rates can be corrected without a deploy. Empty {} =
+    # unchanged (built-in table + conservative default). Applies to FUTURE calls only -- historical
+    # ai_usage rows keep the cost computed at the time of the call.
+    # e.g. AI_PRICING_OVERRIDES='{"deepseek":[0.00027,0.0011],"gpt-4o":[0.0025,0.01]}'.
+    ai_pricing_overrides: dict[str, list[float]] = {}
+
     # AI-2.2A -- AI cost budget enforcement. Additive + default OFF: with ai_budget_enforce=False
     # (or ai_daily_budget_usd<=0) nothing is ever blocked. When enabled, a per-workspace rolling
     # DAILY estimated spend is tracked in Redis; once it reaches the cap, further AI calls for that

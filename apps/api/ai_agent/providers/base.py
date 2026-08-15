@@ -56,13 +56,31 @@ _PRICING_PER_1K = {
 _PRICING_DEFAULT = (0.005, 0.015)
 
 
+def _config_pricing(model_l: str) -> tuple[float, float] | None:
+    """AI-2.2B-1: config-driven pricing override. AI_PRICING_OVERRIDES maps a model-id substring
+    to [in_per_1k, out_per_1k], letting operators correct rates without a deploy. Best-effort: a
+    missing/malformed entry falls through to the built-in table."""
+    try:
+        from apps.api.core.config import get_settings
+
+        for key, val in (get_settings().ai_pricing_overrides or {}).items():
+            if key and str(key).lower() in model_l and isinstance(val, (list, tuple)) and len(val) == 2:
+                return float(val[0]), float(val[1])
+    except Exception:  # noqa: BLE001 -- pricing is estimation only; never break an AI call
+        return None
+    return None
+
+
 def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     model_l = (model or "").lower()
-    prices = _PRICING_DEFAULT
-    for key, val in _PRICING_PER_1K.items():
-        if key in model_l:
-            prices = val
-            break
+    # Config overrides first, then the built-in table, then the conservative default.
+    prices = _config_pricing(model_l)
+    if prices is None:
+        prices = _PRICING_DEFAULT
+        for key, val in _PRICING_PER_1K.items():
+            if key in model_l:
+                prices = val
+                break
     in_rate, out_rate = prices
     return round((prompt_tokens / 1000) * in_rate + (completion_tokens / 1000) * out_rate, 6)
 
