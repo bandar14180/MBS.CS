@@ -263,6 +263,59 @@ def record_beat_tick(ts: int | None = None) -> None:
         pass
 
 
+# --- Dependency health (A): active liveness of the core backing services ----------------------
+# Exposed as mbs_dependency_up{component} on the API /metrics via a scrape-time collector doing
+# SHORT-TIMEOUT SYNCHRONOUS probes. The /ready probe already checks Postgres+Redis but is not
+# scraped, so a Redis-only outage (whose paths fail open) is otherwise near-silent. Fully
+# best-effort: any probe error is reported as down (0) and never breaks a /metrics scrape.
+# Low-cardinality label only (component in {postgres, redis}).
+_DEP_PROBE_TIMEOUT_S = 1.0
+
+
+def _probe_postgres() -> bool:
+    """Best-effort sync Postgres liveness (SELECT 1) with a short connect timeout. The app's async
+    DSN (+asyncpg) is normalized to a plain sync DSN for psycopg2. Never raises."""
+    try:
+        import psycopg2
+
+        from apps.api.core.config import get_settings
+
+        dsn = get_settings().database_url.replace("+asyncpg", "")
+        conn = psycopg2.connect(dsn, connect_timeout=max(1, int(_DEP_PROBE_TIMEOUT_S)))
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        finally:
+            conn.close()
+        return True
+    except Exception:  # noqa: BLE001 -- a probe failure means "down", never an exception
+        return False
+
+
+def _probe_redis() -> bool:
+    """Best-effort sync Redis liveness (PING) with short socket timeouts. Never raises."""
+    try:
+        import redis
+
+        from apps.api.core.config import get_settings
+
+        client = redis.from_url(
+            get_settings().redis_url,
+            socket_connect_timeout=_DEP_PROBE_TIMEOUT_S,
+            socket_timeout=_DEP_PROBE_TIMEOUT_S,
+        )
+        try:
+            return bool(client.ping())
+        finally:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        return False
+
+
 if _PROM:
     from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
@@ -308,6 +361,19 @@ if _PROM:
                 bage.add_metric([], max(0.0, _time.time() - last_beat_ts))
                 yield bage
 
+    class DependencyHealthCollector:
+        """Yields mbs_dependency_up{component} from short-timeout SYNC probes at scrape time.
+        Best-effort: a probe error is reported as down (0); the collector itself never raises, so a
+        dependency outage can never break the /metrics scrape."""
+
+        def collect(self):
+            g = GaugeMetricFamily(
+                "mbs_dependency_up", "Core backing-service liveness (1=up, 0=down)", labels=["component"]
+            )
+            g.add_metric(["postgres"], 1.0 if _probe_postgres() else 0.0)
+            g.add_metric(["redis"], 1.0 if _probe_redis() else 0.0)
+            yield g
+
 
 _reliability_registered = False
 
@@ -325,6 +391,26 @@ def register_reliability_collector() -> bool:
 
         REGISTRY.register(ReliabilityCollector())
         _reliability_registered = True
+        return True
+    except Exception:  # noqa: BLE001 -- never break app startup on a metrics-wiring issue
+        return False
+
+
+_dependency_registered = False
+
+
+def register_dependency_health_collector() -> bool:
+    """Register the DependencyHealthCollector (mbs_dependency_up) on the default registry.
+    Idempotent + best-effort. Call from the API process ONLY (mirrors register_reliability_collector)
+    so the gauge appears once, on api:8000/metrics. Returns True iff registered by THIS call."""
+    global _dependency_registered
+    if not _PROM or _dependency_registered:
+        return False
+    try:
+        from prometheus_client import REGISTRY
+
+        REGISTRY.register(DependencyHealthCollector())
+        _dependency_registered = True
         return True
     except Exception:  # noqa: BLE001 -- never break app startup on a metrics-wiring issue
         return False

@@ -24,7 +24,9 @@ newline** so the header matches the API's stripped token.
 ## Alerts (`alerts.yml`)
 Critical: `MbsApiDown`, `MbsWorkerDown`, `MbsApiHighServerErrorRate` (5xx > 5%),
 `MbsBeatStalled` (no beat heartbeat > 3min — the scheduler, or worker-default draining the
-default queue, is down, so no scheduled scans/backup/retention/reaper run).
+default queue, is down, so no scheduled scans/backup/retention/reaper run),
+`MbsDependencyDown` (`mbs_dependency_up{component}` == 0 for 2min — the API's short-timeout probe
+of Postgres/Redis is failing; catches a Redis outage that fail-open consumers would otherwise hide).
 Warning: `MbsHighScanFailureRatio`, `MbsExcessiveToolFailures`, `MbsAiCostHigh` (configurable
 $ threshold in the rule), `MbsScanRecoveryActivity` (orphan-reaper/relay firing = worker-loss
 or queue-backlog proxy). Prometheus evaluates the rules; wiring them to a notifier
@@ -32,9 +34,10 @@ or queue-backlog proxy). Prometheus evaluates the rules; wiring them to a notifi
 
 ## Known gaps / recommended next increments (intentionally deferred)
 These need additional components and were kept out of this additive step:
-- **Redis / Database "unavailable" alerts** — require `redis_exporter` / `postgres_exporter`
-  (or a small `mbs_dependency_up{component}` gauge fed by the app's `/ready` probe). Add as a
-  scoped follow-up.
+- **Redis / Database "unavailable" alerts** — DONE (item A). The API exposes
+  `mbs_dependency_up{component=postgres|redis}` from short-timeout synchronous probes
+  (`core/observability.py::DependencyHealthCollector`, registered API-side only) and
+  `MbsDependencyDown` alerts on it. No exporter required.
 - **True scan-queue-depth backlog** — needs a Celery/Redis queue-depth exporter. Until then
   `MbsScanRecoveryActivity` is the backlog proxy.
 - **Worker counter aggregation under prefork** — the worker `:9100` endpoint reports

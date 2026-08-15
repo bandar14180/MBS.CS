@@ -51,6 +51,8 @@ def test_alert_rules_present_and_well_formed():
             severities.add(rule["labels"]["severity"])
     for expected in (
         "MbsApiDown", "MbsWorkerDown", "MbsApiHighServerErrorRate",
+        # A: dependency health
+        "MbsDependencyDown",
         "MbsHighScanFailureRatio", "MbsExcessiveToolFailures", "MbsAiCostHigh",
         "MbsScanRecoveryActivity",
         # F4 reliability alerts
@@ -83,6 +85,8 @@ def test_alert_expressions_reference_existing_metrics():
                    "mbs_backup_age_seconds",
                    # P1.1 beat-liveness gauge
                    "mbs_beat_age_seconds",
+                   # A dependency-health gauge
+                   "mbs_dependency_up",
                    # E5 email delivery
                    "mbs_email_failed_total",
                    # AI-2.2A budget enforcement

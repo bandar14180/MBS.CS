@@ -19,6 +19,7 @@ from apps.api.core.observability import (
     CONTENT_TYPE_LATEST,
     get_correlation_id,
     metrics_response_body,
+    register_dependency_health_collector,
     register_reliability_collector,
 )
 from apps.api.modules.api_keys.router import router as api_keys_router
@@ -197,6 +198,9 @@ def create_app() -> FastAPI:
     # F4: expose the Redis-backed reliability signals (DLQ depth + backup/retention failures) on
     # this API process's /metrics only (idempotent; the worker's :9100 must not double-expose them).
     register_reliability_collector()
+    # A: expose mbs_dependency_up{component} (Postgres/Redis liveness) on this API process's
+    # /metrics only (same rationale -- registered once, best-effort).
+    register_dependency_health_collector()
 
     return app
 

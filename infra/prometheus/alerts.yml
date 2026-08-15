@@ -20,6 +20,17 @@ groups:
           summary: "MBS worker unavailable (metrics endpoint unreachable)"
           description: "Prometheus cannot scrape the worker metrics endpoint ({{ $labels.instance }}) for >2m."
 
+      # A: dependency health. mbs_dependency_up{component} is 0 when the API's short-timeout probe
+      # of a core backing service fails. Catches outages that other alerts miss -- notably a Redis
+      # outage, whose consumers fail OPEN, so it need not raise the 5xx rate.
+      - alert: MbsDependencyDown
+        expr: mbs_dependency_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Core dependency {{ $labels.component }} is down"
+          description: "The API's liveness probe of {{ $labels.component }} has failed for >2m -- Postgres/Redis outage or partition; scans, auth, and queueing are impacted."
+
       - alert: MbsApiHighServerErrorRate
         expr: >
           sum(rate(mbs_http_requests_total{status=~"5.."}[5m]))
