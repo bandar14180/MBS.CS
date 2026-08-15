@@ -25,6 +25,7 @@ from apps.api.modules.api_keys.router import router as api_keys_router
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.assistant.router import ai_router as ai_status_router
 from apps.api.modules.assistant.router import router as assistant_router
+from apps.api.modules.ai_usage.router import router as ai_usage_router
 from apps.api.modules.audit.router import router as audit_router
 from apps.api.modules.auth.router import router as auth_router
 from apps.api.modules.billing.router import public_router as plans_public_router
@@ -49,7 +50,7 @@ _ROUTERS = (
     dashboard_router, authorization_scope_router, scans_router, scan_capabilities_router, schedules_router,
     assets_router, vulnerabilities_router, reports_router, assistant_router,
     ai_status_router, billing_router, plans_public_router, notifications_router,
-    audit_router, api_keys_router,
+    audit_router, api_keys_router, ai_usage_router,
 )
 
 
