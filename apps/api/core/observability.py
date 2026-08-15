@@ -197,6 +197,10 @@ RETENTION_FAILURES_KEY = "mbs:reliability:retention_failures_total"
 # DR-4: unix timestamp of the last SUCCESSFUL backup set; drives mbs_backup_age_seconds so a
 # silently-stalled backup pipeline is alertable even while no explicit failure is recorded.
 BACKUP_LAST_SUCCESS_KEY = "mbs:reliability:backup_last_success_ts"
+# P1.1: unix timestamp of the last beat-dispatched heartbeat a worker processed; drives
+# mbs_beat_age_seconds so a stalled beat scheduler (or a down worker-default) is alertable even
+# while no task explicitly fails.
+BEAT_LAST_TICK_KEY = "mbs:reliability:beat_last_tick_ts"
 
 
 def _reliability_redis():
@@ -245,6 +249,20 @@ def record_backup_success(ts: int | None = None) -> None:
         pass
 
 
+def record_beat_tick(ts: int | None = None) -> None:
+    """P1.1: stamp the time of the last beat heartbeat. Best-effort Redis SET; never raises.
+    Read back at scrape time as mbs_beat_age_seconds. Safe when Redis/config is unavailable."""
+    import time as _time
+
+    client = _reliability_redis()
+    if client is None:
+        return
+    try:
+        client.set(BEAT_LAST_TICK_KEY, int(ts if ts is not None else _time.time()))
+    except Exception:  # noqa: BLE001 -- reliability accounting must never break the caller
+        pass
+
+
 if _PROM:
     from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
@@ -261,6 +279,7 @@ if _PROM:
                 backup_failures = int(client.get(BACKUP_FAILURES_KEY) or 0)
                 retention_failures = int(client.get(RETENTION_FAILURES_KEY) or 0)
                 last_backup_ts = int(client.get(BACKUP_LAST_SUCCESS_KEY) or 0)
+                last_beat_ts = int(client.get(BEAT_LAST_TICK_KEY) or 0)
             except Exception:  # noqa: BLE001
                 return
             dlq = GaugeMetricFamily("mbs_dlq_depth", "Scan dead-letter queue depth (LLEN)", labels=["queue"])
@@ -280,6 +299,14 @@ if _PROM:
                 age = GaugeMetricFamily("mbs_backup_age_seconds", "Seconds since the last successful backup set")
                 age.add_metric([], max(0.0, _time.time() - last_backup_ts))
                 yield age
+            # P1.1: seconds since the last beat heartbeat (only once beat has ticked at least once,
+            # so a never-started scheduler doesn't emit a misleading age).
+            if last_beat_ts > 0:
+                import time as _time
+
+                bage = GaugeMetricFamily("mbs_beat_age_seconds", "Seconds since the last Celery beat heartbeat")
+                bage.add_metric([], max(0.0, _time.time() - last_beat_ts))
+                yield bage
 
 
 _reliability_registered = False

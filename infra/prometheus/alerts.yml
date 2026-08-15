@@ -135,6 +135,18 @@ groups:
           summary: "No successful backup in over 30h"
           description: "The last successful backup is {{ $value | humanizeDuration }} old -- the backup pipeline may be stalled (beat/worker-default down or task erroring)."
 
+      # P1.1: beat liveness. The scheduler stamps a heartbeat every ~60s; if it stalls (beat down,
+      # or worker-default not draining the default queue) the age climbs and NO scheduled work
+      # (scans/backup/retention/reaper/relay) runs. 180s tolerates a couple of missed ticks +
+      # scrape jitter. mbs_beat_age_seconds is only emitted once beat has ticked at least once.
+      - alert: MbsBeatStalled
+        expr: mbs_beat_age_seconds > 180
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Celery beat scheduler stalled"
+          description: "No beat heartbeat for {{ $value | humanizeDuration }} -- the scheduler (or worker-default draining the default queue) may be down; scheduled scans/backup/retention/reaper are not running."
+
       - alert: MbsRetentionFailing
         expr: increase(mbs_retention_failures_total[6h]) > 0
         for: 5m

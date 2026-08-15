@@ -20,6 +20,8 @@ celery_app = Celery(
         "apps.api.celery_app.tasks.retention_tasks",
         # E2: async email delivery (default queue). Gated OFF unless email_enabled.
         "apps.api.celery_app.tasks.notification_tasks",
+        # P1.1: beat-liveness heartbeat (default queue). Always scheduled; stamps a Redis timestamp.
+        "apps.api.celery_app.tasks.reliability_tasks",
     ],
 )
 celery_app.conf.broker_connection_retry_on_startup = True
@@ -71,6 +73,13 @@ celery_app.conf.beat_schedule = {
     "reap-orphaned-scans": {
         "task": "scans.reap_orphans",
         "schedule": float(settings.scan_orphan_reaper_interval_seconds),
+    },
+    # P1.1: beat-liveness heartbeat. A tiny task stamped every tick so a stalled scheduler is
+    # alertable (mbs_beat_age_seconds -> MbsBeatStalled). Always scheduled -- beat liveness matters
+    # in every deployment. Runs on the default queue, never `scans`; purely additive observability.
+    "beat-heartbeat": {
+        "task": "reliability.beat_heartbeat",
+        "schedule": float(settings.beat_heartbeat_interval_seconds),
     },
 }
 

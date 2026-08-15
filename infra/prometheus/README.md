@@ -22,7 +22,9 @@ docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml up -
 newline** so the header matches the API's stripped token.
 
 ## Alerts (`alerts.yml`)
-Critical: `MbsApiDown`, `MbsWorkerDown`, `MbsApiHighServerErrorRate` (5xx > 5%).
+Critical: `MbsApiDown`, `MbsWorkerDown`, `MbsApiHighServerErrorRate` (5xx > 5%),
+`MbsBeatStalled` (no beat heartbeat > 3min — the scheduler, or worker-default draining the
+default queue, is down, so no scheduled scans/backup/retention/reaper run).
 Warning: `MbsHighScanFailureRatio`, `MbsExcessiveToolFailures`, `MbsAiCostHigh` (configurable
 $ threshold in the rule), `MbsScanRecoveryActivity` (orphan-reaper/relay firing = worker-loss
 or queue-backlog proxy). Prometheus evaluates the rules; wiring them to a notifier

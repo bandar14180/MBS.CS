@@ -225,6 +225,10 @@ class Settings(BaseSettings):
     scan_orphan_recovery_enabled: bool = True         # master switch for the reaper
     scan_orphan_timeout_seconds: int = 7200           # 2h; 'running' older than this is an orphan
     scan_orphan_reaper_interval_seconds: int = 300    # reaper cadence (beat), default 5 min
+    # P1.1 -- beat-liveness heartbeat. A tiny periodic task stamps a Redis timestamp each tick so a
+    # stalled beat scheduler (or a down worker-default draining the default queue) is alertable via
+    # mbs_beat_age_seconds -> MbsBeatStalled. Always scheduled; additive, cheap, low-cardinality.
+    beat_heartbeat_interval_seconds: int = 60         # heartbeat cadence (beat), default 60s
 
     # Queued-scan relay: a scan row is durably committed 'queued' BEFORE it is dispatched to
     # Celery (create_scan), and celery_task_id is set only AFTER a successful dispatch. So a
