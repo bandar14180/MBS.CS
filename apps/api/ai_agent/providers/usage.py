@@ -119,6 +119,13 @@ def emit_usage(usage: AIUsage, *, latency_ms: float = 0.0) -> None:
         },
     )
     _update_metrics(usage)
+    # AI-2.5: observe successful-call latency (best-effort; low-cardinality agent_role label).
+    try:
+        from apps.api.core.observability import record_ai_latency
+
+        record_ai_latency(usage.agent_role or "unknown", max(0.0, latency_ms) / 1000.0)
+    except Exception:  # noqa: BLE001 -- metrics strictly best-effort
+        pass
     # AI-2.2A: accumulate this successful call's estimated cost into the workspace's rolling
     # daily budget (best-effort; a Redis failure is swallowed inside add_spend).
     if usage.workspace_id and usage.estimated_cost_usd:

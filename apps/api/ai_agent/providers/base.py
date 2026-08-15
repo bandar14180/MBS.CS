@@ -164,6 +164,7 @@ class BaseAIProvider(ABC):
                 emit_usage(result.usage, latency_ms=(time.monotonic() - started) * 1000)
                 return extract_json(result.text)
             except AIProviderError:
+                _record_ai_error(self.provider_name)  # AI-2.5: terminal provider error
                 raise  # already-terminal (e.g. missing key): do not retry
             except Exception as exc:  # noqa: BLE001 -- classify then re-raise
                 last_exc = exc
@@ -176,7 +177,18 @@ class BaseAIProvider(ABC):
         # error as an availability failure when the exhausted cause was retryable (429/5xx/
         # timeout/connection) so a fallback provider is tried; a non-retryable cause (invalid
         # request) stays availability=False and does NOT fall over.
+        _record_ai_error(self.provider_name)  # AI-2.5: retries exhausted -> failed call
         raise AIProviderError(
             f"{self.provider_name} call failed after {attempts} attempt(s): {last_exc}",
             availability=bool(last_exc is not None and self._is_retryable(last_exc)),
         ) from last_exc
+
+
+def _record_ai_error(provider: str) -> None:
+    """AI-2.5: best-effort AI-error counter (never breaks the caller)."""
+    try:
+        from apps.api.core.observability import record_ai_error
+
+        record_ai_error(provider)
+    except Exception:  # noqa: BLE001
+        pass

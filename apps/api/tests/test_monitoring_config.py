@@ -61,6 +61,8 @@ def test_alert_rules_present_and_well_formed():
         "MbsEmailDeliveryFailing",
         # AI-2.2A budget enforcement
         "MbsAiBudgetBlocking",
+        # AI-2.5 observability SLOs
+        "MbsAiLatencySlo", "MbsAiErrorRateHigh", "MbsAiFailoverActive",
     ):
         assert expected in names, f"missing alert {expected}"
     assert {"critical", "warning"} <= severities
@@ -80,7 +82,9 @@ def test_alert_expressions_reference_existing_metrics():
                    # E5 email delivery
                    "mbs_email_failed_total",
                    # AI-2.2A budget enforcement
-                   "mbs_ai_budget_blocked_total"):
+                   "mbs_ai_budget_blocked_total",
+                   # AI-2.5 observability SLOs
+                   "mbs_ai_latency_seconds", "mbs_ai_errors_total", "mbs_ai_failover_total"):
         assert metric in exprs
     assert 'up{job="mbs-api"}' in exprs and 'up{job="mbs-worker"}' in exprs
 

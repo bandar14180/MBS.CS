@@ -66,6 +66,12 @@ if _PROM:
     AI_BUDGET_BLOCKED = Counter(
         "mbs_ai_budget_blocked_total", "AI calls blocked by the daily budget cap", ["agent_role"]
     )
+    # AI-2.5: latency of successful AI calls + AI calls that ultimately failed. Low-cardinality
+    # labels ONLY (bounded agent_role / provider) -- never model/workspace/scan/host.
+    AI_LATENCY = Histogram(
+        "mbs_ai_latency_seconds", "AI provider call latency (successful calls)", ["agent_role"]
+    )
+    AI_ERRORS = Counter("mbs_ai_errors_total", "AI provider calls that ultimately failed", ["provider"])
     # Phase 1.4: API error responses by stable error type (low-cardinality; never a
     # path/scan_id/message).
     API_ERRORS = Counter("mbs_api_errors_total", "API error responses", ["type"])
@@ -106,6 +112,18 @@ def record_ai_budget_blocked(agent_role: str) -> None:
     agent_role label -- never a workspace id or amount."""
     if _PROM:
         AI_BUDGET_BLOCKED.labels(agent_role).inc()
+
+
+def record_ai_latency(agent_role: str, seconds: float) -> None:
+    """AI-2.5: observe the latency of a successful AI call (label: bounded agent_role)."""
+    if _PROM:
+        AI_LATENCY.labels(agent_role or "unknown").observe(max(0.0, seconds))
+
+
+def record_ai_error(provider: str) -> None:
+    """AI-2.5: count one AI call that ultimately failed (label: bounded provider name)."""
+    if _PROM:
+        AI_ERRORS.labels(provider or "unknown").inc()
 
 
 def record_scan_outcome(status: str) -> None:

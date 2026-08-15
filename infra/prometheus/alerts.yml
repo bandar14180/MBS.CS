@@ -93,6 +93,37 @@ groups:
           summary: "AI budget cap is blocking calls"
           description: "{{ $value }} AI call(s) were blocked by the daily budget cap in the last hour -- a workspace reached its AI spend limit."
 
+      # AI-2.5: p95 AI-call latency SLO. Successful calls only; 30s p95 tolerates a large model
+      # while flagging a degraded provider / slow model.
+      - alert: MbsAiLatencySlo
+        expr: histogram_quantile(0.95, sum(rate(mbs_ai_latency_seconds_bucket[10m])) by (le)) > 30
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI p95 latency SLO breached"
+          description: "AI call p95 latency is {{ $value | humanizeDuration }} (>30s) over 10m -- a provider/model may be degraded."
+
+      # AI-2.5: AI call error rate. errors / (errors + successful calls). >20% over 15m = degraded.
+      - alert: MbsAiErrorRateHigh
+        expr: >
+          sum(rate(mbs_ai_errors_total[15m]))
+            / clamp_min(sum(rate(mbs_ai_calls_total[15m])) + sum(rate(mbs_ai_errors_total[15m])), 0.001) > 0.2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI error rate above 20%"
+          description: "More than 20% of AI calls failed over the last 15m -- check provider health/keys/credits."
+
+      # AI-2.5: provider failover firing means the PRIMARY provider is degraded (AI still up via a
+      # fallback). Worth a look even though availability is preserved.
+      - alert: MbsAiFailoverActive
+        expr: increase(mbs_ai_failover_total[15m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI provider failover active"
+          description: "{{ $value }} AI provider failover(s) in the last 15m -- the primary provider is degraded; running on a fallback."
+
       # DR-4: freshness. Catches a SILENTLY stalled pipeline (no explicit failure, just no new
       # successful set) -- e.g. beat stopped or the task never ran. 30h tolerates a daily cadence
       # plus slack. mbs_backup_age_seconds is only emitted once a backup has ever succeeded.
