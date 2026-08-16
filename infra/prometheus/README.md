@@ -50,10 +50,13 @@ These need additional components and were kept out of this additive step:
   `MbsDependencyDown` alerts on it. No exporter required.
 - **True scan-queue-depth backlog** — needs a Celery/Redis queue-depth exporter. Until then
   `MbsScanRecoveryActivity` is the backlog proxy.
-- **Worker counter aggregation under prefork** — the worker `:9100` endpoint reports
-  target *liveness* (`up{}`) and metric families now; full per-child counter values require
-  `PROMETHEUS_MULTIPROC_DIR` set on the worker with a pre-created, writable dir at the
-  container entrypoint (avoids a startup crash). A separate, tested change.
+- **Worker counter aggregation under prefork** — DONE (W1). `worker` + `worker-default` set
+  `PROMETHEUS_MULTIPROC_DIR=/run/prometheus-multiproc`, backed by a **tmpfs** (exists + writable at
+  startup so there is no import-time crash, and empty on every run so no stale counter files carry
+  across restarts). `metrics.py` serves a `MultiProcessCollector` that sums every prefork child's
+  files, so worker task counters (`mbs_scan_*`, `mbs_tool_failure_total`, agent `mbs_ai_*`,
+  `mbs_scan_reaped/relayed`, `mbs_schedule_launched`) are exported truthfully. Not set on `api`
+  (multiprocess mode is incompatible with its custom collectors) or `beat` (runs no tasks).
 - **Alertmanager** — DONE (R4): fired alerts are delivered to email (see "Alert delivery" above).
 - **Grafana dashboards** — an importable AI dashboard ships (`infra/grafana/ai-dashboard.json`); a
   bundled Grafana service is still out of scope.

@@ -204,6 +204,34 @@ def test_r1a_redis_durability_aof_and_volume():
     assert redis.get("healthcheck", {}).get("test")
 
 
+def _svc_env(service: dict) -> dict:
+    env = service.get("environment", {})
+    if isinstance(env, list):   # normalize the "KEY=VALUE" list form to a mapping
+        return dict(e.split("=", 1) for e in env if "=" in e)
+    return env or {}
+
+
+def test_worker_prefork_multiproc_config():
+    """W1: worker + worker-default aggregate prefork-child metrics -- each sets
+    PROMETHEUS_MULTIPROC_DIR and mounts a tmpfs at that SAME path (they must ship together, else the
+    worker crashes creating metric files in a missing dir). The API must NOT set it -- multiprocess
+    mode is incompatible with its custom collectors (ReliabilityCollector/DependencyHealthCollector)."""
+    base_p = REPO_ROOT / "infra" / "docker-compose.yml"
+    if not base_p.is_file():
+        pytest.skip("infra/ not present in this environment")
+    services = yaml.safe_load(base_p.read_text(encoding="utf-8"))["services"]
+    for svc in ("worker", "worker-default"):
+        mp = _svc_env(services[svc]).get("PROMETHEUS_MULTIPROC_DIR")
+        assert mp, f"{svc} must set PROMETHEUS_MULTIPROC_DIR"
+        tmpfs_targets = [
+            v.get("target") for v in services[svc].get("volumes", [])
+            if isinstance(v, dict) and v.get("type") == "tmpfs"
+        ]
+        assert mp in tmpfs_targets, f"{svc} must mount a tmpfs at {mp} (crash-safe + empty per run)"
+    # the API is multi-process (uvicorn --workers) but uses custom collectors -> multiprocess OFF
+    assert "PROMETHEUS_MULTIPROC_DIR" not in _svc_env(services["api"])
+
+
 def test_retention_p1_stage1_enabled_dry_run():
     """P1 Stage 1: retention is SCHEDULED in production but PLAN-ONLY -- enabled on both
     worker-default (executes) and beat (schedules), and dry-run stays true so nothing is deleted
