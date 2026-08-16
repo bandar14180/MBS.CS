@@ -112,6 +112,51 @@ def test_prod_compose_prometheus_service():
     assert "prometheus.yml" in mounts and "alerts.yml" in mounts
 
 
+def test_prometheus_wires_alertmanager():
+    """R4: Prometheus routes fired alerts to the Alertmanager service."""
+    cfg = _load(PROM_DIR / "prometheus.yml")
+    ams = cfg.get("alerting", {}).get("alertmanagers", [])
+    targets = [t for am in ams for sc in am.get("static_configs", []) for t in sc.get("targets", [])]
+    assert "alertmanager:9093" in targets, "Prometheus must point at the alertmanager service"
+
+
+def test_alertmanager_config_email_via_secret():
+    """R4: Alertmanager emails alerts using the SHARED smtp_password secret (never an inline
+    password), routed to an email receiver that has a recipient."""
+    am_p = REPO_ROOT / "infra" / "alertmanager" / "alertmanager.yml"
+    if not am_p.is_file():
+        pytest.skip("infra/ not present in this environment")
+    am = yaml.safe_load(am_p.read_text(encoding="utf-8"))
+    g = am["global"]
+    assert g.get("smtp_auth_password_file") == "/run/secrets/smtp_password"   # secret via file
+    assert "smtp_auth_password" not in g                                       # never inline
+    assert g.get("smtp_smarthost") and g.get("smtp_from")
+    assert am["route"]["receiver"] == "email"
+    receivers = {r["name"]: r for r in am["receivers"]}
+    assert "email" in receivers
+    ec = receivers["email"].get("email_configs")
+    assert ec and ec[0].get("to"), "email receiver must have a recipient"
+
+
+def test_prod_compose_alertmanager_service():
+    """R4: Alertmanager runs in the prod overlay -- pinned image, localhost-only, mounts its config,
+    uses the smtp_password secret; the secret + durable data volume are declared, and Prometheus
+    depends on it."""
+    compose = REPO_ROOT / "infra" / "docker-compose.prod.yml"
+    if not compose.is_file():
+        pytest.skip("infra/ not present in this environment")
+    cfg = yaml.safe_load(compose.read_text(encoding="utf-8"))
+    am = cfg["services"]["alertmanager"]
+    assert am["image"].startswith("prom/alertmanager:")
+    assert am["image"] != "prom/alertmanager:latest"                       # pinned, not :latest
+    assert any(str(p).startswith("127.0.0.1:9093") for p in am["ports"])   # never public
+    assert "smtp_password" in am["secrets"]
+    assert any("alertmanager.yml" in str(v) for v in am["volumes"])
+    assert "smtp_password" in cfg["secrets"]                               # secret declared
+    assert "alertmanager_data" in cfg.get("volumes", {})                  # durable state volume
+    assert "alertmanager" in cfg["services"]["prometheus"]["depends_on"]
+
+
 def test_dr1_backup_durability_and_prod_enablement():
     """DR-1: backups persist across container recreation (named volume) and are enabled +
     encrypted in the production overlay."""

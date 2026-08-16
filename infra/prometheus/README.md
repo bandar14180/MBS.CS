@@ -1,7 +1,8 @@
 # MBS.SC Monitoring (Phase 4.2)
 
 Lightweight Prometheus monitoring for the production deployment. **Additive** — no app,
-schema, or API changes; no Grafana/Alertmanager/exporters added.
+schema, or API changes. Alert delivery is via Alertmanager → email (R4, below); no
+Grafana service or metric exporters are bundled.
 
 ## What runs
 Enabled by the **production** overlay:
@@ -29,8 +30,17 @@ default queue, is down, so no scheduled scans/backup/retention/reaper run),
 of Postgres/Redis is failing; catches a Redis outage that fail-open consumers would otherwise hide).
 Warning: `MbsHighScanFailureRatio`, `MbsExcessiveToolFailures`, `MbsAiCostHigh` (configurable
 $ threshold in the rule), `MbsScanRecoveryActivity` (orphan-reaper/relay firing = worker-loss
-or queue-backlog proxy). Prometheus evaluates the rules; wiring them to a notifier
-(Alertmanager) is a deliberate follow-up.
+or queue-backlog proxy), plus the F4/DR/AI/email alerts (DLQ, backup, retention, AI SLOs,
+email-delivery).
+
+### Alert delivery — Alertmanager → email (R4)
+Fired alerts are delivered by an **`alertmanager`** service (prod overlay, published to
+**`127.0.0.1:9093` only**). Prometheus routes to it (`alerting:` block in `prometheus.yml`);
+config is in [`../alertmanager/alertmanager.yml`](../alertmanager/alertmanager.yml). It emails via
+the **same `smtp_password` Docker Secret** as the app's E-series email — only the password is a
+secret (`smtp_auth_password_file`). Before enabling: set the non-secret `smtp_smarthost` /
+`smtp_from` / `smtp_auth_username` / receiver `to` in `alertmanager.yml`, and provide
+`infra/secrets/smtp_password.txt`. Critical alerts repeat hourly; warnings every 4h.
 
 ## Known gaps / recommended next increments (intentionally deferred)
 These need additional components and were kept out of this additive step:
@@ -44,4 +54,6 @@ These need additional components and were kept out of this additive step:
   target *liveness* (`up{}`) and metric families now; full per-child counter values require
   `PROMETHEUS_MULTIPROC_DIR` set on the worker with a pre-created, writable dir at the
   container entrypoint (avoids a startup crash). A separate, tested change.
-- **Alertmanager / Grafana dashboards** — out of scope for this phase.
+- **Alertmanager** — DONE (R4): fired alerts are delivered to email (see "Alert delivery" above).
+- **Grafana dashboards** — an importable AI dashboard ships (`infra/grafana/ai-dashboard.json`); a
+  bundled Grafana service is still out of scope.

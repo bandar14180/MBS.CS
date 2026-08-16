@@ -9,6 +9,14 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+# R4: deliver fired alerts to Alertmanager (email receiver -- see infra/alertmanager/). The
+# alertmanager service runs in the production overlay only; if it is absent, Prometheus simply
+# logs a delivery warning and keeps evaluating rules (non-fatal).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
 scrape_configs:
   # API process: HTTP request/latency + API-error counters. Token-gated (METRICS_MODE=token):
   # send the x-metrics-token header, value read from the mounted secret -- no token in this file.

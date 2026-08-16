@@ -103,9 +103,30 @@ services:
       - "127.0.0.1:9090:9090"
     depends_on:
       - api
+      - alertmanager
+
+  # R4: alert delivery. Alertmanager receives fired alerts from Prometheus and emails them using
+  # the SAME smtp_password secret as the app's E-series email (config in ./alertmanager/). Swap the
+  # placeholder smarthost/from/to in alertmanager.yml and provide ./secrets/smtp_password.txt before
+  # use. Published to LOCALHOST ONLY -- never exposed publicly.
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    secrets:
+      - smtp_password
+    ports:
+      - "127.0.0.1:9093:9093"
 
 volumes:
   prometheus_data:
+  # R4: durable Alertmanager state (silences, notification log) across recreation.
+  alertmanager_data:
 
 secrets:
   jwt_secret_key:
@@ -119,3 +140,6 @@ secrets:
   # DR-2: master key for AES-256-GCM backup encryption at rest.
   backup_encryption_key:
     file: ./secrets/backup_encryption_key.txt
+  # E1 / R4: SMTP password shared by the app's email tasks and Alertmanager alert delivery.
+  smtp_password:
+    file: ./secrets/smtp_password.txt
