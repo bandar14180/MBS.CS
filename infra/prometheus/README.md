@@ -48,8 +48,10 @@ These need additional components and were kept out of this additive step:
   `mbs_dependency_up{component=postgres|redis}` from short-timeout synchronous probes
   (`core/observability.py::DependencyHealthCollector`, registered API-side only) and
   `MbsDependencyDown` alerts on it. No exporter required.
-- **True scan-queue-depth backlog** — needs a Celery/Redis queue-depth exporter. Until then
-  `MbsScanRecoveryActivity` is the backlog proxy.
+- **True scan-queue-depth backlog** — DONE. The API-side `ReliabilityCollector` exposes
+  `mbs_queue_depth{queue="scans"|"default"}` (LLEN of each Celery broker queue's Redis list) and
+  `MbsScanQueueBacklog` (scans > 50 for 15m — an operational/tunable threshold) alerts on it.
+  Assumes queue name == Redis list key (no priority queues configured). No exporter required.
 - **Worker counter aggregation under prefork** — DONE (W1). `worker` + `worker-default` set
   `PROMETHEUS_MULTIPROC_DIR=/run/prometheus-multiproc`, backed by a **tmpfs** (exists + writable at
   startup so there is no import-time crash, and empty on every run so no stale counter files carry

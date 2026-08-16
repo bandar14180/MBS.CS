@@ -201,6 +201,11 @@ BACKUP_LAST_SUCCESS_KEY = "mbs:reliability:backup_last_success_ts"
 # mbs_beat_age_seconds so a stalled beat scheduler (or a down worker-default) is alertable even
 # while no task explicitly fails.
 BEAT_LAST_TICK_KEY = "mbs:reliability:beat_last_tick_ts"
+# Broker queue-depth backlog: the kombu Redis transport keys each Celery queue's pending-message
+# list by the queue NAME, so LLEN(<queue>) is the count of tasks waiting to be picked up. These
+# MUST match worker.py (task_default_queue="default" + the scans route). ASSUMPTION: no priority
+# queues are configured -- Celery priorities would suffix these keys and change the mapping.
+_BROKER_QUEUES = ("scans", "default")
 
 
 def _reliability_redis():
@@ -329,6 +334,7 @@ if _PROM:
                 return
             try:
                 depth = int(client.llen(DLQ_REDIS_KEY) or 0)
+                queue_depths = {q: int(client.llen(q) or 0) for q in _BROKER_QUEUES}
                 backup_failures = int(client.get(BACKUP_FAILURES_KEY) or 0)
                 retention_failures = int(client.get(RETENTION_FAILURES_KEY) or 0)
                 last_backup_ts = int(client.get(BACKUP_LAST_SUCCESS_KEY) or 0)
@@ -338,6 +344,14 @@ if _PROM:
             dlq = GaugeMetricFamily("mbs_dlq_depth", "Scan dead-letter queue depth (LLEN)", labels=["queue"])
             dlq.add_metric(["scans.run_scan"], float(depth))
             yield dlq
+            # Broker queue backlog: pending tasks per Celery queue (LLEN of the queue's Redis list).
+            # A missing/empty queue reads 0. Assumes queue name == list key (no priority queues).
+            qd = GaugeMetricFamily(
+                "mbs_queue_depth", "Pending tasks in a Celery broker queue (LLEN)", labels=["queue"]
+            )
+            for q, d in queue_depths.items():
+                qd.add_metric([q], float(d))
+            yield qd
             cb = CounterMetricFamily("mbs_backup_failures", "Backup runs that failed (reliability signal)")
             cb.add_metric([], float(backup_failures))
             yield cb

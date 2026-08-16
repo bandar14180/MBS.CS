@@ -57,6 +57,8 @@ def test_alert_rules_present_and_well_formed():
         "MbsScanRecoveryActivity",
         # F4 reliability alerts
         "MbsDlqBacklog", "MbsBackupFailing", "MbsRetentionFailing",
+        # scan-queue backlog
+        "MbsScanQueueBacklog",
         # DR-4 backup freshness
         "MbsBackupStale",
         # P1.1 beat liveness
@@ -81,6 +83,8 @@ def test_alert_expressions_reference_existing_metrics():
                    "mbs_scan_reaped_total", "mbs_scan_relayed_total",
                    # F4 reliability metrics (exposed by the API ReliabilityCollector)
                    "mbs_dlq_depth", "mbs_backup_failures_total", "mbs_retention_failures_total",
+                   # scan-queue backlog gauge
+                   "mbs_queue_depth",
                    # DR-4 backup freshness gauge
                    "mbs_backup_age_seconds",
                    # P1.1 beat-liveness gauge

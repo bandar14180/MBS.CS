@@ -77,6 +77,18 @@ groups:
           summary: "Scan recovery paths active (backlog / worker-loss proxy)"
           description: "The orphan reaper or queued relay fired -- indicates worker loss or queue-dispatch backlog."
 
+      # Direct scan-queue backlog: pending scan tasks piling up in the broker (workers can't keep
+      # pace or are stuck). Unlike MbsScanRecoveryActivity (a worker-LOSS proxy), this reads the
+      # actual queue length. The >50-for-15m threshold is an OPERATIONAL / TUNABLE default -- adjust
+      # to your worker count and scan cadence.
+      - alert: MbsScanQueueBacklog
+        expr: mbs_queue_depth{queue="scans"} > 50
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scan queue backlog"
+          description: "{{ $value }} scan task(s) have been queued for >15m (mbs_queue_depth{queue=\"scans\"}) -- workers may be overwhelmed or stuck; consider scaling the scans worker."
+
       # F4: reliability signals exposed by the API-side Redis-backed ReliabilityCollector.
       - alert: MbsDlqBacklog
         expr: mbs_dlq_depth > 0
