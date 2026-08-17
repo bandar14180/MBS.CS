@@ -126,6 +126,21 @@ class RedTeamAgent:
     def __init__(self, client: SupportsComplete | None = None):
         self._client = client or get_ai_client()
 
+    def _final(self, decision: AgentDecision) -> AgentDecision:
+        """AI-1 Step 4: audit every agent decision on the mbs.ai.security channel with SAFE
+        metadata only -- action/tool/confidence/versions. No target, findings, rationale, or
+        model reasoning (the tool name is an allowlisted constant; stop_reason free-text is NOT
+        logged)."""
+        from apps.api.ai_agent.audit import ai_security_event
+
+        ai_security_event(
+            "ai.decision", agent="red_team_agent",
+            decision=decision.action, tool=decision.tool,
+            selected_confidence=round(decision.confidence, 3),
+            model_version=decision.model_version, prompt_version=decision.prompt_version,
+        )
+        return decision
+
     def available_tools(
         self, *, target_type: str, active_testing_allowed: bool, roe: RulesOfEngagement, already_run: set[str]
     ) -> list[str]:
@@ -224,38 +239,44 @@ class RedTeamAgent:
         used only as a fallback."""
         mv = self._client.model_version
         if not available:
-            return AgentDecision(
+            return self._final(AgentDecision(
                 "finish", None, current_phase, "no further safe actions available", mv, AGENT_PROMPT_VERSION,
                 stop_reason="no_available_tools",
-            )
+            ))
 
         catalog = "\n".join(
             f"- {n} (phase {TOOL_REGISTRY[n].kill_chain_phase}, {TOOL_REGISTRY[n].safety_tier})" for n in available
         )
+        # AI-1 Steps 1-2: every field below is derived from the scanned target -> sanitize +
+        # delimit so an injection payload in tool output cannot steer the decision. The tool
+        # allowlist ([_parse_candidates]) remains the non-bypassable backstop regardless.
+        from apps.api.ai_agent.sanitize import sanitize_untrusted, wrap_untrusted
+
         user = AGENT_USER_TEMPLATE.format(
-            target_value=target_value,
-            target_type=target_type,
-            current_phase=current_phase,
-            objective=objective or "(not specified)",
-            prior_beliefs=prior_beliefs or "(none yet)",
-            actions_summary=actions_summary or tools_run_summary or "(none yet)",
-            attack_summary=attack_summary or "(no techniques mapped yet)",
-            graph_summary=graph_summary or "(empty)",
-            findings_summary=findings_summary or "(none yet)",
+            target_value=sanitize_untrusted(target_value, max_len=256),
+            target_type=sanitize_untrusted(target_type, max_len=64),
+            current_phase=sanitize_untrusted(current_phase, max_len=64),
+            objective=sanitize_untrusted(objective, max_len=512) or "(not specified)",
+            prior_beliefs=wrap_untrusted("prior_reasoning", prior_beliefs) if prior_beliefs else "(none yet)",
+            actions_summary=wrap_untrusted("actions", actions_summary or tools_run_summary)
+            if (actions_summary or tools_run_summary) else "(none yet)",
+            attack_summary=wrap_untrusted("attack", attack_summary) if attack_summary else "(no techniques mapped yet)",
+            graph_summary=wrap_untrusted("graph", graph_summary) if graph_summary else "(empty)",
+            findings_summary=wrap_untrusted("findings", findings_summary) if findings_summary else "(none yet)",
             available_tools=catalog,
         )
         try:
             raw = self._client.complete_json(AGENT_SYSTEM, user)
         except Exception as exc:  # noqa: BLE001 -- AI failure must not break the engagement
-            return AgentDecision(
+            return self._final(AgentDecision(
                 "finish", None, current_phase, f"ai_unavailable: {type(exc).__name__}", mv, AGENT_PROMPT_VERSION,
                 stop_reason="ai_unavailable",
-            )
+            ))
         if not isinstance(raw, dict):
-            return AgentDecision(
+            return self._final(AgentDecision(
                 "finish", None, current_phase, "ai returned non-object", mv, AGENT_PROMPT_VERSION,
                 stop_reason="bad_ai_output",
-            )
+            ))
 
         observations = _str_list(raw.get("observations"))
         inferences = _str_list(raw.get("inferences"))
@@ -270,15 +291,15 @@ class RedTeamAgent:
         # a confidence floor removed every candidate, say so in the stop reason.
         if str(raw.get("action")) == "finish" or not candidates:
             default_stop = "below_confidence_floor" if (min_confidence > 0.0 and not candidates) else "no_candidates"
-            return AgentDecision(
+            return self._final(AgentDecision(
                 "finish", None, phase, stop_reason or "no valid candidate actions", mv, AGENT_PROMPT_VERSION,
                 observations=observations, inferences=inferences, hypotheses=hypotheses,
                 candidates=candidates, stop_reason=stop_reason or default_stop,
-            )
+            ))
 
         best = candidates[0]
-        return AgentDecision(
+        return self._final(AgentDecision(
             "run_tool", best.tool, phase, best.rationale or "selected by confidence", mv, AGENT_PROMPT_VERSION,
             observations=observations, inferences=inferences, hypotheses=hypotheses,
             candidates=candidates, confidence=best.confidence, stop_reason=None,
-        )
+        ))

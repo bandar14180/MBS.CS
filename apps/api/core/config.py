@@ -15,7 +15,15 @@ _FILE_BACKED_SECRETS = (
     "S3_SECRET_KEY",
     "ANTHROPIC_API_KEY",
     "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
     "METRICS_TOKEN",
+    "MFA_ENCRYPTION_KEY",
+    # DR-2 / DR-3: backup encryption key + off-site replication secret (same Vault/Docker
+    # Secrets seam). Empty by default; only required when the matching feature is enabled.
+    "BACKUP_ENCRYPTION_KEY",
+    "BACKUP_OFFSITE_SECRET_KEY",
+    # Email alerts (E1): SMTP password via the same *_FILE convention (SMTP_PASSWORD_FILE).
+    "SMTP_PASSWORD",
 )
 
 # Placeholder / insecure defaults that must never survive into production.
@@ -61,12 +69,31 @@ class Settings(BaseSettings):
     jwt_access_token_ttl_minutes: int = 15
     jwt_refresh_token_ttl_days: int = 7
 
+    # MFA (Sprint 1 foundation). mfa_encryption_key is the master secret used to derive a Fernet
+    # key that encrypts each user's TOTP secret at rest (mfa_secret_encrypted); it supports the
+    # <NAME>_FILE convention via _FILE_BACKED_SECRETS (Docker Secrets / Vault). Empty by default
+    # -- MFA helpers raise a clear error if used unconfigured. No login behavior depends on these
+    # yet (foundation only). mfa_challenge_ttl_seconds bounds the interim MFA-challenge token.
+    mfa_issuer: str = "MBS.CS"
+    mfa_challenge_ttl_seconds: int = 300
+    mfa_encryption_key: str = ""
+    # Per-user MFA brute-force protection (Step 3, Redis-backed, independent of IP rate limiting).
+    mfa_max_attempts: int = 5           # failed second-factor attempts before a temporary lockout
+    mfa_lockout_seconds: int = 900      # lockout window (15 min); the failure counter's TTL
+
     # --- AI Agent Service ---------------------------------------------------
     # Which provider the AI layer uses. Business logic never reads this -- only
     # the provider factory (apps/api/ai_agent/providers/factory.py) does. All
     # providers conform to the SupportsComplete protocol, so switching is a
     # config change, not a code change.
-    ai_provider: str = "openrouter"  # openrouter | anthropic
+    ai_provider: str = "openrouter"  # openrouter | anthropic | local | deepseek
+
+    # AI-2.1 -- provider fallback. Ordered list of SECONDARY providers tried, in order, ONLY when
+    # the current provider hits an availability failure (429/402/5xx/timeout/connection). Default
+    # [] = OFF (single-provider behavior, unchanged). The primary (ai_provider) is always first;
+    # duplicates and a self-reference are dropped, and a fallback with no configured key is
+    # skipped at build time. e.g. AI_FALLBACK_PROVIDERS='["anthropic","deepseek"]'.
+    ai_fallback_providers: list[str] = []
 
     # OpenRouter (primary). OpenAI-compatible; a single integration can proxy
     # Claude/GPT/Gemini/open models -- pick the model with OPENROUTER_MODEL.
@@ -98,6 +125,21 @@ class Settings(BaseSettings):
     ai_max_tokens: int = 4096
     ai_request_timeout_s: float = 60.0
     ai_max_retries: int = 3
+
+    # AI-2.2B-1 -- config-driven pricing overrides for cost ESTIMATION. Maps a model-id substring
+    # to [in_per_1k_usd, out_per_1k_usd], so rates can be corrected without a deploy. Empty {} =
+    # unchanged (built-in table + conservative default). Applies to FUTURE calls only -- historical
+    # ai_usage rows keep the cost computed at the time of the call.
+    # e.g. AI_PRICING_OVERRIDES='{"deepseek":[0.00027,0.0011],"gpt-4o":[0.0025,0.01]}'.
+    ai_pricing_overrides: dict[str, list[float]] = {}
+
+    # AI-2.2A -- AI cost budget enforcement. Additive + default OFF: with ai_budget_enforce=False
+    # (or ai_daily_budget_usd<=0) nothing is ever blocked. When enabled, a per-workspace rolling
+    # DAILY estimated spend is tracked in Redis; once it reaches the cap, further AI calls for that
+    # workspace are blocked (AIBudgetExceededError) and degrade through the EXISTING contract
+    # (assistant -> 503, agent -> finish). Redis failures fail OPEN (never block AI on an outage).
+    ai_budget_enforce: bool = False
+    ai_daily_budget_usd: float = 0.0
 
     # AI correlator (attack-path narrative) latency controls. A large scan must not
     # trigger unbounded AI work: beyond ai_correlator_max_findings the AI narrative
@@ -183,6 +225,10 @@ class Settings(BaseSettings):
     scan_orphan_recovery_enabled: bool = True         # master switch for the reaper
     scan_orphan_timeout_seconds: int = 7200           # 2h; 'running' older than this is an orphan
     scan_orphan_reaper_interval_seconds: int = 300    # reaper cadence (beat), default 5 min
+    # P1.1 -- beat-liveness heartbeat. A tiny periodic task stamps a Redis timestamp each tick so a
+    # stalled beat scheduler (or a down worker-default draining the default queue) is alertable via
+    # mbs_beat_age_seconds -> MbsBeatStalled. Always scheduled; additive, cheap, low-cardinality.
+    beat_heartbeat_interval_seconds: int = 60         # heartbeat cadence (beat), default 60s
 
     # Queued-scan relay: a scan row is durably committed 'queued' BEFORE it is dispatched to
     # Celery (create_scan), and celery_task_id is set only AFTER a successful dispatch. So a
@@ -236,6 +282,51 @@ class Settings(BaseSettings):
     # the SIGKILL backstop and MUST exceed soft (enforced at wiring time).
     backup_task_soft_time_limit_seconds: int = 7200   # 2h
     backup_task_time_limit_seconds: int = 7800        # soft + 10min
+
+    # DR-2 -- backup encryption at rest. Additive + OPT-IN (default OFF -> unencrypted sets,
+    # identical to prior behavior). When enabled, each set's db.dump + objects archive are
+    # encrypted in place with AES-256-GCM; the key is derived from BACKUP_ENCRYPTION_KEY
+    # (supports the <NAME>_FILE convention). verify/restore transparently decrypt; a wrong key
+    # fails closed (authentication tag mismatch). Existing unencrypted sets stay readable.
+    backup_encryption_enabled: bool = False
+    backup_encryption_key: str = ""
+    # DR-3 -- off-site replication. Provider-agnostic: after a verified set, replicate it to an
+    # off-host target. Default OFF. `local` copies to a mounted/off-host directory; `s3` uploads
+    # to ANY S3-compatible endpoint (AWS, MinIO, Wasabi, ...) -- never hard-coded to one cloud.
+    backup_offsite_enabled: bool = False
+    backup_offsite_provider: str = "local"        # local | s3
+    backup_offsite_dir: str = ""                  # local provider: destination base directory
+    backup_offsite_bucket: str = ""               # s3 provider: destination bucket
+    backup_offsite_prefix: str = "mbs-backups"    # s3 provider: key prefix
+    backup_offsite_endpoint_url: str = ""         # s3 provider: custom endpoint (blank -> AWS default)
+    backup_offsite_access_key: str = ""           # s3 provider: falls back to S3_ACCESS_KEY if blank
+    backup_offsite_secret_key: str = ""           # s3 provider: falls back to S3_SECRET_KEY if blank
+    backup_offsite_region: str = "us-east-1"
+    # DR-4 -- manual DR drill scratch database. run_drill restores the latest verified set here
+    # and refuses to touch the live DATABASE_URL. Empty -> a target must be passed on the CLI.
+    backup_drill_database_url: str = ""
+
+    # Email Alert System (E1..E5). Additive + default OFF: with email_enabled=False nothing is
+    # ever sent (the dispatcher and Celery task short-circuit). Delivery is ALWAYS async (the
+    # scan/backup paths only enqueue), so a slow/broken SMTP server never affects a scan. The
+    # SMTP password uses the <NAME>_FILE convention (SMTP_PASSWORD_FILE) via _FILE_BACKED_SECRETS.
+    email_enabled: bool = False
+    email_provider: str = "smtp"                  # smtp (only provider today; abstraction allows more)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True                     # STARTTLS after connect
+    smtp_timeout_seconds: int = 15
+    email_from_address: str = ""
+    # System-level alerts (backup/DLQ failures) have no workspace context -> sent to these admins.
+    email_admin_recipients: list[str] = []
+    # Dedup window: identical (category, workspace, subject) alerts inside this window are
+    # collapsed to one email, preventing storms from a flapping failure.
+    email_dedup_window_seconds: int = 300
+    email_max_retries: int = 3                     # Celery retries for transient SMTP faults
+    email_task_soft_time_limit_seconds: int = 25
+    email_task_time_limit_seconds: int = 40        # > soft; hard SIGKILL backstop
 
     # Phase 5.2 -- retention purge FOUNDATION. Additive + DOUBLE-GATED OFF: nothing is ever
     # deleted unless retention_enabled is flipped true AND retention_dry_run is set false.
@@ -365,12 +456,29 @@ class Settings(BaseSettings):
             problems.append("TRUSTED_HOSTS must list explicit hostnames in production, not '*'.")
         if self.ai_provider not in ("openrouter", "anthropic", "local", "deepseek"):
             problems.append(f"AI_PROVIDER '{self.ai_provider}' is not a known provider.")
+        # AI-2.1: fallback providers must be known and must not include the primary.
+        for name in self.ai_fallback_providers:
+            if name not in ("openrouter", "anthropic", "local", "deepseek"):
+                problems.append(f"AI_FALLBACK_PROVIDERS contains unknown provider '{name}'.")
+            elif name == self.ai_provider:
+                problems.append(f"AI_FALLBACK_PROVIDERS must not include the primary provider '{name}'.")
         if not self.ssl_verify:
             problems.append("SSL_VERIFY is disabled; never disable TLS verification in production.")
         if not self.rate_limit_enabled:
             problems.append("RATE_LIMIT_ENABLED must be true in production (unrestricted limits are unsafe).")
         if self.metrics_mode == "public":
             problems.append("METRICS_MODE must not be 'public' in production.")
+        # MFA Step 3: production must be able to encrypt TOTP secrets at rest.
+        if not self.mfa_encryption_key:
+            problems.append("MFA_ENCRYPTION_KEY must be set in production (MFA cannot function without it).")
+        # DR-2: if backup encryption is enabled, the key must be present (fail closed).
+        if self.backup_enabled and self.backup_encryption_enabled and not self.backup_encryption_key:
+            problems.append("BACKUP_ENCRYPTION_KEY must be set when BACKUP_ENCRYPTION_ENABLED is true.")
+        # E1: if email alerts are enabled, SMTP host + from-address are mandatory (fail closed).
+        if self.email_enabled and self.email_provider == "smtp" and (
+            not self.smtp_host or not self.email_from_address
+        ):
+            problems.append("SMTP_HOST and EMAIL_FROM_ADDRESS must be set when EMAIL_ENABLED is true.")
         # M4.6.1 / F2: refuse to run in production with derived-target authorization
         # enforcement disabled (unless explicitly, emergency-acknowledged).
         from apps.api.core.startup_checks import derived_scope_problem

@@ -127,12 +127,12 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         # vulnerability_evidence -> evidence.storage_uri
         from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
 
-        rows = await db.execute(
+        evidence_rows = await db.execute(
             select(VulnerabilityEvidence.vulnerability_id, Evidence.storage_uri)
             .join(Evidence, Evidence.id == VulnerabilityEvidence.evidence_id)
             .where(VulnerabilityEvidence.vulnerability_id.in_(vuln_ids))
         )
-        for vid, uri in rows.all():
+        for vid, uri in evidence_rows.all():
             uris = evidence_by_vuln.setdefault(vid, [])
             if uri not in uris:
                 uris.append(uri)

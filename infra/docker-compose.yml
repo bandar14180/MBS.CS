@@ -19,8 +19,18 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # R1a: durability. Redis backs the Celery broker + scan DLQ + rate-limit / AI-budget /
+    # MFA-lockout counters + reliability freshness timestamps -- all of which were previously
+    # lost on any container restart (default RDB wrote to an unmounted /data). Enable AOF
+    # (append-only file, fsync every second) and persist /data on a named volume so that state
+    # survives a restart. No maxmemory is set (default = no eviction), so broker/DLQ entries are
+    # never evicted. Additive + reversible; no consumer behavior changes (all are idempotent /
+    # fail-open, and task replay is safe via the atomic scan claim + orphan reaper).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -79,6 +89,20 @@ services:
     command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "scans", "--loglevel=info"]
     env_file:
       - ../.env
+    # W1: aggregate prefork-child metrics. Celery's prefork pool runs tasks in child processes;
+    # without this each child has an isolated registry and the :9100 endpoint (MainProcess) never
+    # sees their counters. PROMETHEUS_MULTIPROC_DIR makes prometheus_client write per-process files
+    # that metrics.py aggregates via MultiProcessCollector. The dir is a tmpfs so it EXISTS + is
+    # writable (mode 1777) at startup -> no import-time crash, and starts EMPTY every run -> no
+    # stale cross-restart counter files. Metrics-only; no task/pool/behavior change. Deliberately
+    # NOT set on api (multiprocess is incompatible with its custom collectors) or beat (no tasks).
+    environment:
+      PROMETHEUS_MULTIPROC_DIR: /run/prometheus-multiproc
+    volumes:
+      - type: tmpfs
+        target: /run/prometheus-multiproc
+        tmpfs:
+          mode: 01777
     # Graceful shutdown (Phase 1.5): celery is PID 1 (exec form) and gets SIGTERM =
     # WARM shutdown -- it stops prefetching and finishes the in-flight scan. This window
     # lets a running scan tool wrap up cleanly; scans that outlast it are bounded by the
@@ -103,7 +127,22 @@ services:
     command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "default", "--loglevel=info"]
     env_file:
       - ../.env
+    # W1: same prefork-metrics aggregation as `worker` (reaper/relay/schedule counters run here in
+    # child processes). tmpfs-backed multiproc dir; see the `worker` service for rationale.
+    environment:
+      PROMETHEUS_MULTIPROC_DIR: /run/prometheus-multiproc
     stop_grace_period: 60s
+    # DR-1: the scheduled backup (backup.run) writes timestamped sets under BACKUP_DIRECTORY
+    # (default /srv/backups). Mount a NAMED VOLUME so backup artifacts SURVIVE container
+    # recreation/redeploy (a container-local path would be wiped). In production, bind this to a
+    # durable/off-host path and pair with off-site replication (DR-3).
+    volumes:
+      - backup_data:/srv/backups
+      # W1: tmpfs-backed prometheus multiprocess dir (exists + writable at startup, empty per run).
+      - type: tmpfs
+        target: /run/prometheus-multiproc
+        tmpfs:
+          mode: 01777
     depends_on:
       postgres:
         condition: service_healthy
@@ -160,3 +199,7 @@ volumes:
   postgres_data:
   minio_data:
   web_node_modules:
+  # DR-1: durable storage for backup sets so they persist across worker-default recreation.
+  backup_data:
+  # R1a: durable Redis AOF storage so the broker/DLQ + operational counters survive a restart.
+  redis_data:

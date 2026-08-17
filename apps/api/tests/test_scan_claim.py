@@ -8,7 +8,7 @@ Scanner behavior + _run_single_tool are untouched by this milestone.
 import asyncio
 import uuid
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 

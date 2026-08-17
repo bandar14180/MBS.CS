@@ -27,6 +27,11 @@ if _PROM:
     RESTORE_FAILED = Counter("mbs_restore_failed_total", "Restores that failed", ["component"])
     VERIFICATION_SUCCESS = Counter("mbs_verification_success_total", "Verifications that passed", ["component"])
     VERIFICATION_FAILED = Counter("mbs_verification_failed_total", "Verifications that failed", ["component"])
+    # DR-3: off-site replication outcomes. DR-4: manual DR-drill outcomes. No high-cardinality labels.
+    OFFSITE_SUCCESS = Counter("mbs_backup_offsite_success_total", "Off-site set replications that succeeded")
+    OFFSITE_FAILED = Counter("mbs_backup_offsite_failed_total", "Off-site set replications that failed")
+    DRILL_SUCCESS = Counter("mbs_dr_drill_success_total", "DR restore drills that passed")
+    DRILL_FAILED = Counter("mbs_dr_drill_failed_total", "DR restore drills that failed")
 
 _ALLOWED = {"postgres", "objects", "full"}
 
@@ -54,3 +59,17 @@ def record_verification(component: str, *, success: bool) -> None:
     if not _PROM:
         return
     (VERIFICATION_SUCCESS if success else VERIFICATION_FAILED).labels(_comp(component)).inc()
+
+
+def record_offsite(*, success: bool) -> None:
+    """DR-3: count one off-site replication outcome. No-op without prometheus_client."""
+    if not _PROM:
+        return
+    (OFFSITE_SUCCESS if success else OFFSITE_FAILED).inc()
+
+
+def record_drill(*, success: bool) -> None:
+    """DR-4: count one manual DR-drill outcome. No-op without prometheus_client."""
+    if not _PROM:
+        return
+    (DRILL_SUCCESS if success else DRILL_FAILED).inc()

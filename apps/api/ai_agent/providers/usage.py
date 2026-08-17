@@ -42,6 +42,14 @@ _call_ctx: contextvars.ContextVar[_CallContext | None] = contextvars.ContextVar(
 )
 
 
+def current_call_context() -> tuple[str | None, str | None]:
+    """AI-2.2A: (workspace_id, agent_role) for the AI call in progress, or (None, None) outside a
+    collect_ai_usage() block. Lets the budget guard attribute/enforce without threading the
+    workspace through every agent signature."""
+    ctx = _call_ctx.get()
+    return (ctx.workspace_id, ctx.agent_role) if ctx is not None else (None, None)
+
+
 class collect_ai_usage:
     """Context manager that (a) tags AI calls made inside it with tenant context
     and (b) collects their usage records for persistence. Best-effort: never
@@ -64,7 +72,7 @@ class collect_ai_usage:
             scan_id=str(scan_id) if scan_id else None,
             correlation_id=correlation_id,
         )
-        self._token = None
+        self._token: contextvars.Token[_CallContext | None] | None = None
 
     def __enter__(self) -> list[AIUsage]:
         self._token = _call_ctx.set(self._ctx)
@@ -111,3 +119,19 @@ def emit_usage(usage: AIUsage, *, latency_ms: float = 0.0) -> None:
         },
     )
     _update_metrics(usage)
+    # AI-2.5: observe successful-call latency (best-effort; low-cardinality agent_role label).
+    try:
+        from apps.api.core.observability import record_ai_latency
+
+        record_ai_latency(usage.agent_role or "unknown", max(0.0, latency_ms) / 1000.0)
+    except Exception:  # noqa: BLE001 -- metrics strictly best-effort
+        pass
+    # AI-2.2A: accumulate this successful call's estimated cost into the workspace's rolling
+    # daily budget (best-effort; a Redis failure is swallowed inside add_spend).
+    if usage.workspace_id and usage.estimated_cost_usd:
+        try:
+            from apps.api.ai_agent.budget import add_spend
+
+            add_spend(usage.workspace_id, float(usage.estimated_cost_usd))
+        except Exception:  # noqa: BLE001 -- accounting must never break an AI call
+            pass

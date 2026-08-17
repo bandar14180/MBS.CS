@@ -43,12 +43,13 @@ async def notify_scan_finished(db: AsyncSession, scan) -> None:
     from apps.api.modules.vulnerabilities.models import Vulnerability
 
     if scan.status == "failed":
-        await create_notification(
+        note = await create_notification(
             db, scan.workspace_id, "scan_failed", "Scan failed",
             severity="warning",
             body="A scan did not complete. Open the project to see which tool failed and why.",
             project_id=scan.project_id, scan_id=scan.id,
         )
+        await _dispatch_email(db, note)
         return
 
     # Completed: count NEW high/critical findings first detected by this scan.
@@ -62,13 +63,14 @@ async def notify_scan_finished(db: AsyncSession, scan) -> None:
     ) or 0
 
     if new_hi > 0:
-        await create_notification(
+        note = await create_notification(
             db, scan.workspace_id, "critical_findings",
             f"{new_hi} new high/critical finding(s)",
             severity="critical",
             body="A completed scan surfaced new high or critical findings. Review them in the Vulnerabilities tab.",
             project_id=scan.project_id, scan_id=scan.id,
         )
+        await _dispatch_email(db, note)
     else:
         await create_notification(
             db, scan.workspace_id, "scan_completed", "Scan completed",
@@ -76,6 +78,14 @@ async def notify_scan_finished(db: AsyncSession, scan) -> None:
             body="A scan finished with no new high/critical findings.",
             project_id=scan.project_id, scan_id=scan.id,
         )
+
+
+async def _dispatch_email(db: AsyncSession, note: Notification) -> None:
+    """E4: fan an emailable scan notification out to the async email task (best-effort, never
+    raises -- the in-app notification is the source of truth; email is an additional channel)."""
+    from apps.api.modules.notifications.alerts import email_scan_alert
+
+    await email_scan_alert(db, note)
 
 
 async def list_notifications(

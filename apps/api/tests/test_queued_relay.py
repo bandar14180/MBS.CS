@@ -6,7 +6,7 @@ recoverable; and the relay never touches running/terminal or freshly-queued scan
 import asyncio
 import uuid
 
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 

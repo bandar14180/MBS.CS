@@ -39,7 +39,7 @@ def render_executive(data: ReportData) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table
 
     styles = _styles(getSampleStyleSheet, ParagraphStyle, colors)
     buf = BytesIO()

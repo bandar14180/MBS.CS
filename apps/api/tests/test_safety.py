@@ -85,7 +85,7 @@ def test_simulated_never_touches_target_always_allowed() -> None:
 # --- RoE from config: config can restrict but never exceed the settings ceiling ---
 
 def test_roe_from_config_caps_to_settings_ceiling() -> None:
-    s = get_settings()  # defaults: ceiling active_safe, exploitation disabled
+    get_settings()  # defaults: ceiling active_safe, exploitation disabled
     roe = RulesOfEngagement.from_config({"safety_tier": "intrusive", "exploitation_enabled": True})
     assert roe.max_tier == SafetyTier.ACTIVE_SAFE          # capped by settings ceiling
     assert roe.exploitation_enabled is False               # settings gate off -> stays off

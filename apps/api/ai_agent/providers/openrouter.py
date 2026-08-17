@@ -64,8 +64,13 @@ class OpenRouterClient(BaseAIProvider):
         # Terminal client errors (bad request / auth / payment / forbidden /
         # not found) -> do not retry; surface a clear message. 429 and 5xx fall
         # through to raise_for_status and are classified retryable below.
-        if resp.status_code in (400, 401, 402, 403, 404):
-            raise AIProviderError(f"OpenRouter {resp.status_code}: {resp.text[:300]}")
+        # AI-2.1: 402 (credits exhausted) is a PROVIDER AVAILABILITY failure -> availability=True
+        # so a fallback provider is tried. 400/401/403/404 (bad request / auth / forbidden /
+        # model-not-found) are config/invalid errors a second provider can't fix -> no failover.
+        if resp.status_code == 402:
+            raise AIProviderError(f"OpenRouter {resp.status_code}: {resp.text[:300]}", availability=True)
+        if resp.status_code in (400, 401, 403, 404):
+            raise AIProviderError(f"OpenRouter {resp.status_code}: {resp.text[:300]}", availability=False)
         resp.raise_for_status()  # 429/5xx raise HTTPStatusError -> classified retryable
         data = resp.json()
         text = data["choices"][0]["message"]["content"] or ""

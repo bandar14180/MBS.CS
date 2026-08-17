@@ -50,7 +50,7 @@ async def ask(
         # Capture token/cost usage for this call and persist it (best-effort) after.
         with collect_ai_usage(
             agent_role="assistant",
-            workspace_id=workspace_id,
+            workspace_id=str(workspace_id),
             correlation_id=get_correlation_id(),
         ) as usage_records:
             # Run the (synchronous) provider call off the event loop so heavy AI

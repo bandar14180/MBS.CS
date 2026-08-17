@@ -1,6 +1,6 @@
 import asyncio
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from apps.api.celery_app.worker import celery_app
@@ -15,7 +15,7 @@ async def _run() -> int:
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        async with session_maker() as session:  # type: AsyncSession
+        async with session_maker() as session:  # -> AsyncSession (inferred)
             return await run_due_schedules(session)
     finally:
         await engine.dispose()

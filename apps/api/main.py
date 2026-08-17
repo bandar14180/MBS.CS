@@ -19,12 +19,14 @@ from apps.api.core.observability import (
     CONTENT_TYPE_LATEST,
     get_correlation_id,
     metrics_response_body,
+    register_dependency_health_collector,
     register_reliability_collector,
 )
 from apps.api.modules.api_keys.router import router as api_keys_router
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.assistant.router import ai_router as ai_status_router
 from apps.api.modules.assistant.router import router as assistant_router
+from apps.api.modules.ai_usage.router import router as ai_usage_router
 from apps.api.modules.audit.router import router as audit_router
 from apps.api.modules.auth.router import router as auth_router
 from apps.api.modules.billing.router import public_router as plans_public_router
@@ -49,7 +51,7 @@ _ROUTERS = (
     dashboard_router, authorization_scope_router, scans_router, scan_capabilities_router, schedules_router,
     assets_router, vulnerabilities_router, reports_router, assistant_router,
     ai_status_router, billing_router, plans_public_router, notifications_router,
-    audit_router, api_keys_router,
+    audit_router, api_keys_router, ai_usage_router,
 )
 
 
@@ -196,6 +198,9 @@ def create_app() -> FastAPI:
     # F4: expose the Redis-backed reliability signals (DLQ depth + backup/retention failures) on
     # this API process's /metrics only (idempotent; the worker's :9100 must not double-expose them).
     register_reliability_collector()
+    # A: expose mbs_dependency_up{component} (Postgres/Redis liveness) on this API process's
+    # /metrics only (same rationale -- registered once, best-effort).
+    register_dependency_health_collector()
 
     return app
 

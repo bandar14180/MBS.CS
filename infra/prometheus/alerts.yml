@@ -20,6 +20,17 @@ groups:
           summary: "MBS worker unavailable (metrics endpoint unreachable)"
           description: "Prometheus cannot scrape the worker metrics endpoint ({{ $labels.instance }}) for >2m."
 
+      # A: dependency health. mbs_dependency_up{component} is 0 when the API's short-timeout probe
+      # of a core backing service fails. Catches outages that other alerts miss -- notably a Redis
+      # outage, whose consumers fail OPEN, so it need not raise the 5xx rate.
+      - alert: MbsDependencyDown
+        expr: mbs_dependency_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Core dependency {{ $labels.component }} is down"
+          description: "The API's liveness probe of {{ $labels.component }} has failed for >2m -- Postgres/Redis outage or partition; scans, auth, and queueing are impacted."
+
       - alert: MbsApiHighServerErrorRate
         expr: >
           sum(rate(mbs_http_requests_total{status=~"5.."}[5m]))
@@ -66,6 +77,18 @@ groups:
           summary: "Scan recovery paths active (backlog / worker-loss proxy)"
           description: "The orphan reaper or queued relay fired -- indicates worker loss or queue-dispatch backlog."
 
+      # Direct scan-queue backlog: pending scan tasks piling up in the broker (workers can't keep
+      # pace or are stuck). Unlike MbsScanRecoveryActivity (a worker-LOSS proxy), this reads the
+      # actual queue length. The >50-for-15m threshold is an OPERATIONAL / TUNABLE default -- adjust
+      # to your worker count and scan cadence.
+      - alert: MbsScanQueueBacklog
+        expr: mbs_queue_depth{queue="scans"} > 50
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scan queue backlog"
+          description: "{{ $value }} scan task(s) have been queued for >15m (mbs_queue_depth{queue=\"scans\"}) -- workers may be overwhelmed or stuck; consider scaling the scans worker."
+
       # F4: reliability signals exposed by the API-side Redis-backed ReliabilityCollector.
       - alert: MbsDlqBacklog
         expr: mbs_dlq_depth > 0
@@ -83,6 +106,70 @@ groups:
           summary: "Backup run failed"
           description: "A scheduled backup failed in the last 6h -- disaster-recovery coverage is at risk."
 
+      # AI-2.2A: AI calls are being blocked by the daily budget cap -> a workspace hit its limit
+      # (expected throttle, or a runaway-spend signal). Investigate the workspace's AI usage.
+      - alert: MbsAiBudgetBlocking
+        expr: increase(mbs_ai_budget_blocked_total[1h]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI budget cap is blocking calls"
+          description: "{{ $value }} AI call(s) were blocked by the daily budget cap in the last hour -- a workspace reached its AI spend limit."
+
+      # AI-2.5: p95 AI-call latency SLO. Successful calls only; 30s p95 tolerates a large model
+      # while flagging a degraded provider / slow model.
+      - alert: MbsAiLatencySlo
+        expr: histogram_quantile(0.95, sum(rate(mbs_ai_latency_seconds_bucket[10m])) by (le)) > 30
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI p95 latency SLO breached"
+          description: "AI call p95 latency is {{ $value | humanizeDuration }} (>30s) over 10m -- a provider/model may be degraded."
+
+      # AI-2.5: AI call error rate. errors / (errors + successful calls). >20% over 15m = degraded.
+      - alert: MbsAiErrorRateHigh
+        expr: >
+          sum(rate(mbs_ai_errors_total[15m]))
+            / clamp_min(sum(rate(mbs_ai_calls_total[15m])) + sum(rate(mbs_ai_errors_total[15m])), 0.001) > 0.2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI error rate above 20%"
+          description: "More than 20% of AI calls failed over the last 15m -- check provider health/keys/credits."
+
+      # AI-2.5: provider failover firing means the PRIMARY provider is degraded (AI still up via a
+      # fallback). Worth a look even though availability is preserved.
+      - alert: MbsAiFailoverActive
+        expr: increase(mbs_ai_failover_total[15m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "AI provider failover active"
+          description: "{{ $value }} AI provider failover(s) in the last 15m -- the primary provider is degraded; running on a fallback."
+
+      # DR-4: freshness. Catches a SILENTLY stalled pipeline (no explicit failure, just no new
+      # successful set) -- e.g. beat stopped or the task never ran. 30h tolerates a daily cadence
+      # plus slack. mbs_backup_age_seconds is only emitted once a backup has ever succeeded.
+      - alert: MbsBackupStale
+        expr: mbs_backup_age_seconds > 108000
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful backup in over 30h"
+          description: "The last successful backup is {{ $value | humanizeDuration }} old -- the backup pipeline may be stalled (beat/worker-default down or task erroring)."
+
+      # P1.1: beat liveness. The scheduler stamps a heartbeat every ~60s; if it stalls (beat down,
+      # or worker-default not draining the default queue) the age climbs and NO scheduled work
+      # (scans/backup/retention/reaper/relay) runs. 180s tolerates a couple of missed ticks +
+      # scrape jitter. mbs_beat_age_seconds is only emitted once beat has ticked at least once.
+      - alert: MbsBeatStalled
+        expr: mbs_beat_age_seconds > 180
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Celery beat scheduler stalled"
+          description: "No beat heartbeat for {{ $value | humanizeDuration }} -- the scheduler (or worker-default draining the default queue) may be down; scheduled scans/backup/retention/reaper are not running."
+
       - alert: MbsRetentionFailing
         expr: increase(mbs_retention_failures_total[6h]) > 0
         for: 5m
@@ -90,3 +177,13 @@ groups:
         annotations:
           summary: "Retention purge failed"
           description: "A retention purge run failed in the last 6h."
+
+      # E5: alert emails are failing to deliver -> operators may be missing critical/failure
+      # notifications. Exposed by the worker-side email metrics (worker-default runs the task).
+      - alert: MbsEmailDeliveryFailing
+        expr: increase(mbs_email_failed_total[1h]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Alert email delivery failing"
+          description: "{{ $value }} alert email(s) failed to send in the last hour -- check SMTP config/credentials (docs/runbooks/email-alerts.md)."

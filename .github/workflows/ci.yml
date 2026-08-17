@@ -84,6 +84,21 @@ jobs:
             htmlcov/
           if-no-files-found: warn
 
+  # Static lint gate (quality): BLOCKING Ruff check over the application package. Ruleset +
+  # config live in pyproject.toml [tool.ruff]; ruff is pinned in requirements-dev.txt. Any
+  # violation exits non-zero and fails the job (not advisory).
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tooling
+        run: pip install --no-cache-dir -r apps/api/requirements-dev.txt
+      - name: Ruff lint (blocking)
+        run: ruff check apps/api --output-format=github
+
   # Supply-chain security (Phase 1.8): GATED dependency vulnerability audit + SBOM.
   # Blocking, but an auditable allowlist (.security/pip-audit-ignore.txt) keeps a
   # triaged/accepted advisory from wedging every PR while a NEW advisory still fails.

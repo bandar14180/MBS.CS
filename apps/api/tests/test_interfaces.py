@@ -106,12 +106,14 @@ def test_reports_storage_has_no_private_evidence_import() -> None:
 
 def test_notification_provider_factory() -> None:
     from apps.api.modules.notifications.providers import (
+        EmailNotificationProvider,
         InAppNotificationProvider,
         _UnimplementedProvider,
         get_notification_provider,
     )
 
     assert isinstance(get_notification_provider("in_app"), InAppNotificationProvider)
+    assert isinstance(get_notification_provider("email"), EmailNotificationProvider)  # E1: now live
     assert isinstance(get_notification_provider("slack"), _UnimplementedProvider)
     with pytest.raises(ValueError):
         get_notification_provider("carrier-pigeon")
@@ -120,7 +122,7 @@ def test_notification_provider_factory() -> None:
 def test_unimplemented_channel_send_raises() -> None:
     from apps.api.modules.notifications.providers import get_notification_provider
 
-    provider = get_notification_provider("email")
+    provider = get_notification_provider("slack")  # still a declared-but-unimplemented channel
     with pytest.raises(NotImplementedError):
         asyncio.run(provider.send(title="t", workspace_id="w"))
 

@@ -16,7 +16,17 @@ class AIProviderError(RuntimeError):
     (planner path fails loud -> 400 / scan failed; assistant/remediation/FP
     paths fail soft -> HTTP 503). Keeping that base class means those call sites
     keep working unchanged regardless of which provider is active.
+
+    AI-2.1: `availability` is True when the failure is a PROVIDER AVAILABILITY issue
+    (429 rate-limit, 402 credits exhausted, 5xx, timeout, connection/network) -- the
+    signal a FallbackClient uses to try the next provider. It is False for config/auth/
+    invalid-request/model-not-found failures, which a second provider cannot fix, so
+    those never trigger a failover.
     """
+
+    def __init__(self, *args, availability: bool = False):
+        super().__init__(*args)
+        self.availability = availability
 
 
 class SupportsComplete(Protocol):
@@ -46,21 +56,44 @@ _PRICING_PER_1K = {
 _PRICING_DEFAULT = (0.005, 0.015)
 
 
+def _config_pricing(model_l: str) -> tuple[float, float] | None:
+    """AI-2.2B-1: config-driven pricing override. AI_PRICING_OVERRIDES maps a model-id substring
+    to [in_per_1k, out_per_1k], letting operators correct rates without a deploy. Best-effort: a
+    missing/malformed entry falls through to the built-in table."""
+    try:
+        from apps.api.core.config import get_settings
+
+        for key, val in (get_settings().ai_pricing_overrides or {}).items():
+            if key and str(key).lower() in model_l and isinstance(val, (list, tuple)) and len(val) == 2:
+                return float(val[0]), float(val[1])
+    except Exception:  # noqa: BLE001 -- pricing is estimation only; never break an AI call
+        return None
+    return None
+
+
 def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     model_l = (model or "").lower()
-    prices = _PRICING_DEFAULT
-    for key, val in _PRICING_PER_1K.items():
-        if key in model_l:
-            prices = val
-            break
+    # Config overrides first, then the built-in table, then the conservative default.
+    prices = _config_pricing(model_l)
+    if prices is None:
+        prices = _PRICING_DEFAULT
+        for key, val in _PRICING_PER_1K.items():
+            if key in model_l:
+                prices = val
+                break
     in_rate, out_rate = prices
     return round((prompt_tokens / 1000) * in_rate + (completion_tokens / 1000) * out_rate, 6)
+
+
+# Upper bound on a model response we will parse -- guards against a runaway/oversized output
+# inflating logs/latency or the JSON parser (AI-1 Step 3 / G7). Generous vs. any real answer.
+_MAX_RAW_CHARS = 200_000
 
 
 def extract_json(text: str) -> dict[str, Any]:
     """Parse a JSON object out of the model's text, tolerating stray prose or a
     ```json fence around it (the prompt asks for bare JSON, but be forgiving)."""
-    text = text.strip()
+    text = text[:_MAX_RAW_CHARS].strip() if text else ""
     if text.startswith("```"):
         text = text.split("```", 2)[1]
         if text.startswith("json"):
@@ -112,6 +145,15 @@ class BaseAIProvider(ABC):
         """Whether `exc` from `_invoke` is worth retrying (429/5xx/timeout/conn)."""
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
+        # AI-2.2A: enforce the per-workspace daily spend cap BEFORE any provider call. Reads the
+        # workspace of the AI call in progress from the collect_ai_usage contextvar. Over budget ->
+        # AIBudgetExceededError (an AIProviderError with availability=False), so callers degrade via
+        # the existing contract and the AI-2.1 fallback does NOT try another provider. No-op when
+        # enforcement is off. Lazy import avoids any import cycle (budget -> base).
+        from apps.api.ai_agent.budget import enforce_budget
+
+        enforce_budget()
+
         started = time.monotonic()
         last_exc: Exception | None = None
         attempts = 0
@@ -122,6 +164,7 @@ class BaseAIProvider(ABC):
                 emit_usage(result.usage, latency_ms=(time.monotonic() - started) * 1000)
                 return extract_json(result.text)
             except AIProviderError:
+                _record_ai_error(self.provider_name)  # AI-2.5: terminal provider error
                 raise  # already-terminal (e.g. missing key): do not retry
             except Exception as exc:  # noqa: BLE001 -- classify then re-raise
                 last_exc = exc
@@ -130,7 +173,22 @@ class BaseAIProvider(ABC):
                     continue
                 break
         # Report the attempts actually made, not the configured max -- a
-        # non-retryable failure (e.g. 402) breaks after one attempt.
+        # non-retryable failure (e.g. 422) breaks after one attempt. AI-2.1: mark the wrapped
+        # error as an availability failure when the exhausted cause was retryable (429/5xx/
+        # timeout/connection) so a fallback provider is tried; a non-retryable cause (invalid
+        # request) stays availability=False and does NOT fall over.
+        _record_ai_error(self.provider_name)  # AI-2.5: retries exhausted -> failed call
         raise AIProviderError(
-            f"{self.provider_name} call failed after {attempts} attempt(s): {last_exc}"
+            f"{self.provider_name} call failed after {attempts} attempt(s): {last_exc}",
+            availability=bool(last_exc is not None and self._is_retryable(last_exc)),
         ) from last_exc
+
+
+def _record_ai_error(provider: str) -> None:
+    """AI-2.5: best-effort AI-error counter (never breaks the caller)."""
+    try:
+        from apps.api.core.observability import record_ai_error
+
+        record_ai_error(provider)
+    except Exception:  # noqa: BLE001
+        pass

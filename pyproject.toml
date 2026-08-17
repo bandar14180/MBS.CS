@@ -46,3 +46,18 @@ directory = "htmlcov"
 
 [tool.coverage.xml]
 output = "coverage.xml"
+
+# --- Ruff: static lint gate (CI-blocking) -------------------------------------------------------
+# Scoped in CI to the application package (`ruff check apps/api`), mirroring the coverage source.
+# A conservative, genuine-bug ruleset -- deliberately NOT used as a formatter/large-refactor tool.
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# E4 (import errors), E7 (statement errors: bare-except, None/True comparisons, ...), E9 (syntax),
+# F (pyflakes: unused imports/vars, undefined names, f-string bugs), W (pycodestyle warnings incl.
+# W605 invalid escapes). Deliberately EXCLUDES line-length/whitespace-reformatting rules, I (import
+# reordering), and opinionated B/SIM/UP/RET/... families -- to keep the gate focused on genuine
+# defects, avoid formatting churn, and dodge the FastAPI `Depends()` (B008) false-positive.
+select = ["E4", "E7", "E9", "F", "W"]

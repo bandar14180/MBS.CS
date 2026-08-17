@@ -14,12 +14,11 @@ from apps.api.core.config import get_settings
 from apps.api.modules.agent.models import AgentStep
 from apps.api.modules.agent.repo import persist_agent_decision
 from apps.api.scanner_engine.models import ToolRun
-from apps.api.tests.test_scans import (  # noqa: F401 -- no_celery_dispatch is a fixture
+from apps.api.tests.test_scans import (
     _auth,
     _make_target,
     _register,
     _verify_target,
-    no_celery_dispatch,
 )
 
 

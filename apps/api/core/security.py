@@ -52,6 +52,27 @@ def decode_access_token(token: str) -> dict[str, Any]:
     return payload
 
 
+def create_mfa_challenge_token(user_id: UUID) -> str:
+    """A short-lived, single-purpose token issued after a correct password when the user has MFA
+    enabled. It is NOT an access token (type='mfa') -- decode_access_token rejects it -- so it can
+    never authenticate a protected route; it only authorizes the /auth/mfa/login second factor."""
+    now = datetime.now(timezone.utc)
+    payload: dict[str, Any] = {
+        "sub": str(user_id),
+        "type": "mfa",
+        "iat": now,
+        "exp": now + timedelta(seconds=settings.mfa_challenge_ttl_seconds),
+    }
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=JWT_ALGORITHM)
+
+
+def decode_mfa_challenge_token(token: str) -> dict[str, Any]:
+    payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[JWT_ALGORITHM])
+    if payload.get("type") != "mfa":
+        raise jwt.InvalidTokenError("not an mfa challenge token")
+    return payload
+
+
 def generate_refresh_token() -> str:
     return secrets.token_urlsafe(48)
 

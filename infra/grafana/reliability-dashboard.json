@@ -1,0 +1,113 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "MBS.CS Prometheus data source",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "MBS.CS - Reliability & Operations",
+  "description": "Operational health: broker/DLQ backlog, dependency liveness, backup/beat freshness, scan outcomes, and recovery activity. Import as an artifact; no Grafana service is bundled. References only metrics the app already exports.",
+  "tags": ["mbs", "reliability", "operations"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Scan queue depth by queue",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "mbs_queue_depth", "legendFormat": "{{queue}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Dead-letter queue depth",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "mbs_dlq_depth", "legendFormat": "{{queue}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Dependency health (1 = up, 0 = down)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "mbs_dependency_up", "legendFormat": "{{component}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Backup freshness (age)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "mbs_backup_age_seconds", "legendFormat": "backup age" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Beat heartbeat age",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "mbs_beat_age_seconds", "legendFormat": "beat age" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Scan outcomes/min (success vs failure)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "cpm", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(mbs_scan_success_total[5m])) * 60", "legendFormat": "success" },
+        { "refId": "B", "expr": "sum(rate(mbs_scan_failed_total[5m])) * 60", "legendFormat": "failed" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Scan failure ratio (30m)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(mbs_scan_failed_total[30m])) / clamp_min(sum(rate(mbs_scan_success_total[30m])) + sum(rate(mbs_scan_failed_total[30m])), 0.001)", "legendFormat": "failure ratio" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Recovery activity (reaper / relay per min)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "cpm", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(mbs_scan_reaped_total[15m])) * 60", "legendFormat": "reaped" },
+        { "refId": "B", "expr": "sum(rate(mbs_scan_relayed_total[15m])) * 60", "legendFormat": "relayed" }
+      ]
+    }
+  ]
+}

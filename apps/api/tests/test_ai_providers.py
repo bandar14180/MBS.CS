@@ -38,6 +38,31 @@ def test_estimate_cost_nonzero() -> None:
     assert estimate_cost_usd("mystery-model", 1000, 0) > 0
 
 
+# --- AI-2.2B-1: config-driven pricing overrides ---
+
+def test_estimate_cost_uses_config_override(monkeypatch) -> None:
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ai_pricing_overrides", {"deepseek": [0.001, 0.002]})
+    # 1000 in @0.001/1k + 1000 out @0.002/1k = 0.003
+    assert estimate_cost_usd("deepseek-chat", 1000, 1000) == pytest.approx(0.003)
+
+
+def test_estimate_cost_empty_override_uses_builtin(monkeypatch) -> None:
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ai_pricing_overrides", {})
+    assert estimate_cost_usd("anthropic/claude-opus-4.1", 1000, 1000) == pytest.approx(0.09)  # built-in opus
+    assert estimate_cost_usd("mystery-model", 1000, 0) == pytest.approx(0.005)                # default in-rate
+
+
+def test_estimate_cost_malformed_override_falls_through(monkeypatch) -> None:
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ai_pricing_overrides", {"opus": [0.015]})  # wrong length -> ignored
+    assert estimate_cost_usd("claude-opus", 1000, 1000) == pytest.approx(0.09)      # falls to built-in opus
+
+
 def test_openrouter_parses_content_and_usage(monkeypatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -151,6 +176,7 @@ def _hardened(**overrides) -> Settings:
         ai_provider="openrouter",
         rate_limit_enabled=True,
         metrics_mode="token",
+        mfa_encryption_key="a-real-mfa-encryption-key",
     )
     base.update(overrides)
     return Settings(**base)
@@ -158,6 +184,14 @@ def _hardened(**overrides) -> Settings:
 
 def test_validate_production_accepts_hardened_config() -> None:
     _hardened().validate_production()  # must not raise
+
+
+def test_validate_production_requires_mfa_encryption_key() -> None:
+    import pytest
+
+    with pytest.raises(RuntimeError) as exc:
+        _hardened(mfa_encryption_key="").validate_production()
+    assert "MFA_ENCRYPTION_KEY" in str(exc.value)
 
 
 def test_validate_production_requires_rate_limiting() -> None:

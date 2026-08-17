@@ -41,7 +41,6 @@ async def ingest_finding(
     metadata + last_seen, and if it had been marked `fixed`, flip to `reopened`
     (it came back). Analyst decisions (`false_positive`/`accepted_risk`) stick.
     Every ingest appends a vulnerability_evidence row (blueprint §1)."""
-    now = datetime.now(timezone.utc)
     existing = await db.scalar(
         select(Vulnerability).where(
             Vulnerability.project_id == project_id, Vulnerability.fingerprint == finding.fingerprint

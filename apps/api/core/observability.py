@@ -56,6 +56,22 @@ if _PROM:
     SCAN_DURATION = Histogram("mbs_scan_duration_seconds", "End-to-end scan duration", ["status"])
     TOOL_FAILURE = Counter("mbs_tool_failure_total", "Tool executions that failed", ["tool"])
     AI_DECISION = Counter("mbs_ai_decision_total", "Autonomous agent decisions", ["action"])
+    # AI-2.1: provider failovers on an availability failure. Low-cardinality labels ONLY
+    # (provider names) -- never a key, endpoint, error body, or tenant id.
+    AI_FAILOVER = Counter(
+        "mbs_ai_failover_total", "AI provider failovers (availability failure)", ["from_provider", "to_provider"]
+    )
+    # AI-2.2A: AI calls blocked by the per-workspace daily budget cap. Low-cardinality label ONLY
+    # (agent_role) -- NEVER a workspace id, email, key, or amount.
+    AI_BUDGET_BLOCKED = Counter(
+        "mbs_ai_budget_blocked_total", "AI calls blocked by the daily budget cap", ["agent_role"]
+    )
+    # AI-2.5: latency of successful AI calls + AI calls that ultimately failed. Low-cardinality
+    # labels ONLY (bounded agent_role / provider) -- never model/workspace/scan/host.
+    AI_LATENCY = Histogram(
+        "mbs_ai_latency_seconds", "AI provider call latency (successful calls)", ["agent_role"]
+    )
+    AI_ERRORS = Counter("mbs_ai_errors_total", "AI provider calls that ultimately failed", ["provider"])
     # Phase 1.4: API error responses by stable error type (low-cardinality; never a
     # path/scan_id/message).
     API_ERRORS = Counter("mbs_api_errors_total", "API error responses", ["type"])
@@ -83,6 +99,31 @@ def record_ai_usage_metrics(usage) -> None:
     AI_TOKENS.labels(usage.provider, usage.model, "prompt").inc(usage.prompt_tokens)
     AI_TOKENS.labels(usage.provider, usage.model, "completion").inc(usage.completion_tokens)
     AI_COST.labels(usage.provider, usage.model).inc(usage.estimated_cost_usd)
+
+
+def record_ai_failover(from_provider: str, to_provider: str) -> None:
+    """AI-2.1: count one provider failover. Provider NAMES only -- never keys/endpoints/bodies."""
+    if _PROM:
+        AI_FAILOVER.labels(from_provider, to_provider).inc()
+
+
+def record_ai_budget_blocked(agent_role: str) -> None:
+    """AI-2.2A: count one AI call blocked by the daily budget cap. Only the low-cardinality
+    agent_role label -- never a workspace id or amount."""
+    if _PROM:
+        AI_BUDGET_BLOCKED.labels(agent_role).inc()
+
+
+def record_ai_latency(agent_role: str, seconds: float) -> None:
+    """AI-2.5: observe the latency of a successful AI call (label: bounded agent_role)."""
+    if _PROM:
+        AI_LATENCY.labels(agent_role or "unknown").observe(max(0.0, seconds))
+
+
+def record_ai_error(provider: str) -> None:
+    """AI-2.5: count one AI call that ultimately failed (label: bounded provider name)."""
+    if _PROM:
+        AI_ERRORS.labels(provider or "unknown").inc()
 
 
 def record_scan_outcome(status: str) -> None:
@@ -153,6 +194,18 @@ def metrics_response_body() -> bytes:
 DLQ_REDIS_KEY = "dlq:scans.run_scan"                          # must match scan_tasks.DLQ_KEY
 BACKUP_FAILURES_KEY = "mbs:reliability:backup_failures_total"
 RETENTION_FAILURES_KEY = "mbs:reliability:retention_failures_total"
+# DR-4: unix timestamp of the last SUCCESSFUL backup set; drives mbs_backup_age_seconds so a
+# silently-stalled backup pipeline is alertable even while no explicit failure is recorded.
+BACKUP_LAST_SUCCESS_KEY = "mbs:reliability:backup_last_success_ts"
+# P1.1: unix timestamp of the last beat-dispatched heartbeat a worker processed; drives
+# mbs_beat_age_seconds so a stalled beat scheduler (or a down worker-default) is alertable even
+# while no task explicitly fails.
+BEAT_LAST_TICK_KEY = "mbs:reliability:beat_last_tick_ts"
+# Broker queue-depth backlog: the kombu Redis transport keys each Celery queue's pending-message
+# list by the queue NAME, so LLEN(<queue>) is the count of tasks waiting to be picked up. These
+# MUST match worker.py (task_default_queue="default" + the scans route). ASSUMPTION: no priority
+# queues are configured -- Celery priorities would suffix these keys and change the mapping.
+_BROKER_QUEUES = ("scans", "default")
 
 
 def _reliability_redis():
@@ -187,6 +240,87 @@ def record_retention_failure() -> None:
     _incr_reliability(RETENTION_FAILURES_KEY)
 
 
+def record_backup_success(ts: int | None = None) -> None:
+    """DR-4: stamp the time of the last successful backup set. Best-effort Redis SET; never
+    raises. Read back at scrape time as mbs_backup_age_seconds."""
+    import time as _time
+
+    client = _reliability_redis()
+    if client is None:
+        return
+    try:
+        client.set(BACKUP_LAST_SUCCESS_KEY, int(ts if ts is not None else _time.time()))
+    except Exception:  # noqa: BLE001 -- reliability accounting must never break the caller
+        pass
+
+
+def record_beat_tick(ts: int | None = None) -> None:
+    """P1.1: stamp the time of the last beat heartbeat. Best-effort Redis SET; never raises.
+    Read back at scrape time as mbs_beat_age_seconds. Safe when Redis/config is unavailable."""
+    import time as _time
+
+    client = _reliability_redis()
+    if client is None:
+        return
+    try:
+        client.set(BEAT_LAST_TICK_KEY, int(ts if ts is not None else _time.time()))
+    except Exception:  # noqa: BLE001 -- reliability accounting must never break the caller
+        pass
+
+
+# --- Dependency health (A): active liveness of the core backing services ----------------------
+# Exposed as mbs_dependency_up{component} on the API /metrics via a scrape-time collector doing
+# SHORT-TIMEOUT SYNCHRONOUS probes. The /ready probe already checks Postgres+Redis but is not
+# scraped, so a Redis-only outage (whose paths fail open) is otherwise near-silent. Fully
+# best-effort: any probe error is reported as down (0) and never breaks a /metrics scrape.
+# Low-cardinality label only (component in {postgres, redis}).
+_DEP_PROBE_TIMEOUT_S = 1.0
+
+
+def _probe_postgres() -> bool:
+    """Best-effort sync Postgres liveness (SELECT 1) with a short connect timeout. The app's async
+    DSN (+asyncpg) is normalized to a plain sync DSN for psycopg2. Never raises."""
+    try:
+        import psycopg2
+
+        from apps.api.core.config import get_settings
+
+        dsn = get_settings().database_url.replace("+asyncpg", "")
+        conn = psycopg2.connect(dsn, connect_timeout=max(1, int(_DEP_PROBE_TIMEOUT_S)))
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        finally:
+            conn.close()
+        return True
+    except Exception:  # noqa: BLE001 -- a probe failure means "down", never an exception
+        return False
+
+
+def _probe_redis() -> bool:
+    """Best-effort sync Redis liveness (PING) with short socket timeouts. Never raises."""
+    try:
+        import redis
+
+        from apps.api.core.config import get_settings
+
+        client = redis.from_url(
+            get_settings().redis_url,
+            socket_connect_timeout=_DEP_PROBE_TIMEOUT_S,
+            socket_timeout=_DEP_PROBE_TIMEOUT_S,
+        )
+        try:
+            return bool(client.ping())
+        finally:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        return False
+
+
 if _PROM:
     from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
@@ -200,19 +334,59 @@ if _PROM:
                 return
             try:
                 depth = int(client.llen(DLQ_REDIS_KEY) or 0)
+                queue_depths = {q: int(client.llen(q) or 0) for q in _BROKER_QUEUES}
                 backup_failures = int(client.get(BACKUP_FAILURES_KEY) or 0)
                 retention_failures = int(client.get(RETENTION_FAILURES_KEY) or 0)
+                last_backup_ts = int(client.get(BACKUP_LAST_SUCCESS_KEY) or 0)
+                last_beat_ts = int(client.get(BEAT_LAST_TICK_KEY) or 0)
             except Exception:  # noqa: BLE001
                 return
             dlq = GaugeMetricFamily("mbs_dlq_depth", "Scan dead-letter queue depth (LLEN)", labels=["queue"])
             dlq.add_metric(["scans.run_scan"], float(depth))
             yield dlq
+            # Broker queue backlog: pending tasks per Celery queue (LLEN of the queue's Redis list).
+            # A missing/empty queue reads 0. Assumes queue name == list key (no priority queues).
+            qd = GaugeMetricFamily(
+                "mbs_queue_depth", "Pending tasks in a Celery broker queue (LLEN)", labels=["queue"]
+            )
+            for q, d in queue_depths.items():
+                qd.add_metric([q], float(d))
+            yield qd
             cb = CounterMetricFamily("mbs_backup_failures", "Backup runs that failed (reliability signal)")
             cb.add_metric([], float(backup_failures))
             yield cb
             cr = CounterMetricFamily("mbs_retention_failures", "Retention purge runs that failed (reliability signal)")
             cr.add_metric([], float(retention_failures))
             yield cr
+            # DR-4: seconds since the last successful backup (only when we have ever recorded one,
+            # so a never-backed-up dev/CI target doesn't emit a misleading age).
+            if last_backup_ts > 0:
+                import time as _time
+
+                age = GaugeMetricFamily("mbs_backup_age_seconds", "Seconds since the last successful backup set")
+                age.add_metric([], max(0.0, _time.time() - last_backup_ts))
+                yield age
+            # P1.1: seconds since the last beat heartbeat (only once beat has ticked at least once,
+            # so a never-started scheduler doesn't emit a misleading age).
+            if last_beat_ts > 0:
+                import time as _time
+
+                bage = GaugeMetricFamily("mbs_beat_age_seconds", "Seconds since the last Celery beat heartbeat")
+                bage.add_metric([], max(0.0, _time.time() - last_beat_ts))
+                yield bage
+
+    class DependencyHealthCollector:
+        """Yields mbs_dependency_up{component} from short-timeout SYNC probes at scrape time.
+        Best-effort: a probe error is reported as down (0); the collector itself never raises, so a
+        dependency outage can never break the /metrics scrape."""
+
+        def collect(self):
+            g = GaugeMetricFamily(
+                "mbs_dependency_up", "Core backing-service liveness (1=up, 0=down)", labels=["component"]
+            )
+            g.add_metric(["postgres"], 1.0 if _probe_postgres() else 0.0)
+            g.add_metric(["redis"], 1.0 if _probe_redis() else 0.0)
+            yield g
 
 
 _reliability_registered = False
@@ -231,6 +405,26 @@ def register_reliability_collector() -> bool:
 
         REGISTRY.register(ReliabilityCollector())
         _reliability_registered = True
+        return True
+    except Exception:  # noqa: BLE001 -- never break app startup on a metrics-wiring issue
+        return False
+
+
+_dependency_registered = False
+
+
+def register_dependency_health_collector() -> bool:
+    """Register the DependencyHealthCollector (mbs_dependency_up) on the default registry.
+    Idempotent + best-effort. Call from the API process ONLY (mirrors register_reliability_collector)
+    so the gauge appears once, on api:8000/metrics. Returns True iff registered by THIS call."""
+    global _dependency_registered
+    if not _PROM or _dependency_registered:
+        return False
+    try:
+        from prometheus_client import REGISTRY
+
+        REGISTRY.register(DependencyHealthCollector())
+        _dependency_registered = True
         return True
     except Exception:  # noqa: BLE001 -- never break app startup on a metrics-wiring issue
         return False

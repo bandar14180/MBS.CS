@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from apps.api.core.config import get_settings
-from apps.api.modules.agent.models import AgentStep, EngagementState
+from apps.api.modules.agent.models import EngagementState
 from apps.api.modules.projects.models import Project, Target
 from apps.api.modules.scans.models import Scan
 from apps.api.modules.users.models import User

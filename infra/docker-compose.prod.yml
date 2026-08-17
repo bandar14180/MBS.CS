@@ -39,14 +39,50 @@ services:
 
   # F1: the dedicated default-queue worker needs the same production config -- backup.run and
   # retention.purge touch object storage (s3_secret_key), and all tasks run in production mode.
+  # DR-1/DR-2: backups are ENABLED here and ENCRYPTED at rest (key via Docker Secret). The
+  # backup_data named volume (base compose) persists sets across recreation; bind it to a
+  # durable/off-host path in a real deployment and enable off-site replication (DR-3) via env.
   worker-default:
     environment:
       ENVIRONMENT: production
       AI_PROVIDER: openrouter
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
+      BACKUP_ENABLED: "true"
+      BACKUP_ENCRYPTION_ENABLED: "true"
+      BACKUP_ENCRYPTION_KEY_FILE: /run/secrets/backup_encryption_key
+      # Retention P1 Stage 1: schedule the purge but run it PLAN-ONLY (dry-run). RETENTION_DRY_RUN
+      # stays "true" here -- the task meters what it WOULD delete and touches NO data. Flip to
+      # "false" only after validating a dry-run cycle + taking a DR backup (see
+      # docs/runbooks/retention.md). worker-default executes retention.purge.
+      RETENTION_ENABLED: "true"
+      RETENTION_DRY_RUN: "true"
     secrets:
       - openrouter_api_key
       - s3_secret_key
+      - backup_encryption_key
+
+  # Beat must also see BACKUP_ENABLED / RETENTION_ENABLED so it registers those beat entries
+  # (worker.py builds the schedule from settings at import time). It only emits the ticks; the
+  # backup + retention tasks run on worker-default. RETENTION_DRY_RUN stays "true" (plan-only).
+  beat:
+    environment:
+      ENVIRONMENT: production
+      BACKUP_ENABLED: "true"
+      RETENTION_ENABLED: "true"
+      RETENTION_DRY_RUN: "true"
+
+  # Email alerts (E1..E5). Default OFF -- flip EMAIL_ENABLED=true and fill SMTP_* to turn on.
+  # The email delivery task runs on worker-default; the password is a Docker Secret (*_FILE).
+  # worker (scan queue) does not send email, but shares config for the DLQ-failure alert path.
+  # Example (commented -- provide real values before enabling):
+  #   EMAIL_ENABLED: "true"
+  #   EMAIL_PROVIDER: smtp
+  #   SMTP_HOST: smtp.example.com
+  #   SMTP_PORT: "587"
+  #   SMTP_USERNAME: alerts@example.com
+  #   SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+  #   EMAIL_FROM_ADDRESS: alerts@example.com
+  #   EMAIL_ADMIN_RECIPIENTS: '["ops@example.com"]'
 
   # Production monitoring (Phase 4.2). Scrapes api:8000/metrics (x-metrics-token read from the
   # mounted metrics_token secret) and worker:9100 over the internal compose network. Config in
@@ -67,9 +103,30 @@ services:
       - "127.0.0.1:9090:9090"
     depends_on:
       - api
+      - alertmanager
+
+  # R4: alert delivery. Alertmanager receives fired alerts from Prometheus and emails them using
+  # the SAME smtp_password secret as the app's E-series email (config in ./alertmanager/). Swap the
+  # placeholder smarthost/from/to in alertmanager.yml and provide ./secrets/smtp_password.txt before
+  # use. Published to LOCALHOST ONLY -- never exposed publicly.
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    secrets:
+      - smtp_password
+    ports:
+      - "127.0.0.1:9093:9093"
 
 volumes:
   prometheus_data:
+  # R4: durable Alertmanager state (silences, notification log) across recreation.
+  alertmanager_data:
 
 secrets:
   jwt_secret_key:
@@ -80,3 +137,9 @@ secrets:
     file: ./secrets/s3_secret_key.txt
   metrics_token:
     file: ./secrets/metrics_token.txt
+  # DR-2: master key for AES-256-GCM backup encryption at rest.
+  backup_encryption_key:
+    file: ./secrets/backup_encryption_key.txt
+  # E1 / R4: SMTP password shared by the app's email tasks and Alertmanager alert delivery.
+  smtp_password:
+    file: ./secrets/smtp_password.txt

@@ -50,6 +50,36 @@ class InAppNotificationProvider(NotificationProvider):
         )
 
 
+class EmailNotificationProvider(NotificationProvider):
+    """E1: deliver an alert over email (SMTP). Async-compatible -- the blocking smtplib call runs
+    in a worker thread so this satisfies the async interface without blocking the event loop.
+    Constructed with its recipients + settings (the fixed NotificationProvider.send signature
+    carries content only). Safe when disabled: with email_enabled=False, send() is a no-op, so
+    the channel can always be selected without risk."""
+
+    name = "email"
+
+    def __init__(self, settings=None, recipients: list[str] | None = None):
+        from apps.api.core.config import get_settings
+
+        self._settings = settings or get_settings()
+        self._recipients = list(recipients or [])
+
+    async def send(self, *, title, body=None, workspace_id=None, type="info", severity="info") -> None:
+        import asyncio
+
+        s = self._settings
+        if not s.email_enabled:
+            return  # default-off: nothing is ever sent
+        recipients = self._recipients or list(s.email_admin_recipients)
+        if not recipients:
+            return
+        from apps.api.modules.notifications.email import smtp_send
+
+        # Run the blocking SMTP call off the event loop (async-compatible).
+        await asyncio.to_thread(smtp_send, s, recipients, title, body or "")
+
+
 class _UnimplementedProvider(NotificationProvider):
     """Placeholder for a planned channel; raises so nothing is silently dropped."""
 
@@ -60,14 +90,15 @@ class _UnimplementedProvider(NotificationProvider):
         raise NotImplementedError(f"Notification channel '{self.name}' is not implemented yet.")
 
 
-# Future channels are registered here as they are implemented; today only in-app is
-# live. Email/Slack/Teams/Webhook are declared so the interface + selection exist.
-_CHANNELS = {"email", "slack", "teams", "webhook"}
+# Live channels: in_app + email. Slack/Teams/Webhook remain declared placeholders.
+_CHANNELS = {"slack", "teams", "webhook"}
 
 
 def get_notification_provider(channel: str = "in_app", *, db=None) -> NotificationProvider:
     if channel == "in_app":
         return InAppNotificationProvider(db=db)
+    if channel == "email":
+        return EmailNotificationProvider()
     if channel in _CHANNELS:
         return _UnimplementedProvider(channel)
     raise ValueError(f"Unknown notification channel '{channel}'")

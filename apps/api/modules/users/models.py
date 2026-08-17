@@ -17,6 +17,9 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     mfa_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # MFA Sprint 1 Step 2: when MFA was activated (NULL = never / disabled). Additive, nullable
+    # -> existing users are unaffected and default to MFA disabled.
+    mfa_enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
