@@ -15,7 +15,7 @@ async def _run() -> int:
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        async with session_maker() as session:  # type: AsyncSession
+        async with session_maker() as session:  # -> AsyncSession (inferred)
             return await run_due_schedules(session)
     finally:
         await engine.dispose()

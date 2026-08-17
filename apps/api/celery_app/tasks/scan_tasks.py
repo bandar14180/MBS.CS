@@ -33,7 +33,7 @@ async def _run(scan_id: str) -> None:
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        async with session_maker() as session:  # type: AsyncSession
+        async with session_maker() as session:  # -> AsyncSession (inferred)
             await run_scan(session, uuid.UUID(scan_id))
     finally:
         await engine.dispose()
@@ -59,9 +59,9 @@ async def _fail_scan(scan_id: str, reason: str, duration_s: float = 0.0) -> None
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        async with session_maker() as session:  # type: AsyncSession
+        async with session_maker() as session:  # -> AsyncSession (inferred)
             scan = await session.get(Scan, uuid.UUID(scan_id))
-            recovered = bool(scan) and await _finalize_status(session, scan, "failed")
+            recovered = scan is not None and await _finalize_status(session, scan, "failed")
         if recovered:
             # Reuse the existing lifecycle metric (SCAN_FAILED + duration + outcomes).
             record_scan_result("failed", duration_s)
@@ -85,7 +85,7 @@ async def _fail_scan(scan_id: str, reason: str, duration_s: float = 0.0) -> None
 DLQ_KEY = "dlq:scans.run_scan"
 
 
-def _record_dlq(scan_id: str, exc: Exception, *, task_id: str | None = None, retries: int = 0) -> None:
+def _record_dlq(scan_id: str, exc: BaseException, *, task_id: str | None = None, retries: int = 0) -> None:
     """Push an exhausted scan task onto a Redis dead-letter list for inspection /
     replay. Best-effort: a DLQ write must never mask the original failure. See
     apps.api.celery_app.dlq for inspect/replay/remove tooling."""
@@ -221,7 +221,7 @@ async def _reap() -> int:
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        async with session_maker() as session:  # type: AsyncSession
+        async with session_maker() as session:  # -> AsyncSession (inferred)
             reaped = await reap_orphaned_scans(session, settings.scan_orphan_timeout_seconds)
         if reaped:
             record_scan_reaped(reaped, reason="timeout")
@@ -254,7 +254,7 @@ async def _relay_queued() -> int:
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     relayed = 0
     try:
-        async with session_maker() as session:  # type: AsyncSession
+        async with session_maker() as session:  # -> AsyncSession (inferred)
             rows = await session.execute(
                 text(
                     "SELECT id FROM scans WHERE status = 'queued' AND celery_task_id IS NULL "

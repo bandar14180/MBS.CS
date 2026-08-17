@@ -145,6 +145,8 @@ async def update_member_role(
     await db.commit()
 
     user = await db.get(User, target_user_id)
+    if user is None:  # membership row whose user no longer exists -> 404, not a 500
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Member not found")
     return {
         "id": member.id,
         "user_id": target_user_id,

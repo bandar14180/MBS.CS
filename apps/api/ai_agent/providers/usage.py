@@ -72,7 +72,7 @@ class collect_ai_usage:
             scan_id=str(scan_id) if scan_id else None,
             correlation_id=correlation_id,
         )
-        self._token = None
+        self._token: contextvars.Token[_CallContext | None] | None = None
 
     def __enter__(self) -> list[AIUsage]:
         self._token = _call_ctx.set(self._ctx)

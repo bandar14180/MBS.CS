@@ -127,7 +127,10 @@ def restore_objects(src_dir, store: ObjectStore) -> int:
             if not member.isfile():
                 continue
             bucket, _, key = member.name.partition("/")
-            data = tar.extractfile(member).read()
+            fh = tar.extractfile(member)
+            if fh is None:  # not an extractable regular member -- nothing to restore
+                continue
+            data = fh.read()
             m = meta_by.get((bucket, key), {})
             store.write_object(
                 bucket, key, data,
@@ -151,7 +154,10 @@ def verify_objects_archive(dest_dir) -> bool:
             files = 0
             for member in tar.getmembers():
                 if member.isfile():
-                    tar.extractfile(member).read()  # raises on gzip/tar CRC corruption
+                    fh = tar.extractfile(member)
+                    if fh is None:  # unreadable member => treat the archive as invalid
+                        return False
+                    fh.read()  # raises on gzip/tar CRC corruption
                     files += 1
         return files == manifest.get("count", -1)
     except Exception:  # noqa: BLE001 -- any read/parse error == corrupt/invalid

@@ -127,8 +127,8 @@ def kill_chain_steps(title_by_vuln_id: dict[uuid.UUID, str], mappings: list[Atta
     for phase in KILL_CHAIN_ORDER:
         if phase not in phase_bucket:
             continue
-        techniques = [{**t, "findings": sorted(t["findings"])} for t in phase_bucket[phase].values()]
-        steps.append({"phase": phase, "phase_name": KILL_CHAIN_PHASE_NAMES[phase], "techniques": techniques})
+        phase_techniques = [{**t, "findings": sorted(t["findings"])} for t in phase_bucket[phase].values()]
+        steps.append({"phase": phase, "phase_name": KILL_CHAIN_PHASE_NAMES[phase], "techniques": phase_techniques})
     return steps
 
 
