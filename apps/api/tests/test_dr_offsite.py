@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from apps.api.dr import metrics as m
 from apps.api.dr.offsite import LocalOffsiteTarget, get_offsite_target
 from apps.api.dr.service import run_backup
 from apps.api.tests.test_dr_backup import FakePgRunner, _sample_store

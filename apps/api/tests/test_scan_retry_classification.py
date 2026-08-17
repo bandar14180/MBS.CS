@@ -7,8 +7,6 @@ touched; time.sleep is neutralized so backoff never actually waits.
 """
 import uuid
 
-import pytest
-
 from apps.api.celery_app.tasks import scan_tasks
 from apps.api.celery_app.tasks.scan_tasks import TRANSIENT_ERRORS, run_scan_task
 

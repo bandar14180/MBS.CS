@@ -17,12 +17,11 @@ from apps.api.core.config import get_settings
 from apps.api.modules.scans.models import Scan
 from apps.api.modules.vulnerabilities.models import Vulnerability
 from apps.api.scanner_engine.models import Evidence, ToolRun
-from apps.api.tests.test_scans import (  # noqa: F401 -- fixture + helpers reused
+from apps.api.tests.test_scans import (  # helpers reused (no_celery_dispatch is a conftest fixture)
     _auth,
     _make_target,
     _register,
     _verify_target,
-    no_celery_dispatch,
 )
 
 

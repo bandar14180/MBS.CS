@@ -10,7 +10,6 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -362,7 +361,7 @@ def test_audit_events_deleted_last(monkeypatch):
             await eng.dispose()
 
     ids = asyncio.run(seed())
-    s = _live(monkeypatch, [ids["ws"]])
+    _live(monkeypatch, [ids["ws"]])
 
     order: list[str] = []
     real_by_ids, real_scans = repo.delete_by_ids, repo.delete_scans

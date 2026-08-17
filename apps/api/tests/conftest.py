@@ -93,3 +93,19 @@ def client():
     # keeps everything on a single loop.
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture
+def no_celery_dispatch(monkeypatch):
+    """Stops create_scan from actually queueing to Celery/Redis -- we only want
+    to test the API/gate/persistence layer here, not tool execution (that's
+    verified live against the worker + naabu). Returns a fake AsyncResult.
+
+    Lives in conftest so it is auto-discovered by every test module without a
+    cross-module import (which previously required a `# noqa: F401` and tripped F811)."""
+    from apps.api.celery_app.tasks import scan_tasks
+
+    class _FakeResult:
+        id = "fake-task-id"
+
+    monkeypatch.setattr(scan_tasks.run_scan_task, "delay", lambda *a, **k: _FakeResult())

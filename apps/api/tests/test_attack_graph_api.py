@@ -12,13 +12,12 @@ from sqlalchemy.pool import StaticPool
 
 from apps.api.core.config import get_settings
 from apps.api.modules.agent.models import EngagementState
-# Reuse the established API helpers + the no-Celery fixture from the scans tests.
-from apps.api.tests.test_scans import (  # noqa: F401 -- no_celery_dispatch is a fixture
+# Reuse the established API helpers from the scans tests (no_celery_dispatch is a conftest fixture).
+from apps.api.tests.test_scans import (
     _auth,
     _make_target,
     _register,
     _verify_target,
-    no_celery_dispatch,
 )
 
 _SAMPLE_GRAPH = {

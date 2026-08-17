@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from apps.api.core.config import get_settings
-from apps.api.scanner_engine import net_guard, scope_guard
+from apps.api.scanner_engine import net_guard
 from apps.api.scanner_engine.scope_guard import (
     extract_host,
     finding_in_scope,

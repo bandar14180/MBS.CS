@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from apps.api.ai_agent.agent import AgentDecision, CandidateAction
 from apps.api.core.config import get_settings
-from apps.api.modules.agent.models import AgentDecision as AgentDecisionRow, AgentStep
+from apps.api.modules.agent.models import AgentStep
 from apps.api.modules.agent.repo import latest_agent_decision, persist_agent_decision
 from apps.api.modules.projects.models import Project, Target
 from apps.api.modules.scans.models import Scan

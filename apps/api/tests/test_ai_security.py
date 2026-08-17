@@ -10,7 +10,7 @@ import logging
 
 import pytest
 
-from apps.api.ai_agent import guards, sanitize
+from apps.api.ai_agent import guards
 from apps.api.ai_agent.guards import (
     ASSISTANT_FALLBACK_ANSWER,
     REMEDIATION_FALLBACK_SUMMARY,

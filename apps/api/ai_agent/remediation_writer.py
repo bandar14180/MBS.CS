@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from apps.api.ai_agent.guards import REMEDIATION_FALLBACK_SUMMARY, redact_output, validate_output
 from apps.api.ai_agent.providers import SupportsComplete, get_ai_client

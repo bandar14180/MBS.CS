@@ -3,3 +3,5 @@
 # gitleaks are provided by their GitHub Actions, not pip.
 pip-audit==2.7.3
 cyclonedx-bom==4.6.1
+# Static lint gate (CI-blocking). Pinned for reproducible CI; config in pyproject.toml [tool.ruff].
+ruff==0.16.3

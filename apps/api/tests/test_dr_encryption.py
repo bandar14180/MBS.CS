@@ -4,7 +4,6 @@ Reuses the Phase 1.6 injectable fakes (no postgres/MinIO needed). Proves: an ena
 writes ciphertext with the MBS magic header, verifies + restores round-trip, a WRONG key fails
 closed, and disabling encryption preserves the exact prior (plaintext) behavior.
 """
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest

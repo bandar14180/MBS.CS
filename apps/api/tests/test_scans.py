@@ -1,6 +1,5 @@
 import uuid
 
-import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.scanner_engine.tool_runners.base import RawToolOutput
@@ -88,19 +87,6 @@ def _verify_target(client: TestClient, headers: dict, workspace_id: str, project
     base = f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/targets/{target_id}/authorization-scope"
     client.post(base, headers=headers, json={"proof_type": "dns_txt", "proof_reference": "x"})
     client.post(f"{base}/verify", headers=headers, json={"active_testing_allowed": False})
-
-
-@pytest.fixture
-def no_celery_dispatch(monkeypatch):
-    """Stops create_scan from actually queueing to Celery/Redis -- we only want
-    to test the API/gate/persistence layer here, not tool execution (that's
-    verified live against the worker + naabu). Returns a fake AsyncResult."""
-    from apps.api.celery_app.tasks import scan_tasks
-
-    class _FakeResult:
-        id = "fake-task-id"
-
-    monkeypatch.setattr(scan_tasks.run_scan_task, "delay", lambda *a, **k: _FakeResult())
 
 
 def test_naabu_parse_extracts_ports() -> None:
