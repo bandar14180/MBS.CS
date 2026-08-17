@@ -60,5 +60,8 @@ These need additional components and were kept out of this additive step:
   `mbs_scan_reaped/relayed`, `mbs_schedule_launched`) are exported truthfully. Not set on `api`
   (multiprocess mode is incompatible with its custom collectors) or `beat` (runs no tasks).
 - **Alertmanager** — DONE (R4): fired alerts are delivered to email (see "Alert delivery" above).
-- **Grafana dashboards** — an importable AI dashboard ships (`infra/grafana/ai-dashboard.json`); a
-  bundled Grafana service is still out of scope.
+- **Grafana dashboards** — importable artifacts ship: `infra/grafana/ai-dashboard.json` (AI ops) and
+  `infra/grafana/reliability-dashboard.json` (queue/DLQ depth, dependency health, backup/beat
+  freshness, scan outcomes, reaper/relay recovery). Both reference only exported metrics (asserted by
+  tests). A bundled Grafana service is still out of scope — deploy your own Grafana against the
+  existing Prometheus and import the JSON.
