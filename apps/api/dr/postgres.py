@@ -5,6 +5,7 @@ carries a 'PGDMP' magic header used here for cheap integrity + corruption detect
 external pg commands run through an injectable `PgRunner` seam, so the surrounding logic
 (naming, integrity checks, error paths) is unit-testable without the postgres client.
 """
+import re
 import subprocess
 from pathlib import Path
 
@@ -23,6 +24,28 @@ def pg_uri(database_url: str) -> str:
     return database_url.replace("+asyncpg", "").replace("+psycopg2", "").replace("+psycopg", "")
 
 
+def _redact(text: str) -> str:
+    """Strip userinfo from any libpq URI in `text` -- the DB password is on argv, so an
+    un-redacted command echo would leak it into logs and exception messages."""
+    return re.sub(r"://[^@/\s]*@", "://<redacted>@", text)
+
+
+def _run(cmd: list, *, stdout=None) -> None:
+    """Run a pg_* command and, on failure, raise BackupError CARRYING ITS STDERR.
+
+    Previously stderr went to a pipe that nobody read and `check=True` raised a bare
+    CalledProcessError, whose message is only the argv + exit status -- so a failed
+    restore logged 'returned non-zero exit status 1' and nothing about WHY. Exit-code
+    semantics are deliberately unchanged: any non-zero is still a failure (no
+    --exit-on-error, no partial-success handling); only the diagnostics improve."""
+    proc = subprocess.run(cmd, stdout=stdout, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip() or "<no stderr>"
+        raise BackupError(
+            f"{Path(cmd[0]).name} failed (exit {proc.returncode}): {_redact(err)}"
+        )
+
+
 class PgRunner:
     """Thin seam around pg_dump / pg_restore. Injected in tests with a fake that writes a
     synthetic archive, so no postgres client is needed to exercise the DR flow."""
@@ -33,16 +56,11 @@ class PgRunner:
 
     def dump(self, database_url: str, out_path: Path) -> None:
         with open(out_path, "wb") as fh:
-            subprocess.run(
-                [self.dump_cmd, "-Fc", "-d", pg_uri(database_url)],
-                stdout=fh, stderr=subprocess.PIPE, check=True,
-            )
+            _run([self.dump_cmd, "-Fc", "-d", pg_uri(database_url)], stdout=fh)
 
     def restore(self, database_url: str, dump_path: Path) -> None:
-        subprocess.run(
-            [self.restore_cmd, "--no-owner", "--no-privileges", "-d", pg_uri(database_url), str(dump_path)],
-            stderr=subprocess.PIPE, check=True,
-        )
+        _run([self.restore_cmd, "--no-owner", "--no-privileges", "-d",
+              pg_uri(database_url), str(dump_path)])
 
 
 def backup_postgres(dest_dir, *, database_url: str, runner: PgRunner) -> dict:

@@ -357,9 +357,9 @@ def run_restore(settings, set_dir, *, target_database_url=None, store=None, runn
         ok = False
         m.record_restore("postgres", success=False)
         m.logger.error(
-            "restore.failed component=postgres set=%s", set_dir.name,
+            "restore.failed component=postgres set=%s error=%s", set_dir.name, exc,
             extra={"event": "restore.failed", "component": "postgres", "set": set_dir.name,
-                   "reason": type(exc).__name__},
+                   "reason": type(exc).__name__, "error": str(exc)},
             exc_info=True,
         )
 
