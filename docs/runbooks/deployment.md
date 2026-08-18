@@ -95,7 +95,7 @@ docker compose $COMPOSE stop -t 60 worker           # -t >= stop_grace_period
   — but prefer forward fixes; downgrades are a last resort.
 
 ## Related runbooks
-- Disaster recovery / backups: `disaster-recovery.md`, `backup-restore.md`
+- Disaster recovery / backups: `disaster-recovery.md`
 - DLQ replay: `dlq-replay.md` (planned) — inspect/replay dead-lettered scans
 - Retention enablement: `retention.md`
 - Email alerts: `email-alerts.md`

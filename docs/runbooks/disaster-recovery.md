@@ -1,8 +1,13 @@
 # Disaster Recovery Runbook (Phase 1.6)
 
 Automated, configurable backup & restore for PostgreSQL **and** object storage (evidence +
-reports), with verification, retention, metrics, and structured logging. This complements
-the manual `infra/backup/*.sh` scripts (Phase 1.1) with a testable, scheduled, in-app system.
+reports), with verification, retention, metrics, and structured logging.
+
+**`apps/api/dr/` is the production backup system** — it is what `worker-default` runs on the
+beat schedule (`backup.run`) and what `docker-compose.prod.yml` configures. It superseded the
+manual `infra/backup/*.sh` shell scripts (Phase 1.1), which were never wired into compose, CI
+or the scheduler and have been removed; this runbook is the single source of truth. If you
+find a reference to `infra/backup/` or `backup-restore.md` anywhere, it is stale.
 
 ## Layout of a backup set
 Each run creates one **timestamped, never-overwritten** directory under `BACKUP_DIRECTORY`:
@@ -17,14 +22,29 @@ Each run creates one **timestamped, never-overwritten** directory under `BACKUP_
   MANIFEST.json           # timestamp, per-component result + checksums, overall status
 ```
 
-## CLI
+## CLI — operator quick reference
 ```bash
 python -m apps.api.dr backup                    # create + verify + prune  (exit 0/1)
 python -m apps.api.dr verify   <set_dir>        # integrity + checksum      (exit 0/1)
+python -m apps.api.dr drill    --target-db-url <SCRATCH_DB> [--set <dir>] [--objects]
 python -m apps.api.dr restore  <set_dir> [--target-db-url URL] [--objects]
 python -m apps.api.dr cleanup                   # apply retention now
 ```
 Exit code is `0` on success, non-zero on failure — composes with cron/systemd/CI.
+
+Run these on **`worker-default`**: it is the service that mounts `backup_data:/srv/backups`
+(`BACKUP_DIRECTORY`), so a set created anywhere else is written to container-local storage and
+lost on recreation. The image also ships the postgres client that `pg_dump`/`pg_restore` need.
+
+```bash
+COMPOSE="-f infra/docker-compose.yml -f infra/docker-compose.prod.yml"
+docker compose $COMPOSE exec worker-default python -m apps.api.dr backup
+docker compose $COMPOSE exec worker-default python -m apps.api.dr verify /srv/backups/<SET>
+```
+
+`restore` and `drill` write to a database. `drill` refuses to run without a scratch target and
+refuses a target equal to the live `DATABASE_URL`; `restore` has **no such guard** — always pass
+`--target-db-url` explicitly unless you intend to overwrite the database in `DATABASE_URL`.
 
 ## Backup flow
 1. `pg_dump -Fc` → `db.dump`; reject a missing/tiny/non-`PGDMP` archive; write `.sha256`.
@@ -129,7 +149,21 @@ idempotent (DLQ replay is safe via the atomic scan claim + orphan reaper) or fai
 (rate-limit / budget / MFA-lockout). For a real deployment, bind `redis_data` to a durable/off-host
 path. *(This is single-node durability, not HA — Redis failover/replication is deferred; see DR-5.)*
 
-## Recovery evidence — the four required scenarios
+## Recovery evidence — status
+
+**No backup has been created and no restore drill has been executed in any environment yet.**
+The mechanisms below are implemented and unit-tested (the DR suites use an injected fake
+`PgRunner`/object store, so they exercise the naming, checksum, verification, retention and
+drill-safety logic — **not** real `pg_dump`/`pg_restore`). Recoverability is therefore
+**unproven** until a real backup set and a drill evidence artifact exist.
+
+Closing that gap is the top DR priority: run `dr backup`, then `dr drill` against a scratch
+database, and keep `<BACKUP_DIRECTORY>/drills/drill-<ts>.json` as the evidence. Until then,
+treat the scenarios below as *designed* recovery paths, not *demonstrated* ones — and do not
+enable live retention deletion (see `retention.md`, Stage 2), which depends on a restorable
+backup existing.
+
+### The four required scenarios
 - **Database loss** → `dr restore` / `dr drill` (pg_restore into a clean DB; migration-consistent).
 - **Object storage failure** → object verify + `restore --objects` (faithful metadata).
 - **Accidental data deletion** → timestamped retained sets (`min_keep` never erases the newest);
