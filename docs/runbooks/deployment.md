@@ -33,6 +33,15 @@ docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml run 
 Migrations in this repo are additive; a brief window where old code runs against the new schema is
 tolerated. Never roll app code that requires a migration that hasn't been applied yet.
 
+## TLS trust at build time
+Production builds require **no** local CA file: the images verify PyPI / GitHub / npm
+against the public root store shipped in their base image, and no interception root is
+baked into any layer. The optional `extra_ca` BuildKit secret is a **developer-machine
+convenience** for networks that intercept TLS (see the README); it is supplied by a
+gitignored `infra/docker-compose.local-ca.yml` overlay that is never applied here. If a
+build on a production host fails TLS verification, treat it as a network/proxy problem
+to fix at the network layer — do not disable verification and do not add the overlay.
+
 ## Rolling restart (no scan loss)
 Order matters: drain scan workers first, then the rest.
 ```bash

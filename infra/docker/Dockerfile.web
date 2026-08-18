@@ -3,7 +3,26 @@ FROM node:20-slim
 WORKDIR /srv
 
 COPY apps/web/package.json ./package.json
-RUN npm install
+
+# Local TLS-interception support (BUILD-TIME ONLY).
+# Where an AV/proxy terminates TLS, registry.npmjs.org presents a locally-signed
+# cert and npm fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE. Node does NOT read the
+# system trust store -- its roots are compiled in -- and NODE_EXTRA_CA_CERTS
+# APPENDS to them, so pointing it at the root alone is sufficient (no
+# ca-certificates package, no update-ca-certificates, no combined bundle).
+#
+# The root is an OPTIONAL BuildKit secret:
+#   local: docker build --secret id=extra_ca,src=infra/docker/norton-webmail-root.crt ...
+#   CI/prod: no secret passed -> public CAs only; the image trusts nothing extra.
+# The secret is readable only inside this layer and is never copied into the
+# image, so no interception root ships and no persistent ENV weakens runtime TLS.
+# TLS verification is never disabled (no strict-ssl=false, no NODE_TLS_REJECT_UNAUTHORIZED).
+RUN --mount=type=secret,id=extra_ca \
+    if [ -f /run/secrets/extra_ca ]; then \
+      NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca npm install; \
+    else \
+      npm install; \
+    fi
 
 COPY apps/web ./
 

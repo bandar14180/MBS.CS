@@ -21,6 +21,18 @@ npm-debug.log*
 # Docker
 *.pid
 
+# Local TLS-interception CA + its build overlay -- developer-machine only, never
+# committed. The images take this root as an OPTIONAL BuildKit secret; CI and
+# production build without it and trust public CAs only. Exact paths (not *.crt /
+# *.cer) so legitimate project certificates are never hidden by accident.
+infra/docker/norton-webmail-root.crt
+infra/docker/norton-webmail-root.cer
+infra/docker-compose.local-ca.yml
+
+# Claude Code local session state (agent worktrees, etc.) -- already excluded from
+# the Docker build context via .dockerignore.
+.claude/
+
 # OS / editor
 .DS_Store
 Thumbs.db
