@@ -10,6 +10,13 @@
 *.pem
 *.key
 secrets/
+# Local TLS-interception root CA. It reaches the build ONLY as a BuildKit secret
+# (read from the host path, never from the build context), so keeping it out of the
+# context is free and guarantees it can never be COPYed into a layer by accident.
+# Exact paths, NOT *.crt/*.cer -- a broad glob could silently hide a legitimate
+# project certificate from a future build.
+infra/docker/norton-webmail-root.crt
+infra/docker/norton-webmail-root.cer
 
 # VCS / CI
 .git

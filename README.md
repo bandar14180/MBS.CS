@@ -54,6 +54,27 @@ docker compose -f infra/docker-compose.yml exec api sh -c "cd /srv/db && alembic
 
 > Use `localhost` (not `127.0.0.1` / LAN IP) so the browser's CORS origin matches the API allow-list.
 
+<details>
+<summary>Building behind a TLS-intercepting proxy / AV (optional)</summary>
+
+If your machine terminates TLS (some corporate proxies and antivirus products do), the
+image builds fail to verify PyPI / GitHub / the npm registry — typically
+`unable to get local issuer certificate` or `UNABLE_TO_VERIFY_LEAF_SIGNATURE`.
+
+The fix is to **trust** your interception root, never to disable verification. Drop the
+root (PEM) at `infra/docker/norton-webmail-root.crt`, create a local build overlay
+`infra/docker-compose.local-ca.yml` (both are gitignored), and build with:
+
+```bash
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.local-ca.yml build
+```
+
+The overlay passes the root as an **optional BuildKit secret** used only during
+`pip install` / `npm install` / tool downloads. It is never copied into an image and
+sets no persistent CA environment variable. The command above is required **only** on
+such machines — the standard `up --build` path needs no certificate.
+</details>
+
 ### Enable live AI (optional)
 
 Everything works without AI (graceful fallback). To activate the AI Planner / Correlator / FP-Reducer / Remediation / Assistant, put a key in `.env` and recreate the API/worker:

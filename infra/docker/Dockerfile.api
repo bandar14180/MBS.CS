@@ -7,7 +7,28 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UVICORN_WORKERS=2
 
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
-RUN pip install --no-cache-dir -r apps/api/requirements.txt
+
+# Local TLS-interception support (BUILD-TIME ONLY).
+# Where an AV/proxy terminates TLS (e.g. Norton), PyPI presents a locally-signed
+# cert and pip fails with "unable to get local issuer certificate". Trusting the
+# root system-wide is NOT enough: pip ignores the system store and uses its own
+# vendored certifi bundle, so it needs PIP_CERT pointed at a bundle that includes
+# the local root.
+#
+# The root is an OPTIONAL BuildKit secret:
+#   local: docker build --secret id=extra_ca,src=infra/docker/norton-webmail-root.crt ...
+#   CI/prod: no secret passed -> public CAs only; the image trusts nothing extra.
+# The combined bundle exists in /tmp for THIS layer only and is deleted before the
+# layer is committed, so the interception root never reaches the final image.
+# TLS verification is never disabled (no --trusted-host, no SSL bypass).
+RUN --mount=type=secret,id=extra_ca \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export PIP_CERT=/tmp/ca-build.pem SSL_CERT_FILE=/tmp/ca-build.pem \
+               REQUESTS_CA_BUNDLE=/tmp/ca-build.pem CURL_CA_BUNDLE=/tmp/ca-build.pem; \
+    fi; \
+    pip install --no-cache-dir -r apps/api/requirements.txt \
+    && rm -f /tmp/ca-build.pem
 
 COPY apps/__init__.py ./apps/__init__.py
 COPY apps/api ./apps/api

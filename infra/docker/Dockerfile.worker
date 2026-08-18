@@ -15,7 +15,23 @@ ARG NAABU_VERSION=2.6.1
 ARG SUBFINDER_VERSION=2.14.0
 ARG HTTPX_VERSION=1.10.0
 ARG NUCLEI_VERSION=3.11.0
-RUN apt-get update \
+# Local TLS-interception support (BUILD-TIME ONLY) -- applied to every HTTPS step
+# in this file (curl -> GitHub, pip -> PyPI, nuclei -> template repo).
+# Where an AV/proxy terminates TLS (e.g. Norton), those hosts present a locally-
+# signed cert. The root is passed as an OPTIONAL BuildKit secret:
+#   local: docker build --secret id=extra_ca,src=infra/docker/norton-webmail-root.crt ...
+#   CI/prod: no secret passed -> public CAs only; the image trusts nothing extra.
+# The combined bundle lives in /tmp for the duration of each layer and is deleted
+# before that layer is committed, so the interception root never ships in the image.
+# TLS verification is never disabled (no --trusted-host, no -k, no SSL bypass).
+# NOTE: pip ignores the system trust store (vendored certifi), hence PIP_CERT.
+RUN --mount=type=secret,id=extra_ca \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export CURL_CA_BUNDLE=/tmp/ca-build.pem SSL_CERT_FILE=/tmp/ca-build.pem \
+               PIP_CERT=/tmp/ca-build.pem REQUESTS_CA_BUNDLE=/tmp/ca-build.pem; \
+    fi; \
+    apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip libpcap0.8 nmap \
     && curl -sSfL "https://github.com/projectdiscovery/naabu/releases/download/v${NAABU_VERSION}/naabu_${NAABU_VERSION}_linux_amd64.zip" -o /tmp/naabu.zip \
     && unzip -o /tmp/naabu.zip -d /tmp/naabu && mv /tmp/naabu/naabu /usr/local/bin/naabu \
@@ -29,10 +45,19 @@ RUN apt-get update \
     && rm -rf /tmp/naabu* /tmp/subfinder* /tmp/httpx* /tmp/nuclei* \
     && apt-get purge -y curl unzip \
     && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /tmp/ca-build.pem
 
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
-RUN pip install --no-cache-dir -r apps/api/requirements.txt
+# PyPI over HTTPS -- same optional-secret pattern as above.
+RUN --mount=type=secret,id=extra_ca \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export PIP_CERT=/tmp/ca-build.pem SSL_CERT_FILE=/tmp/ca-build.pem \
+               REQUESTS_CA_BUNDLE=/tmp/ca-build.pem; \
+    fi; \
+    pip install --no-cache-dir -r apps/api/requirements.txt \
+    && rm -f /tmp/ca-build.pem
 
 # Run scans as an unprivileged user. The default recon config uses connect scans
 # (naabu/nmap) which do NOT need root/raw sockets, so no capabilities are lost.
@@ -53,8 +78,17 @@ ENV HOME=/home/appuser \
 # appuser's HOME -- an image that cannot vuln-scan is not fit to ship (no `|| true`).
 # This sits BEFORE the app COPY so iterating on application code doesn't bust the
 # (large, slow) template layer.
-RUN nuclei -update-templates \
-    && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ]
+# GitHub over HTTPS -- same optional-secret pattern. `uid=10001` is required here
+# because this layer runs as appuser and the secret is root-owned 0400 by default.
+# Go reads SSL_CERT_FILE for its system cert pool, so nuclei honors the bundle.
+RUN --mount=type=secret,id=extra_ca,uid=10001 \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export SSL_CERT_FILE=/tmp/ca-build.pem; \
+    fi; \
+    nuclei -update-templates \
+    && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ] \
+    && rm -f /tmp/ca-build.pem
 
 # DAST enhancement: the app-layer coverage the signature pipeline lacks.
 #   katana  -- crawler (release zip), feeds discovered URLs to the fuzzer.
@@ -64,20 +98,34 @@ RUN nuclei -update-templates \
 # them never busts that (large) cache. Needs root for /usr/local/bin + site-packages.
 USER root
 ARG KATANA_VERSION=1.1.2
-RUN apt-get update \
+# GitHub (katana) + PyPI (arjun) over HTTPS -- same optional-secret pattern.
+RUN --mount=type=secret,id=extra_ca \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export CURL_CA_BUNDLE=/tmp/ca-build.pem SSL_CERT_FILE=/tmp/ca-build.pem \
+               PIP_CERT=/tmp/ca-build.pem REQUESTS_CA_BUNDLE=/tmp/ca-build.pem; \
+    fi; \
+    apt-get update \
     && apt-get install -y --no-install-recommends curl unzip \
     && curl -sSfL "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_amd64.zip" -o /tmp/katana.zip \
     && unzip -o /tmp/katana.zip -d /tmp/katana && mv /tmp/katana/katana /usr/local/bin/katana \
     && chmod +x /usr/local/bin/katana \
     && rm -rf /tmp/katana* \
     && pip install --no-cache-dir arjun==2.2.7 \
-    && apt-get purge -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+    && apt-get purge -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* \
+    && rm -f /tmp/ca-build.pem
 USER appuser
 
 # Warm httpx's tech-detection ("dit") model into the image so scans don't download
 # ~92MB at runtime (P2-15). Best-effort: if the build network can't fetch it, we
 # fall back to the runtime download (unchanged behavior) rather than failing.
-RUN echo "https://example.com" | httpx-pd -tech-detect -silent -timeout 20 >/dev/null 2>&1 || true
+RUN --mount=type=secret,id=extra_ca,uid=10001 \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export SSL_CERT_FILE=/tmp/ca-build.pem; \
+    fi; \
+    echo "https://example.com" | httpx-pd -tech-detect -silent -timeout 20 >/dev/null 2>&1 || true; \
+    rm -f /tmp/ca-build.pem
 
 # Application code last: it changes most often, so keeping it after the template
 # layer keeps rebuilds fast. Owned by the runtime user (COPY runs as root).
