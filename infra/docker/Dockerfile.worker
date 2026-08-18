@@ -33,6 +33,7 @@ RUN --mount=type=secret,id=extra_ca \
     fi; \
     apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip libpcap0.8 nmap \
+       postgresql-client-17 \
     && curl -sSfL "https://github.com/projectdiscovery/naabu/releases/download/v${NAABU_VERSION}/naabu_${NAABU_VERSION}_linux_amd64.zip" -o /tmp/naabu.zip \
     && unzip -o /tmp/naabu.zip -d /tmp/naabu && mv /tmp/naabu/naabu /usr/local/bin/naabu \
     && curl -sSfL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/subfinder_${SUBFINDER_VERSION}_linux_amd64.zip" -o /tmp/subfinder.zip \
@@ -61,7 +62,14 @@ RUN --mount=type=secret,id=extra_ca \
 
 # Run scans as an unprivileged user. The default recon config uses connect scans
 # (naabu/nmap) which do NOT need root/raw sockets, so no capabilities are lost.
-RUN useradd --create-home --uid 10001 appuser
+# DR-1: create BACKUP_DIRECTORY here, owned by appuser, BEFORE dropping privileges.
+# The named volume mounted at /srv/backups inherits this ownership the first time it
+# is used (Docker seeds an empty named volume from the image directory), so the
+# unprivileged runtime user can write backup sets. Without it the mount lands
+# root-owned 0755 and `dr backup` fails with PermissionError.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /srv/backups \
+    && chown appuser:appuser /srv/backups
 USER appuser
 
 # Docker does NOT reset $HOME when USER changes -- it stays at the builder default
@@ -80,15 +88,70 @@ ENV HOME=/home/appuser \
 # (large, slow) template layer.
 # GitHub over HTTPS -- same optional-secret pattern. `uid=10001` is required here
 # because this layer runs as appuser and the secret is root-owned 0400 by default.
-# Go reads SSL_CERT_FILE for its system cert pool, so nuclei honors the bundle.
-RUN --mount=type=secret,id=extra_ca,uid=10001 \
-    if [ -f /run/secrets/extra_ca ]; then \
-        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
-        export SSL_CERT_FILE=/tmp/ca-build.pem; \
-    fi; \
-    nuclei -update-templates \
-    && [ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ] \
-    && rm -f /tmp/ca-build.pem
+# Go/Python read SSL_CERT_FILE for their trust store, so the fetch honors the bundle.
+#
+# `nuclei -update-templates` is NOT used: on 3.11.0 it can exit 0 while installing
+# NOTHING (download succeeds, extraction fails silently), which defeats the count
+# gate below by leaving an empty dir behind a successful exit. Fetching the pinned
+# release archive directly is deterministic instead: the version is an ARG (an
+# upgrade becomes a reviewed repo change rather than a silent drift), a truncated
+# download raises BadZipFile, and `set -eu` aborts the layer on any failure.
+ARG NUCLEI_TEMPLATES_VERSION=10.4.7
+RUN --mount=type=secret,id=extra_ca,uid=10001 <<'SH'
+set -eu
+if [ -f /run/secrets/extra_ca ]; then
+    cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem
+    export SSL_CERT_FILE=/tmp/ca-build.pem
+fi
+python - "$NUCLEI_TEMPLATES_DIR" "$NUCLEI_TEMPLATES_VERSION" <<'PY'
+import http.client, io, os, ssl, sys, time, urllib.request, zipfile
+
+dest, ver = sys.argv[1], sys.argv[2]
+url = f"https://codeload.github.com/projectdiscovery/nuclei-templates/zip/refs/tags/v{ver}"
+ctx = ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or None)
+
+# A TLS-intercepting proxy can sever this ~19MB transfer mid-stream (IncompleteRead),
+# intermittently rather than deterministically. Retry the WHOLE download up to 3 times;
+# each attempt discards its partial buffer, so a truncated body is never reused or
+# written to disk. After the last attempt the exception propagates and fails the build.
+ATTEMPTS = 3
+for attempt in range(1, ATTEMPTS + 1):
+    data = None                              # drop any partial buffer from a failed try
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "nuclei"}), context=ctx, timeout=300
+        ) as r:
+            data = r.read()
+        expected = r.headers.get("Content-Length")
+        if expected is not None and len(data) != int(expected):
+            raise OSError(f"short read: got {len(data)} of {expected} bytes")
+        break
+    except (http.client.IncompleteRead, OSError, ssl.SSLError) as exc:
+        data = None
+        print(f"attempt {attempt}/{ATTEMPTS} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if attempt == ATTEMPTS:
+            raise
+        time.sleep(5 * attempt)               # brief, widening pause before retrying
+
+z = zipfile.ZipFile(io.BytesIO(data))       # truncated archive -> BadZipFile -> build fails
+root = z.namelist()[0].split("/")[0]        # strip the "nuclei-templates-<ver>/" prefix
+os.makedirs(dest, exist_ok=True)
+for m in z.infolist():
+    rel = m.filename[len(root) + 1:]
+    if not rel:
+        continue
+    target = os.path.join(dest, rel)
+    if m.is_dir():
+        os.makedirs(target, exist_ok=True)
+        continue
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with z.open(m) as src, open(target, "wb") as dst:
+        dst.write(src.read())
+print(f"extracted {len(z.infolist())} entries -> {dest}")
+PY
+[ "$(find "$NUCLEI_TEMPLATES_DIR" -name '*.yaml' 2>/dev/null | wc -l)" -gt 100 ]
+rm -f /tmp/ca-build.pem
+SH
 
 # DAST enhancement: the app-layer coverage the signature pipeline lacks.
 #   katana  -- crawler (release zip), feeds discovered URLs to the fuzzer.

@@ -1,0 +1,4 @@
+# Dockerfile heredocs (RUN <<'EOF') are byte-sensitive: a CRLF line ending makes the
+# shell see EOF\r, which never matches the EOF terminator and breaks the build on
+# Windows checkouts. Force LF so the worker image builds identically everywhere.
+infra/docker/Dockerfile* text eol=lf
