@@ -43,10 +43,19 @@ _hard_limit = settings.celery_task_time_limit_seconds
 if _soft_limit and (_hard_limit <= _soft_limit):
     _hard_limit = _soft_limit + 300  # keep a margin for clean in-task teardown
 
+# Redis broker visibility timeout. kombu's default is 3600s -- BELOW the hard task time
+# limit, so a scan legitimately running between 3600s and the hard limit had its message
+# restored to the queue and redelivered WHILE its original worker was still executing it.
+# The atomic claim stopped that redelivery executing, but it acked away the one message that
+# gave the scan its acks_late safety net. Derived from the hard limit (never below it) so
+# raising the limit cannot silently reintroduce the overlap; asserted in the worker tests.
+_visibility_timeout = max(4200, (_hard_limit or 0) + 300)
+
 celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
+    broker_transport_options={"visibility_timeout": _visibility_timeout},
     task_default_queue="default",
     task_routes={
         "scans.run_scan": {"queue": "scans"},
@@ -114,7 +123,7 @@ celery_app.conf.timezone = "UTC"
 # Phase 4.1: start the worker's Prometheus metrics endpoint once the worker is up. Registered
 # unconditionally (the handler no-ops in the API process -- the signal only fires in a worker)
 # and is fully best-effort, so it can never block worker startup.
-from celery.signals import worker_ready  # noqa: E402
+from celery.signals import worker_ready, worker_shutting_down  # noqa: E402
 
 
 @worker_ready.connect
@@ -122,3 +131,21 @@ def _start_worker_metrics(**_kwargs) -> None:
     from apps.api.celery_app.metrics import start_worker_metrics_server
 
     start_worker_metrics_server()
+
+
+# P1-1: on a deliberate (warm) shutdown, return a still-executing scan to the queue so the
+# redelivery that acks_late ALREADY performs is actually claimable -- without this the
+# redelivered task hits `_claim_scan` on a 'running' row, skips, and ACKs away the only
+# message that could restart the scan (leaving it stranded until the orphan reaper fails it).
+# The handler writes nothing up front; see apps/api/celery_app/shutdown.py for why it waits
+# out the drain first. Best-effort: it must never block or fail the worker's exit.
+@worker_shutting_down.connect
+def _requeue_inflight_scans(**_kwargs) -> None:
+    try:
+        from apps.api.celery_app.shutdown import on_worker_shutting_down
+
+        on_worker_shutting_down()
+    except Exception:  # noqa: BLE001 -- shutdown hygiene must never prevent shutdown
+        import logging
+
+        logging.getLogger("mbs.shutdown").warning("shutdown.hook_failed", exc_info=True)

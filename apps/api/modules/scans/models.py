@@ -39,6 +39,21 @@ class Scan(Base):
     # (AI Layer v1). requested_modules lives in `config` in the meantime.
     config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # EXECUTION OWNERSHIP FENCE (P1-1 P3). `status='running'` alone cannot say WHICH
+    # execution owns the scan, so an executor whose row was requeued by the graceful-
+    # shutdown hook could not tell it had been revoked -- it kept running and its terminal
+    # write silently matched 0 rows. `_claim_scan` stamps a fresh token here and every
+    # ownership-sensitive write is conditional on it. NULL = unowned (queued/terminal).
+    # Internal to the worker lifecycle: deliberately NOT exposed in ScanRead.
+    execution_token: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    # WHEN this scan entered the queue -- what the queued relay ages off. Distinct from
+    # created_at on purpose: a scan requeued by the graceful-shutdown hook was CREATED long
+    # ago, so ageing off created_at made it relay-eligible the instant it was requeued, i.e.
+    # redispatchable while its old worker was still draining. The requeue refreshes this, so
+    # the earliest redispatch is requeue + scan_queued_relay_seconds.
+    queued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=True
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -155,7 +155,7 @@ async def _seed(session):
 
 
 async def _scenario(scripted: ScriptedClient):
-    from apps.api.scanner_engine.orchestrator import _run_agent_driven
+    from apps.api.scanner_engine.orchestrator import _claim_scan, _run_agent_driven
 
     settings = get_settings()
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
@@ -167,7 +167,12 @@ async def _scenario(scripted: ScriptedClient):
             target = await session.get(Target, target_id)
             scope = SimpleNamespace(active_testing_allowed=True)  # authorization is tested elsewhere
 
-            statuses = await _run_agent_driven(session, scan, target, scope)
+            # The agent path only ever runs inside a CLAIMED execution, which stamps the
+            # ownership token its stop-checks are fenced on (P1-1 P3).
+            token = uuid.uuid4()
+            await _claim_scan(session, scan_id, token)
+            await session.refresh(scan)
+            statuses = await _run_agent_driven(session, scan, target, scope, token)
 
         # Re-open a SEPARATE session to prove the graph was PERSISTED to the DB,
         # not merely held on the in-memory state object.
@@ -216,7 +221,7 @@ class _AlwaysHttpx:
 
 
 async def _budget_scenario(client):
-    from apps.api.scanner_engine.orchestrator import _run_agent_driven
+    from apps.api.scanner_engine.orchestrator import _claim_scan, _run_agent_driven
 
     settings = get_settings()
     engine = create_async_engine(settings.database_url, poolclass=StaticPool)
@@ -226,7 +231,10 @@ async def _budget_scenario(client):
             ws_id, scan_id, target_id = await _seed(s)
             scan = await s.get(Scan, scan_id)
             target = await s.get(Target, target_id)
-            await _run_agent_driven(s, scan, target, SimpleNamespace(active_testing_allowed=True))
+            token = uuid.uuid4()
+            await _claim_scan(s, scan_id, token)
+            await s.refresh(scan)
+            await _run_agent_driven(s, scan, target, SimpleNamespace(active_testing_allowed=True), token)
         async with maker() as v:
             await _set_guc(v, ws_id)
             decisions = list(await v.scalars(

@@ -59,7 +59,7 @@ async def _seed_scan(status="queued", *, task_id=None, age_seconds=0) -> uuid.UU
             s.add(scan)
             await s.flush()
             if age_seconds:
-                await s.execute(text("UPDATE scans SET created_at = now() - make_interval(secs => :a) WHERE id = :i"),
+                await s.execute(text("UPDATE scans SET created_at = now() - make_interval(secs => :a), queued_at = now() - make_interval(secs => :a) WHERE id = :i"),
                                 {"a": age_seconds, "i": scan.id})
             await s.commit()
             return scan.id
@@ -101,8 +101,8 @@ def test_relay_plus_late_original_cannot_double_execute():
             async with maker() as s:
                 # a queued scan (as if relayed AND the original message is also in the broker)
                 scan_id = await _seed_scan_inline(s, "queued")
-                first = await _claim_scan(s, scan_id)     # one worker (e.g. relay msg) claims
-                second = await _claim_scan(s, scan_id)    # the other (late original) cannot
+                first = await _claim_scan(s, scan_id, uuid.uuid4())     # one worker (e.g. relay msg) claims
+                second = await _claim_scan(s, scan_id, uuid.uuid4())    # the other (late original) cannot
             return first, second
         finally:
             await engine.dispose()

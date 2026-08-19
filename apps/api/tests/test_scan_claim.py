@@ -57,8 +57,8 @@ def test_claim_queued_then_second_claim_fails():
         try:
             async with maker() as s:
                 scan_id = await _seed_scan(s, "queued")
-                first = await _claim_scan(s, scan_id)
-                second = await _claim_scan(s, scan_id)
+                first = await _claim_scan(s, scan_id, uuid.uuid4())
+                second = await _claim_scan(s, scan_id, uuid.uuid4())
                 status = await s.scalar(select(Scan.status).where(Scan.id == scan_id))
             return first, second, status
         finally:
@@ -79,7 +79,7 @@ def test_running_not_claimable():
         try:
             async with maker() as s:
                 scan_id = await _seed_scan(s, "running")
-                return await _claim_scan(s, scan_id)
+                return await _claim_scan(s, scan_id, uuid.uuid4())
         finally:
             await engine.dispose()
 
@@ -94,9 +94,9 @@ def test_terminal_not_claimable():
         maker = async_sessionmaker(engine, expire_on_commit=False)
         try:
             async with maker() as s:
-                completed = await _claim_scan(s, await _seed_scan(s, "completed"))
-                cancelled = await _claim_scan(s, await _seed_scan(s, "cancelled"))
-                with_errors = await _claim_scan(s, await _seed_scan(s, "completed_with_errors"))
+                completed = await _claim_scan(s, await _seed_scan(s, "completed"), uuid.uuid4())
+                cancelled = await _claim_scan(s, await _seed_scan(s, "cancelled"), uuid.uuid4())
+                with_errors = await _claim_scan(s, await _seed_scan(s, "completed_with_errors"), uuid.uuid4())
             return completed, cancelled, with_errors
         finally:
             await engine.dispose()
@@ -114,7 +114,7 @@ def test_failed_is_reclaimable():
         try:
             async with maker() as s:
                 scan_id = await _seed_scan(s, "failed")
-                claimed = await _claim_scan(s, scan_id)
+                claimed = await _claim_scan(s, scan_id, uuid.uuid4())
                 status = await s.scalar(select(Scan.status).where(Scan.id == scan_id))
             return claimed, status
         finally:
@@ -135,8 +135,8 @@ def test_two_connections_only_one_claims():
             async with m1() as s_seed:
                 scan_id = await _seed_scan(s_seed, "queued")
             async with m1() as s1, m2() as s2:
-                c1 = await _claim_scan(s1, scan_id)   # connection 1
-                c2 = await _claim_scan(s2, scan_id)   # connection 2 (separate)
+                c1 = await _claim_scan(s1, scan_id, uuid.uuid4())   # connection 1
+                c2 = await _claim_scan(s2, scan_id, uuid.uuid4())   # connection 2 (separate)
             return c1, c2
         finally:
             await e1.dispose()

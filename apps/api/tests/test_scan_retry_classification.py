@@ -34,7 +34,7 @@ def _wire(monkeypatch, boom_exc, *, succeed_after: int | None = None):
     to a counter; neutralize backoff sleeps. Returns the shared call counters."""
     calls = {"run": 0, "dlq": 0}
 
-    async def _boom(_scan_id):
+    async def _boom(_scan_id, execution_token=None):
         calls["run"] += 1
         if succeed_after is not None and calls["run"] > succeed_after:
             return None
