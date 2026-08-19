@@ -27,9 +27,23 @@ def _parse_limit(spec: str) -> tuple[int, int]:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """Best-effort client IP for rate-limit bucketing.
+
+    X-Forwarded-For is set by the client and MUST NOT be trusted unless the app actually
+    sits behind a known number of trusted proxies (TRUSTED_PROXY_COUNT). With N>0 trusted
+    proxies we take the client's own hop as the Nth entry FROM THE RIGHT -- the rightmost
+    entries are appended by our trusted proxies, the leftmost are attacker-spoofable. With
+    the default 0 we ignore XFF entirely and use the direct socket peer, so spoofing the
+    header cannot fabricate an unlimited number of distinct rate-limit buckets."""
+    from apps.api.core.config import get_settings
+
+    n = get_settings().trusted_proxy_count
+    if n > 0:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            parts = [p.strip() for p in fwd.split(",") if p.strip()]
+            if len(parts) >= n:
+                return parts[-n]
     return request.client.host if request.client else "unknown"
 
 
@@ -103,6 +117,25 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return "ai", self._ai
         return "default", self._default
 
+    @staticmethod
+    def _principal(request: Request) -> str:
+        """The rate-limit identity. Prefer the authenticated user (stable, and immune to
+        NAT/proxy IP sharing or X-Forwarded-For spoofing); fall back to the client IP for
+        anonymous requests. The bearer token is validated by a pure, side-effect-free JWT
+        decode -- any invalid/absent token degrades to the IP bucket, never raising."""
+        authz = request.headers.get("authorization", "")
+        if authz[:7].lower() == "bearer ":
+            token = authz[7:].strip()
+            try:
+                from apps.api.core.security import decode_access_token
+
+                sub = decode_access_token(token).get("sub")
+                if sub:
+                    return f"user:{sub}"
+            except Exception:  # noqa: BLE001 -- unauthenticated/invalid token -> IP bucket
+                pass
+        return f"ip:{_client_ip(request)}"
+
     async def _get_redis(self):
         if self._redis is None:
             import redis.asyncio as aioredis
@@ -112,8 +145,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         bucket, (limit, window) = self._limit_for(request.url.path)
-        ip = _client_ip(request)
-        key = f"rl:{bucket}:{ip}"
+        key = f"rl:{bucket}:{self._principal(request)}"
         now = time.time()
         try:
             client = await self._get_redis()

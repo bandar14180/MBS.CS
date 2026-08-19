@@ -28,6 +28,10 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       DATABASE_URL: postgresql+asyncpg://mbs:mbs@localhost:5432/mbs
+      # The test suite's autouse fixture wipes every table before each test. This runner's
+      # Postgres is a disposable service container, so explicitly authorize the wipe. Locally
+      # the suite refuses to run against a non-`*_test` database unless this is set (conftest.py).
+      MBS_ALLOW_DB_WIPE: "1"
       REDIS_URL: redis://localhost:6379/0
       # Object storage for the storage-dependent tests (report generation + scan
       # evidence). Mirrors docker-compose's MinIO; without it those tests fail on a

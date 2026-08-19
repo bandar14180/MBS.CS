@@ -88,6 +88,25 @@ async def lifespan(app: FastAPI):
             "AI provider '%s' has no API key; AI features will degrade gracefully (503).",
             settings.ai_provider,
         )
+    # Cost-safety nudge: a hosted AI provider is billable, so warn when no daily spend cap is
+    # enforced. Non-fatal (some deployments intentionally run uncapped); the local provider is free.
+    if settings.ai_enabled and settings.ai_provider != "local" and not (
+        settings.ai_budget_enforce and settings.ai_daily_budget_usd > 0
+    ):
+        logger.warning(
+            "AI is enabled on billable provider '%s' with NO daily spend cap "
+            "(AI_BUDGET_ENFORCE + AI_DAILY_BUDGET_USD). Set a cap to bound cost/abuse.",
+            settings.ai_provider,
+        )
+    # Rate-limit correctness nudge: behind a reverse proxy with TRUSTED_PROXY_COUNT=0 the app
+    # cannot see real client IPs, so anonymous requests all share the proxy's IP bucket while
+    # X-Forwarded-For is (correctly) ignored. Warn so operators set the real proxy-hop count.
+    if settings.rate_limit_enabled and settings.trusted_proxy_count == 0:
+        logger.warning(
+            "RATE_LIMIT_ENABLED is on but TRUSTED_PROXY_COUNT=0: X-Forwarded-For is ignored and "
+            "anonymous requests are bucketed by the direct peer IP. If the app is behind a reverse "
+            "proxy, set TRUSTED_PROXY_COUNT to the number of trusted hops (e.g. 1 behind nginx)."
+        )
     yield
 
 
@@ -127,8 +146,10 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        """Liveness: the process is up. No dependency checks (never fails on a DB blip)."""
-        return {"status": "ok", "service": settings.app_name, "environment": settings.environment}
+        """Liveness: the process is up. No dependency checks (never fails on a DB blip).
+        Intentionally minimal -- this probe is unauthenticated, so it must not disclose the
+        environment name or other deployment metadata to anonymous callers."""
+        return {"status": "ok"}
 
     @app.get("/ready")
     async def ready() -> Response:
