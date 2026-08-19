@@ -365,6 +365,13 @@ class Settings(BaseSettings):
     rate_limit_default: str = "300/minute"
     rate_limit_auth: str = "10/minute"
     rate_limit_ai: str = "30/minute"
+    # How many TRUSTED reverse proxies sit in front of the app. X-Forwarded-For is
+    # client-controllable, so it is only honored when this is > 0, and then the client's
+    # own hop is read as the Nth entry FROM THE RIGHT (leftmost entries are attacker-
+    # spoofable). 0 (default) = ignore XFF entirely and use the direct peer, so a spoofed
+    # header can never mint fresh rate-limit buckets. Set to the real proxy-hop count in
+    # production (e.g. 1 behind a single nginx).
+    trusted_proxy_count: int = 0
 
     # --- Logging / observability -------------------------------------------
     log_level: str = "INFO"

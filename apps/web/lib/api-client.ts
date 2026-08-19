@@ -7,10 +7,11 @@ const API_BASE_URL =
     ? process.env.API_INTERNAL_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
     : process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+// /health is an UNAUTHENTICATED liveness probe, so it deliberately returns nothing beyond
+// liveness — the service name and environment were removed rather than disclosed to anonymous
+// callers. Keep this type minimal to match; anything richer belongs behind auth (/ready).
 export type HealthResponse = {
   status: string;
-  service: string;
-  environment: string;
 };
 
 export async function getHealth(): Promise<HealthResponse> {
