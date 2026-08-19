@@ -1,9 +1,40 @@
+import os
 import warnings
+from urllib.parse import urlparse
 
 import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
+
+
+def _env_truthy(val: str | None) -> bool:
+    return str(val or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _assert_wipe_allowed(dsn: str) -> None:
+    """Refuse to run the destructive per-test reset against a non-test database.
+
+    The autouse `_reset_db` fixture DELETEs every volatile table before each test, so pointing
+    DATABASE_URL at a real database destroys its data (this suite has, historically, emptied the
+    shared `mbs` DB used by the app and the DR backups). The wipe is permitted ONLY when the
+    target is clearly disposable:
+      * the database name ends in `_test`, or
+      * MBS_ALLOW_DB_WIPE is explicitly truthy (CI sets this against an ephemeral throwaway DB).
+    Otherwise we stop the WHOLE session immediately with an actionable message rather than
+    silently clearing real data -- fail closed, since even read/write tests would pollute it."""
+    if _env_truthy(os.environ.get("MBS_ALLOW_DB_WIPE")):
+        return
+    db_name = urlparse(dsn).path.lstrip("/").split("?")[0]
+    if db_name.endswith("_test"):
+        return
+    pytest.exit(
+        "Refusing to run: the test suite wipes every table in the target database, but "
+        f"DATABASE_URL points at '{db_name or '(unknown)'}', which is not a test database. "
+        "Point DATABASE_URL at a database whose name ends in '_test', or set MBS_ALLOW_DB_WIPE=1 "
+        "to override (CI does this against a disposable database).",
+        returncode=1,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +79,8 @@ def _reset_db():
     _PRESERVE = ("alembic_version", "roles", "permissions", "role_permissions")
 
     dsn = get_settings().database_url.replace("+asyncpg", "")
+    # Fail closed BEFORE connecting: never wipe a database that isn't a disposable test DB.
+    _assert_wipe_allowed(dsn)
     try:
         conn = psycopg2.connect(dsn, connect_timeout=5)
     except psycopg2.OperationalError as exc:  # DB unreachable: the only environment case we handle
