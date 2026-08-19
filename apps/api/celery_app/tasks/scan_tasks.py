@@ -11,7 +11,7 @@ from apps.api.core.config import get_settings
 from apps.api.scanner_engine.orchestrator import run_scan
 
 
-async def _run(scan_id: str) -> None:
+async def _run(scan_id: str, execution_token: uuid.UUID | None = None) -> None:
     # A fresh engine bound to THIS task's event loop. Reusing the API's
     # module-level engine here fails with "Future attached to a different loop"
     # because Celery runs each task under a new asyncio.run() loop while the
@@ -34,12 +34,14 @@ async def _run(scan_id: str) -> None:
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_maker() as session:  # -> AsyncSession (inferred)
-            await run_scan(session, uuid.UUID(scan_id))
+            await run_scan(session, uuid.UUID(scan_id), execution_token=execution_token)
     finally:
         await engine.dispose()
 
 
-async def _fail_scan(scan_id: str, reason: str, duration_s: float = 0.0) -> None:
+async def _fail_scan(
+    scan_id: str, reason: str, duration_s: float, execution_token: uuid.UUID
+) -> None:
     """Mark a scan 'failed' from the TASK level (Phase 1.5), used when the Celery soft
     time limit fires. The signal surfaces out of asyncio.run (outside the orchestrator's
     own try/except), so without this the scan would stay 'running' until the reaper.
@@ -61,7 +63,12 @@ async def _fail_scan(scan_id: str, reason: str, duration_s: float = 0.0) -> None
     try:
         async with session_maker() as session:  # -> AsyncSession (inferred)
             scan = await session.get(Scan, uuid.UUID(scan_id))
-            recovered = scan is not None and await _finalize_status(session, scan, "failed")
+            # Fenced on THIS execution's token (P1-1 P3): if the scan was requeued on
+            # shutdown and re-claimed by a new executor, the row is 'running' again -- an
+            # unfenced write here would clobber the NEW owner's scan with our timeout.
+            recovered = scan is not None and await _finalize_status(
+                session, scan, "failed", execution_token
+            )
         if recovered:
             # Reuse the existing lifecycle metric (SCAN_FAILED + duration + outcomes).
             record_scan_result("failed", duration_s)
@@ -181,8 +188,13 @@ def run_scan_task(self, scan_id: str, correlation_id: str | None = None) -> str:
 
     set_correlation_id(correlation_id or new_correlation_id())
     _started = _time.monotonic()
+    # One ownership token for this whole execution (P1-1 P3). Generated HERE, not inside
+    # run_scan, so the soft-timeout handler below can fence its terminal write on the same
+    # token -- otherwise a timeout firing after a shutdown requeue + re-claim would mark the
+    # NEW executor's running scan as failed.
+    execution_token = uuid.uuid4()
     try:
-        asyncio.run(_run(scan_id))
+        asyncio.run(_run(scan_id, execution_token))
     except SoftTimeLimitExceeded as exc:
         # The soft time limit fired (Phase 1.5): the scan ran too long. Mark it 'failed'
         # cleanly so it is reclaimable (not stuck 'running' waiting on the reaper), record
@@ -190,7 +202,9 @@ def run_scan_task(self, scan_id: str, correlation_id: str | None = None) -> str:
         # timeout -- returning normally acks the task and stops the retry chain. The HARD
         # limit (billiard TimeLimitExceeded / SIGKILL) is deliberately NOT caught here: it
         # is the final safety net, left to the orphan reaper.
-        asyncio.run(_fail_scan(scan_id, "soft_time_limit_exceeded", _time.monotonic() - _started))
+        asyncio.run(_fail_scan(
+            scan_id, "soft_time_limit_exceeded", _time.monotonic() - _started, execution_token
+        ))
         _record_dlq(scan_id, exc, task_id=self.request.id, retries=self.request.retries)
         return scan_id
     except TRANSIENT_ERRORS as exc:
@@ -239,6 +253,15 @@ async def _relay_queued() -> int:
     never got a celery_task_id (their Celery dispatch failed -- the DB+Redis dual-write's
     Redis side) and have sat past scan_queued_relay_seconds.
 
+    Ages rows off `queued_at` (when the scan ENTERED the queue), NOT `created_at`. A scan
+    returned to the queue by the graceful-shutdown hook was created long before it ran, so
+    ageing off `created_at` made it eligible IMMEDIATELY on requeue -- the relay could
+    redispatch it inside the container's stop_grace_period while the old executor was still
+    running, producing two live executions against the same target. Rows that predate the
+    `queued_at` column were explicitly backfilled from `created_at` by its migration, so they
+    keep their real queue age; `coalesce(queued_at, created_at)` is a defensive fallback for
+    an unexpected NULL, not the mechanism that preserves that behaviour.
+
     Conservative: `celery_task_id IS NULL` targets ONLY undelivered scans -- a scan already
     in flight has a task id and is never touched. It NEVER creates a second scan row; it just
     re-enqueues the existing scan_id, and the atomic scan claim (queued/failed -> running)
@@ -258,7 +281,7 @@ async def _relay_queued() -> int:
             rows = await session.execute(
                 text(
                     "SELECT id FROM scans WHERE status = 'queued' AND celery_task_id IS NULL "
-                    "AND created_at < now() - make_interval(secs => :secs)"
+                    "AND coalesce(queued_at, created_at) < now() - make_interval(secs => :secs)"
                 ),
                 {"secs": int(settings.scan_queued_relay_seconds)},
             )

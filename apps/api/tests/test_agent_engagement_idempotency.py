@@ -64,7 +64,7 @@ async def _seed(session):
     session.add(tgt)
     await session.flush()
     scan = Scan(workspace_id=ws.id, project_id=proj.id, target_id=tgt.id, initiated_by=user.id,
-                scan_type="network", status="running", config={})
+                scan_type="network", status="running", config={}, execution_token=uuid.uuid4())
     session.add(scan)
     await session.commit()
     return ws.id, scan, tgt
@@ -85,7 +85,7 @@ def test_first_run_creates_single_engagement_and_runs_loop(monkeypatch):
         try:
             async with async_sessionmaker(eng, expire_on_commit=False)() as s:
                 ws, scan, tgt = await _seed(s)
-                await _run_agent_driven(s, scan, tgt, SimpleNamespace(active_testing_allowed=True))
+                await _run_agent_driven(s, scan, tgt, SimpleNamespace(active_testing_allowed=True), scan.execution_token)
             async with async_sessionmaker(eng, expire_on_commit=False)() as v:
                 return client.calls, await _count(v, ws, "engagement_state", scan.id)
         finally:
@@ -112,7 +112,7 @@ def test_rerun_reuses_engagement_and_skips_ai(monkeypatch):
                 await s.commit()
 
                 client.calls = 0  # reset -- the re-run must make ZERO AI calls
-                result = await _run_agent_driven(s, scan, tgt, SimpleNamespace(active_testing_allowed=True))
+                result = await _run_agent_driven(s, scan, tgt, SimpleNamespace(active_testing_allowed=True), scan.execution_token)
             async with async_sessionmaker(eng, expire_on_commit=False)() as v:
                 return (client.calls, result,
                         await _count(v, ws, "engagement_state", scan.id),
@@ -139,9 +139,9 @@ def test_rerun_does_not_raise_integrity_error(monkeypatch):
             async with async_sessionmaker(eng, expire_on_commit=False)() as s:
                 ws, scan, tgt = await _seed(s)
                 scope = SimpleNamespace(active_testing_allowed=True)
-                await _run_agent_driven(s, scan, tgt, scope)   # first run: creates + commits
+                await _run_agent_driven(s, scan, tgt, scope, scan.execution_token)   # first run: creates + commits
                 calls_after_first = client.calls
-                await _run_agent_driven(s, scan, tgt, scope)   # retry: must NOT raise
+                await _run_agent_driven(s, scan, tgt, scope, scan.execution_token)   # retry: must NOT raise
                 calls_after_second = client.calls
             async with async_sessionmaker(eng, expire_on_commit=False)() as v:
                 return calls_after_first, calls_after_second, await _count(v, ws, "engagement_state", scan.id)

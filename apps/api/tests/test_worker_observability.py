@@ -84,7 +84,7 @@ def test_run_scan_task_sets_correlation_from_kwarg(monkeypatch):
 
     captured = {}
 
-    async def _fake_run(_scan_id):
+    async def _fake_run(_scan_id, execution_token=None):
         captured["cid"] = get_correlation_id()
 
     monkeypatch.setattr(scan_tasks, "_run", _fake_run)
@@ -99,7 +99,7 @@ def test_run_scan_task_generates_correlation_when_missing(monkeypatch):
     set_correlation_id("-")   # reset ambient
     captured = {}
 
-    async def _fake_run(_scan_id):
+    async def _fake_run(_scan_id, execution_token=None):
         captured["cid"] = get_correlation_id()
 
     monkeypatch.setattr(scan_tasks, "_run", _fake_run)

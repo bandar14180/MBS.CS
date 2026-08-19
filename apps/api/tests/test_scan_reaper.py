@@ -164,8 +164,13 @@ def test_reaper_does_not_overwrite_a_completing_scan():
             async with maker() as s:
                 _w, sid = await _seed_scan(s, "running", OLD)   # old enough to be a reap candidate
                 scan = await s.get(Scan, sid)
+                # Give the row an owner, as a real claim would (P1-1 P3): the terminal write
+                # is fenced on it.
+                token = uuid.uuid4()
+                scan.execution_token = token
+                await s.commit()
                 # the worker finishes FIRST: running -> completed (atomic conditional write)
-                won = await _finalize_status(s, scan, "completed")
+                won = await _finalize_status(s, scan, "completed", token)
                 # the reaper then runs -- it must NOT clobber the just-completed scan
                 await reap_orphaned_scans(s, TIMEOUT)
                 return won, await _status(s, sid), await _config(s, sid)
@@ -190,8 +195,8 @@ def test_reaped_scan_cannot_be_double_executed():
                 await reap_orphaned_scans(s, TIMEOUT)     # -> 'failed' (reclaimable)
                 status_after = await _status(s, sid)
                 # Two workers now attempt to claim the recovered scan: exactly one wins.
-                first = await _claim_scan(s, sid)
-                second = await _claim_scan(s, sid)
+                first = await _claim_scan(s, sid, uuid.uuid4())
+                second = await _claim_scan(s, sid, uuid.uuid4())
             return status_after, first, second
         finally:
             await engine.dispose()

@@ -30,6 +30,16 @@ class AuthorizationRevoked(Exception):
     time (revoked/expired between queueing and running)."""
 
 
+class ExecutionRevoked(Exception):
+    """Raised when THIS executor no longer owns the scan it is running (P1-1 P3).
+
+    Ownership is revoked by the graceful-shutdown hook returning an interrupted scan to the
+    queue (`running` -> `queued`, `execution_token` -> NULL) so it can be redispatched. The
+    revoked executor must stop cooperatively and must NOT finalize: its outcome is no longer
+    authoritative, and the row now belongs to whichever executor claims it next. Deliberately
+    NOT an error path -- nothing failed, this execution was superseded."""
+
+
 async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
     # scans is intentionally not RLS-protected; we read it by trusted id first,
     # THEN set the workspace RLS var so every subsequent read/write on
@@ -40,7 +50,7 @@ async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
     return scan
 
 
-async def _claim_scan(db: AsyncSession, scan_id: uuid.UUID) -> bool:
+async def _claim_scan(db: AsyncSession, scan_id: uuid.UUID, execution_token: uuid.UUID) -> bool:
     """Atomically CLAIM a scan for execution (F3). A single conditional UPDATE uses the
     `status` column as the claim token: only a `queued` scan (first run) or a `failed`
     scan (retry) is claimable; a `running` or terminal scan is not. Returns True iff
@@ -48,13 +58,19 @@ async def _claim_scan(db: AsyncSession, scan_id: uuid.UUID) -> bool:
     redelivery / duplicate dispatch WITHOUT any long-held lock -- the row lock is held
     only for this one statement, which commits immediately (the multi-minute scan then
     runs lock-free). Under READ COMMITTED a losing worker updates 0 rows. Does NOT
-    recover orphaned `running` scans (out of scope -- see F3b follow-up)."""
+    recover orphaned `running` scans (out of scope -- see F3b follow-up).
+
+    The claim ALSO stamps `execution_token` (P1-1 P3): the claimable-status set is
+    deliberately UNCHANGED -- this only records WHICH execution won, so every later
+    ownership-sensitive write can be fenced against a superseded executor. The token is
+    REQUIRED: an execution that did not record who it is could never fence its own terminal
+    write, which is precisely the defect this exists to prevent."""
     result = await db.execute(
         text(
-            "UPDATE scans SET status = 'running', started_at = now() "
+            "UPDATE scans SET status = 'running', started_at = now(), execution_token = :tok "
             "WHERE id = :id AND status IN ('queued', 'failed') RETURNING id"
         ),
-        {"id": str(scan_id)},
+        {"id": str(scan_id), "tok": str(execution_token)},
     )
     claimed = result.first() is not None
     await db.commit()  # make the claim durable + visible to other workers
@@ -72,9 +88,20 @@ async def reap_orphaned_scans(db: AsyncSession, timeout_seconds: int) -> int:
 
     Why 'failed' and NOT re-queue: the reaper never re-dispatches a task, so it can never
     create a duplicate execution. If a marked scan is later retried, the atomic claim
-    (queued/failed only) still guarantees at-most-one executor. If the 'crashed' worker
-    was merely slow and still alive, it simply overwrites this 'failed' with its true
-    terminal status on completion -- again, only ONE execution ever ran.
+    (queued/failed only) still guarantees at-most-one executor.
+
+    The SAME statement clears `execution_token`, so the transition is `running + token X` ->
+    `failed + token NULL`. That is what REVOKES a 'crashed' worker that was merely slow and
+    is in fact still alive: it can no longer finalize (terminalization is fenced on
+    `status='running'` AND the token), and -- because the token no longer matches -- its
+    losing terminal write is correctly recognised as lost ownership, so it records no
+    duplicate lifecycle metric, publishes no second ScanCompleted, and is not dead-lettered.
+    Without the clear, that executor still "owned" a terminal row and fell through into
+    exactly those duplicate signals. Note this is a REVOCATION, not an overwrite: the
+    reaper's 'failed' stands, and the slow worker's own outcome is discarded.
+
+    A replacement executor is never at risk: a fresh claim sets `started_at = now()`, so a
+    re-claimed scan is not over the threshold and this statement cannot match it.
 
     A clear failure reason is persisted into config.recovery (reason/recovered_at/
     running_timeout_seconds) in the SAME atomic statement -- additive JSONB, no schema or
@@ -89,7 +116,7 @@ async def reap_orphaned_scans(db: AsyncSession, timeout_seconds: int) -> int:
     # (vs :secs for make_interval) avoids one param serving two type contexts.
     result = await db.execute(
         text(
-            "UPDATE scans SET status = 'failed', completed_at = now(), "
+            "UPDATE scans SET status = 'failed', completed_at = now(), execution_token = NULL, "
             "config = coalesce(config, '{}'::jsonb) || jsonb_build_object("
             "  'recovery', jsonb_build_object("
             "    'reason', :reason ::text, 'recovered_at', now(), "
@@ -106,31 +133,30 @@ async def reap_orphaned_scans(db: AsyncSession, timeout_seconds: int) -> int:
     return reaped
 
 
-async def _is_cancelled(db: AsyncSession, scan_id: uuid.UUID) -> bool:
-    """Cooperative-cancellation probe (Phase 1.5). A fresh single-statement read of the
-    scan's status; under READ COMMITTED it sees a concurrent API cancel committed on
-    another connection. Used between tool executions so an in-flight scan stops promptly
-    instead of running every remaining tool after the user cancelled."""
-    row = (await db.execute(
-        text("SELECT status FROM scans WHERE id = :id"), {"id": str(scan_id)}
-    )).first()
-    return bool(row and row[0] == "cancelled")
-
-
-async def _finalize_status(db: AsyncSession, scan: Scan, new_status: str) -> bool:
+async def _finalize_status(
+    db: AsyncSession, scan: Scan, new_status: str, execution_token: uuid.UUID
+) -> bool:
     """Atomically move a scan from 'running' to a terminal status (Phase 1.5).
 
     The write is CONDITIONAL on status still being 'running' (mirrors the atomic claim),
     so it can NEVER clobber a scan that was cancelled (or otherwise moved terminal)
     concurrently by the API. Returns True iff THIS caller performed the terminal write;
     False means someone else already finalized it (e.g. a cancel) and the caller must not
-    overwrite. Refreshes the ORM object so callers see the authoritative status."""
+    overwrite. Refreshes the ORM object so callers see the authoritative status.
+
+    OWNERSHIP FENCE (P1-1 P3): the write additionally requires the row to still be owned by
+    THIS execution. Without that, an executor whose scan had been requeued and then
+    re-claimed by a NEW executor would satisfy `status='running'` and clobber the new
+    owner's scan with its own stale outcome. On success the token is cleared -- a terminal
+    scan is owned by nobody. The token is REQUIRED: there is deliberately no way to disable
+    the fence, so a caller cannot silently perform an unowned terminal write."""
     result = await db.execute(
         text(
-            "UPDATE scans SET status = :st, completed_at = now() "
-            "WHERE id = :id AND status = 'running' RETURNING id"
+            "UPDATE scans SET status = :st, completed_at = now(), execution_token = NULL "
+            "WHERE id = :id AND status = 'running' AND execution_token = :tok ::uuid "
+            "RETURNING id"
         ),
-        {"st": new_status, "id": str(scan.id)},
+        {"st": new_status, "id": str(scan.id), "tok": str(execution_token)},
     )
     won = result.first() is not None
     await db.commit()
@@ -138,7 +164,61 @@ async def _finalize_status(db: AsyncSession, scan: Scan, new_status: str) -> boo
     return won
 
 
-async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
+_TERMINAL_STATUSES = ("completed", "completed_with_errors", "failed", "cancelled")
+
+
+def _ownership_lost_reason(status: str | None) -> str:
+    """WHY this execution no longer owns its scan, derived from the row's CURRENT status.
+
+    Ownership can be lost three different ways, and reporting all of them as a shutdown
+    requeue is misleading -- the orphan reaper terminalizes a scan (and revokes its token)
+    with no shutdown involved at all."""
+    if status == "queued":
+        return "requeued_on_shutdown"      # graceful-shutdown hook returned it to the queue
+    if status == "running":
+        return "reclaimed_by_new_owner"    # a later executor already claimed it
+    if status in _TERMINAL_STATUSES:
+        return "already_terminal"          # reaper / cancellation / another finalizer won
+    return "ownership_lost"
+
+
+async def _execution_stop_reason(
+    db: AsyncSession, scan_id: uuid.UUID, execution_token: uuid.UUID
+) -> str | None:
+    """Why this execution should stop right now, or None to continue (Phase 1.5 + P1-1 P3).
+
+    One fresh single-statement read; under READ COMMITTED it sees commits made on other
+    connections. Returns:
+      * 'cancelled' -- the user cancelled (pre-existing cooperative cancellation), or
+      * 'revoked'   -- this execution no longer owns the scan: the graceful-shutdown hook
+                       returned it to the queue, or a later executor has since claimed it.
+    Checked between tool runs AND once more immediately before each tool is spawned, so a
+    superseded executor never deliberately starts new work against the target. It cannot
+    make an already-running tool stop, so it shrinks the overlap window rather than removing
+    it; what actually rules out a concurrent replacement executor is the shutdown timing
+    (see `test_shutdown_timing_invariant_*`)."""
+    row = (await db.execute(
+        text("SELECT status, execution_token FROM scans WHERE id = :id"), {"id": str(scan_id)}
+    )).first()
+    if row is None:
+        return "revoked"  # row vanished: we certainly no longer own it
+    status, current_token = row[0], row[1]
+    if status == "cancelled":
+        return "cancelled"
+    if status != "running" or str(current_token or "") != str(execution_token):
+        return "revoked"
+    return None
+
+
+async def run_scan(
+    db: AsyncSession, scan_id: uuid.UUID, execution_token: uuid.UUID | None = None
+) -> None:
+    # EXECUTION OWNERSHIP (P1-1 P3): one token identifies THIS execution for its whole life.
+    # Installed by the atomic claim below and required by every terminal write, so an
+    # executor that is superseded mid-run (graceful-shutdown requeue) can neither finalize
+    # nor be confused with the executor that takes over. The task layer passes its own token
+    # so it can fence the soft-timeout path too; direct callers get a fresh one.
+    execution_token = execution_token or uuid.uuid4()
     scan = await _load_scan(db, scan_id)
 
     # ATOMIC CLAIM (F3): a task can be re-delivered after a worker crash (acks_late),
@@ -146,7 +226,7 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     # is the claim token) -- only a queued (first run) or failed (retry) scan is
     # claimable; a running or terminal scan is not. This prevents duplicate concurrent
     # execution without any long-held lock. If we don't win the claim, skip cleanly.
-    claimed = await _claim_scan(db, scan_id)
+    claimed = await _claim_scan(db, scan_id, execution_token)
     await db.refresh(scan)  # resync the ORM object after the raw claim UPDATE
     if not claimed:
         logger.info("scan.skip_not_claimable scan=%s status=%s", scan.id, scan.status)
@@ -207,7 +287,7 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # of Engagement (safety enforced in code). Supersedes the AI planner + the
         # fixed pipeline. Fail-soft: an AI failure ends the loop cleanly.
         if scan.config.get("use_agent"):
-            tool_statuses = await _run_agent_driven(db, scan, target_row, scope)
+            tool_statuses = await _run_agent_driven(db, scan, target_row, scope, execution_token)
         else:
             # Opt-in AI planning (blueprint §7 step 2). When enabled, the AI Planner
             # proposes which of the requested tools to run and in what order; its
@@ -248,16 +328,22 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
             # Findings accumulate across the pipeline so later tools build on earlier
             # ones (httpx probes subfinder's subdomains; nmap deep-scans naabu ports).
             for runner in runners:
-                # Cooperative cancellation (Phase 1.5): stop launching further tools the
-                # moment the scan is cancelled. The terminal write below then loses the
-                # atomic race and leaves the 'cancelled' state intact.
-                if await _is_cancelled(db, scan.id):
+                # Cooperative stop (Phase 1.5 + P1-1 P3): stop launching further tools the
+                # moment the scan is cancelled OR this execution is superseded.
+                stop_reason = await _execution_stop_reason(db, scan.id, execution_token)
+                if stop_reason == "cancelled":
+                    # The terminal write below then loses the atomic race and leaves the
+                    # 'cancelled' state intact.
                     logger.info(
                         "scan.cancelled_stop scan=%s tool=%s (skipping remaining tools)", scan.id, runner.name,
                         extra={"event": "scan.cancelled_stop", "scan_id": str(scan.id),
                                "reason": "cancelled", "tool": runner.name},
                     )
                     break
+                if stop_reason == "revoked":
+                    # We no longer own this scan -- abandon it BEFORE running another tool,
+                    # so the executor that takes over never overlaps with this one.
+                    raise ExecutionRevoked(f"execution superseded before tool {runner.name}")
                 if runner.applicable_target_types is not None and target_row.type not in runner.applicable_target_types:
                     continue
                 # Active-testing gate: tools that send payloads run only when the
@@ -277,7 +363,8 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
                     await db.commit()
                     continue
                 findings, status = await _run_single_tool(
-                    db, scan, runner, target_row.value, discovered, target_row.criticality, target_row.type
+                    db, scan, runner, target_row.value, discovered, target_row.criticality,
+                    target_row.type, execution_token,
                 )
                 discovered.extend(findings)
                 tool_statuses.append(status)
@@ -300,11 +387,49 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
         # Best-effort AI attack-path narrative over all of this scan's findings.
         # Fully fail-soft: an AI failure never changes the scan status or aborts.
         await _synthesize_attack_narrative(db, scan)
+    except ExecutionRevoked as exc:
+        # SUPERSEDED, not failed (P1-1 P3). Something else now owns this scan -- the
+        # graceful-shutdown requeue, a later executor, or the orphan reaper terminalizing it.
+        # Emit NO terminal write, NO lifecycle metric and NO ScanCompleted event: reporting a
+        # result for a scan we no longer own would be a false outcome. Return normally so the
+        # task acks; recovery is whatever the current owner does with the row.
+        try:
+            await db.refresh(scan)  # report the ACTUAL reason, not an assumed shutdown
+        except Exception:  # noqa: BLE001 -- row vanished; the generic reason still applies
+            pass
+        _revocation_reason = _ownership_lost_reason(scan.status)
+        logger.warning(
+            "scan.execution_revoked scan=%s duration=%.2fs -- %s; abandoning to the current owner",
+            scan.id, time.monotonic() - scan_started, exc,
+            extra={"event": "scan.execution_revoked", "scan_id": str(scan.id),
+                   "reason": _revocation_reason, "status": scan.status,
+                   "duration_s": round(time.monotonic() - scan_started, 2),
+                   **({"shutdown_reason": "worker_shutting_down"}
+                      if _revocation_reason == "requeued_on_shutdown" else {})},
+        )
+        return
     except Exception as exc:
         _duration = time.monotonic() - scan_started
-        # Atomic terminal write: only running -> failed. If a cancel landed concurrently
-        # (Phase 1.5), we lose the race and MUST NOT overwrite 'cancelled'.
-        won = await _finalize_status(db, scan, "failed")
+        # Atomic terminal write: only running -> failed, and only while WE still own it. If a
+        # cancel landed concurrently (Phase 1.5), we lose the race and MUST NOT overwrite
+        # 'cancelled'; if ownership was revoked, we lose it too and must not report anything.
+        won = await _finalize_status(db, scan, "failed", execution_token)
+        if not won and scan.status != "cancelled" and str(scan.execution_token or "") != str(execution_token):
+            # Ownership was lost before this write (requeue, re-claim, or the orphan reaper
+            # terminalizing us): the scan ran, but its outcome is not ours to record. Same
+            # contract as ExecutionRevoked.
+            _revocation_reason = _ownership_lost_reason(scan.status)
+            logger.warning(
+                "scan.execution_revoked scan=%s status=%s duration=%.2fs reason=%s -- lost the "
+                "terminal write; abandoning to the current owner",
+                scan.id, scan.status, _duration, _revocation_reason,
+                extra={"event": "scan.execution_revoked", "scan_id": str(scan.id),
+                       "status": scan.status, "reason": _revocation_reason,
+                       "duration_s": round(_duration, 2),
+                       **({"shutdown_reason": "worker_shutting_down"}
+                          if _revocation_reason == "requeued_on_shutdown" else {})},
+            )
+            return
         if not won and scan.status == "cancelled":
             logger.info(
                 "scan.cancelled_during_run scan=%s -- leaving cancelled, not retrying", scan.id,
@@ -326,8 +451,23 @@ async def run_scan(db: AsyncSession, scan_id: uuid.UUID) -> None:
     _duration = time.monotonic() - scan_started
     # Atomic terminal write: only running -> terminal, so a scan cancelled mid-run (or
     # already finalized) is never clobbered back to completed (Phase 1.5).
-    won = await _finalize_status(db, scan, new_status)
+    won = await _finalize_status(db, scan, new_status, execution_token)
     if not won:
+        if scan.status != "cancelled" and str(scan.execution_token or "") != str(execution_token):
+            # P1-1 P3: requeued, already re-claimed, or reaped while we were finishing. The
+            # work ran, but this executor no longer owns the row -- record nothing, publish
+            # nothing.
+            _revocation_reason = _ownership_lost_reason(scan.status)
+            logger.warning(
+                "scan.execution_revoked scan=%s status=%s reason=%s -- lost the terminal "
+                "write; abandoning to the current owner",
+                scan.id, scan.status, _revocation_reason,
+                extra={"event": "scan.execution_revoked", "scan_id": str(scan.id),
+                       "status": scan.status, "reason": _revocation_reason,
+                       **({"shutdown_reason": "worker_shutting_down"}
+                          if _revocation_reason == "requeued_on_shutdown" else {})},
+            )
+            return
         logger.info(
             "scan.finalize_skipped scan=%s status=%s -- already terminal, not overwriting",
             scan.id, scan.status,
@@ -378,7 +518,9 @@ async def _publish_scan_completed(db: AsyncSession, scan: Scan) -> None:
     )
 
 
-async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> list[str]:
+async def _run_agent_driven(
+    db: AsyncSession, scan: Scan, target_row, scope, execution_token: uuid.UUID
+) -> list[str]:
     """Agent-driven engagement (M2): the single RedTeamAgent chooses tools
     dynamically by kill-chain phase + accumulated results, within the engagement's
     Rules of Engagement (safety enforced in code, not prompt). Every decision + tool
@@ -533,16 +675,20 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
         exploitation -- that stays deterministic and gated in the outer round."""
         nonlocal step_no, ai_calls, stall
         while step_no < settings.agent_max_steps:
-            # Cooperative cancellation (Phase 1.5): break out of the reasoning loop as soon
+            # Cooperative stop (Phase 1.5 + P1-1 P3): break out of the reasoning loop as soon
             # as the scan is cancelled, before spending another AI call or tool run. The
             # outer atomic terminal write then leaves the 'cancelled' state intact.
-            if await _is_cancelled(db, scan.id):
+            agent_stop = await _execution_stop_reason(db, scan.id, execution_token)
+            if agent_stop == "cancelled":
                 logger.info(
                     "scan.cancelled_stop scan=%s (agent loop, step=%d)", scan.id, step_no,
                     extra={"event": "scan.cancelled_stop", "scan_id": str(scan.id),
                            "reason": "cancelled", "step_no": step_no},
                 )
                 break
+            if agent_stop == "revoked":
+                # Superseded mid-engagement: stop before another AI call or tool run.
+                raise ExecutionRevoked(f"execution superseded at agent step {step_no}")
             # Deterministic budget stop (checked before spending an AI call). Recorded as
             # a finish decision so the termination reason is auditable in agent_decisions.
             budget_stop = _budget_stop_reason()
@@ -619,7 +765,8 @@ async def _run_agent_driven(db: AsyncSession, scan: Scan, target_row, scope) -> 
                 continue
 
             findings, status = await _run_single_tool(
-                db, scan, runner, target_row.value, discovered, target_row.criticality, target_row.type
+                db, scan, runner, target_row.value, discovered, target_row.criticality,
+                target_row.type, execution_token,
             )
             discovered.extend(findings)
             # Tag each discovered asset with the tool that found it, for graph provenance.
@@ -888,6 +1035,7 @@ async def _run_single_tool(
     prior_findings: list[CommonFinding],
     criticality: str,
     target_type: str,
+    execution_token: uuid.UUID | None = None,
 ) -> tuple[list[CommonFinding], str]:
     """Run one tool resiliently and return (findings, status) where status is
     completed | partial | failed. A tool NEVER aborts the scan: a crash/timeout or
@@ -930,6 +1078,20 @@ async def _run_single_tool(
         "tool.start scan=%s tool=%s version=%s target=%s prior_findings=%d",
         scan.id, runner.name, runner.version, target_value, len(prior_findings),
     )
+
+    # LAST-MOMENT OWNERSHIP GATE (P1-1 P3). The between-tools check happens before this
+    # function is entered, so a revocation committed in between would otherwise let a
+    # superseded executor spawn one more tool against the target. Re-check immediately
+    # before the process is spawned, so the window shrinks to this statement and no tool is
+    # ever launched with a revocation already visible. The half-written ToolRun row is
+    # marked so the abandoned attempt is auditable rather than left 'running'.
+    if execution_token is not None:
+        if await _execution_stop_reason(db, scan.id, execution_token) == "revoked":
+            tool_run.status = "abandoned_revoked"
+            tool_run.completed_at = datetime.now(timezone.utc)
+            tool_run.error_message = "execution superseded before launch (graceful-shutdown requeue)"
+            await db.commit()
+            raise ExecutionRevoked(f"execution superseded before launching {runner.name}")
 
     # A crash/timeout in the runner is a failed tool run, NOT a failed scan: record
     # it (with evidence of the exception) and let the pipeline continue.
