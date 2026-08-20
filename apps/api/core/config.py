@@ -12,6 +12,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _FILE_BACKED_SECRETS = (
     "JWT_SECRET_KEY",
     "DATABASE_URL",
+    # B3: once Redis requires a password the connection string carries it, so REDIS_URL is a
+    # secret and travels the same way. Delivered as REDIS_URL_FILE in production; the plain
+    # var stays the local-development path.
+    "REDIS_URL",
     "S3_ACCESS_KEY",
     "S3_SECRET_KEY",
     "ANTHROPIC_API_KEY",
@@ -31,20 +35,43 @@ _FILE_BACKED_SECRETS = (
 _INSECURE_JWT_SECRETS = {"", "change-me-in-.env", "change-me-generate-a-real-secret"}
 
 
+# Secret files that were declared via `<NAME>_FILE` but could not be read. Recorded here
+# rather than raised, because resolution runs before Settings exists; validate_production()
+# turns them into a startup failure so a mounted-but-unreadable secret can never be silently
+# replaced by an inherited default. Rebuilt on every resolve() call (idempotent).
+_UNREADABLE_FILE_SECRETS: list[str] = []
+
+
 def _resolve_file_secrets() -> None:
-    """For each `<NAME>_FILE` env var, read the file and populate `<NAME>` (unless
-    already set explicitly). Safe to call repeatedly; never raises on a missing
-    file (a bad path simply leaves the base var unset, caught by validation)."""
+    """Resolve every `<NAME>_FILE` env var into `<NAME>`, with **the file winning**.
+
+    PRECEDENCE (deliberate, and the reason this is not `if not os.environ.get(name)`):
+    a declared `<NAME>_FILE` is an explicit statement that the secret is delivered by
+    Docker Secrets / Vault, so it must beat whatever `<NAME>` happens to be inherited.
+    The compose base file loads `env_file: ../.env` into every application service, and a
+    compose overlay CANNOT unset an env_file-sourced variable -- so under the old
+    "first value wins" rule a stale `.env` entry silently defeated the mounted secret and
+    production ran on a development key with no signal. The file is the source of truth.
+
+    Configuration that is NOT secret is untouched: only the `_FILE_BACKED_SECRETS` names
+    participate, and only when the operator actually declared the matching `_FILE` var.
+
+    Never raises -- an unreadable path is recorded in `_UNREADABLE_FILE_SECRETS` and
+    surfaced by validate_production() instead, so the inherited value cannot quietly stand
+    in for a secret the operator believed was mounted. Safe to call repeatedly.
+    """
+    _UNREADABLE_FILE_SECRETS.clear()
     for name in _FILE_BACKED_SECRETS:
         file_var = f"{name}_FILE"
         path = os.environ.get(file_var)
-        if path and not os.environ.get(name):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    os.environ[name] = fh.read().strip()
-            except OSError:
-                # Leave unset; validate_production() / lazy checks surface it.
-                continue
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                os.environ[name] = fh.read().strip()
+        except OSError:
+            # Declared but unreadable: never fall back silently -- see validate_production().
+            _UNREADABLE_FILE_SECRETS.append(file_var)
 
 
 class Settings(BaseSettings):
@@ -454,6 +481,15 @@ class Settings(BaseSettings):
         if not self.is_production:
             return
         problems: list[str] = []
+        # A secret the operator declared via `<NAME>_FILE` but that could not be read. The
+        # inherited value (typically a dev default from .env) must NOT be allowed to stand in
+        # for it -- that is exactly the silent substitution the file-precedence rule exists to
+        # prevent, so fail closed instead of booting on the wrong credential.
+        for file_var in _UNREADABLE_FILE_SECRETS:
+            problems.append(
+                f"{file_var} is set but its file could not be read; the secret cannot be "
+                "loaded and an inherited value must not be used in its place."
+            )
         if self.jwt_secret_key in _INSECURE_JWT_SECRETS or "change-me" in self.jwt_secret_key:
             problems.append("JWT_SECRET_KEY is a placeholder; set a strong random secret.")
         if self.s3_access_key == "minioadmin" or self.s3_secret_key == "minioadmin":
@@ -538,9 +574,11 @@ def configure_networking(settings: "Settings | None" = None) -> None:
 
 @lru_cache
 def get_settings() -> Settings:
-    # Secret loading order (first present wins): explicit env / Docker-K8s env ->
-    # external backend (setdefault) -> <NAME>_FILE (Docker/K8s secret files). See
-    # core/secrets.py. External backend is a no-op unless SECRETS_BACKEND is set.
+    # Secret loading order, HIGHEST PRECEDENCE LAST: explicit env / Docker-K8s env ->
+    # external backend (setdefault, no-op unless SECRETS_BACKEND is set; see core/secrets.py)
+    # -> <NAME>_FILE (Docker/K8s secret files), which OVERRIDES the earlier two. A declared
+    # secret file is an explicit delivery mechanism and must not be defeated by an inherited
+    # default -- see _resolve_file_secrets() for why that ordering is load-bearing.
     from apps.api.core.secrets import load_external_secrets
 
     load_external_secrets()

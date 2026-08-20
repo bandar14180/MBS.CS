@@ -1,7 +1,15 @@
 # Dev overrides -- auto-merged by `docker compose up` (do NOT use in production).
-# Restores hot-reload and code bind mounts so local DX is identical to before the
-# Phase 1 image hardening. Production runs the base file only:
-#   docker compose -f docker-compose.yml up -d
+# Restores hot-reload, code bind mounts and DIRECT HOST ACCESS to every service so local DX
+# is unchanged, while the base file stays safe to merge into production.
+#
+# Why the host port publications live here rather than in the base file: compose APPENDS
+# `ports` across `-f` files instead of replacing them, so anything published in the base file
+# CANNOT be withdrawn by the production overlay. Keeping them here makes the production merge
+# expose nginx:80 only -- every other service is reachable in-network by service name.
+#
+# Compose auto-merges this file for a bare `docker compose up`; an explicit `-f` list must
+# name it (see README), and the production invocation deliberately does not:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 services:
   api:
     # Single-worker hot-reload for local iteration (base image default is
@@ -27,3 +35,23 @@ services:
   beat:
     volumes:
       - ../apps/api:/srv/apps/api
+
+  # B1: host access to the datastores and the web dev server, for local development ONLY.
+  # psql/redis-cli/the MinIO console and http://localhost:3000 all keep working exactly as
+  # before; none of these publications reach the production merge.
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  minio:
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  web:
+    ports:
+      - "3000:3000"

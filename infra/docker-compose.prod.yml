@@ -37,10 +37,23 @@ services:
       # `env_file: ../.env`, so a value set in .env is silently ignored for this service.
       TRUSTED_PROXY_COUNT: "1"
       AI_PROVIDER: openrouter
-      # Secrets come from files (Docker Secrets / Vault Agent), not inline env.
+      # Secrets come from files (Docker Secrets / Vault Agent), not inline env. The base file
+      # loads `env_file: ../.env` into this service and a compose overlay CANNOT unset an
+      # env_file-sourced variable -- so these files must WIN over whatever .env supplies.
+      # core/config.py::_resolve_file_secrets() enforces exactly that precedence (B4).
       JWT_SECRET_KEY_FILE: /run/secrets/jwt_secret_key
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
+      # B2: object-storage credentials -- BOTH halves, so neither falls back to `minioadmin`.
+      S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
       S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+      # B2: the DSN carries the application role's password, so it is a secret. Point it at a
+      # LEAST-PRIVILEGED, NON-SUPERUSER role -- startup_checks.py refuses to run in production
+      # on a superuser role because that bypasses FORCE RLS. See docs/runbooks/deployment.md.
+      DATABASE_URL_FILE: /run/secrets/database_url
+      # B3: Redis now requires a password, so the URL carries it and is likewise a secret
+      # (redis://:<password>@redis:6379/0). Broker, DLQ, rate-limit / AI-budget / MFA-lockout
+      # counters all use this one URL, so authentication is uniform across every consumer.
+      REDIS_URL_FILE: /run/secrets/redis_url
     # LOOPBACK ONLY -- never publish the API on a routable interface in production. External
     # traffic must arrive through nginx (:80), because TRUSTED_PROXY_COUNT above trusts exactly
     # one appended X-Forwarded-For hop; a client that could reach :8000 directly would supply
@@ -53,17 +66,30 @@ services:
     secrets:
       - jwt_secret_key
       - openrouter_api_key
+      - s3_access_key
       - s3_secret_key
       - metrics_token
+      - database_url
+      - redis_url
 
   worker:
     environment:
       ENVIRONMENT: production
       AI_PROVIDER: openrouter
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
+      # The scan worker writes evidence to object storage and reads/writes scan rows, and it
+      # takes every task off the authenticated broker -- so it needs the same credentials as
+      # the API. Without the *_FILE vars it would silently inherit .env's dev defaults.
+      S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+      S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL_FILE: /run/secrets/redis_url
     secrets:
       - openrouter_api_key
+      - s3_access_key
       - s3_secret_key
+      - database_url
+      - redis_url
 
   # F1: the dedicated default-queue worker needs the same production config -- backup.run and
   # retention.purge touch object storage (s3_secret_key), and all tasks run in production mode.
@@ -75,6 +101,12 @@ services:
       ENVIRONMENT: production
       AI_PROVIDER: openrouter
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
+      # Same credential set as `worker`: this one runs the reaper, relay, scheduler, backup and
+      # retention tasks, all of which touch the database, object storage and the broker.
+      S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+      S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL_FILE: /run/secrets/redis_url
       BACKUP_ENABLED: "true"
       BACKUP_ENCRYPTION_ENABLED: "true"
       BACKUP_ENCRYPTION_KEY_FILE: /run/secrets/backup_encryption_key
@@ -86,8 +118,11 @@ services:
       RETENTION_DRY_RUN: "true"
     secrets:
       - openrouter_api_key
+      - s3_access_key
       - s3_secret_key
       - backup_encryption_key
+      - database_url
+      - redis_url
 
   # Beat must also see BACKUP_ENABLED / RETENTION_ENABLED so it registers those beat entries
   # (worker.py builds the schedule from settings at import time). It only emits the ticks; the
@@ -98,6 +133,72 @@ services:
       BACKUP_ENABLED: "true"
       RETENTION_ENABLED: "true"
       RETENTION_DRY_RUN: "true"
+      # B3: beat publishes every tick onto the broker, so it needs the authenticated URL too --
+      # without it the scheduler cannot connect and all periodic work (reaper, relay, backup,
+      # retention, beat-liveness heartbeat) stops silently.
+      REDIS_URL_FILE: /run/secrets/redis_url
+      DATABASE_URL_FILE: /run/secrets/database_url
+    secrets:
+      - redis_url
+      - database_url
+
+  # B3: AUTHENTICATED REDIS. The base file runs redis-server with no password at all, which is
+  # only tenable because production no longer publishes 6379 (B1) -- defence in depth requires
+  # both. Redis backs the Celery broker, the DLQ and the rate-limit / AI-budget / MFA-lockout
+  # counters, so unauthenticated access means task injection and tampering with those controls.
+  #
+  # The password is written into a config file rather than passed as `--requirepass <value>` so
+  # it never appears in the container's process arguments. `--appendonly/--appendfsync` stay on
+  # the command line and still win over the generated file, preserving the R1a durability
+  # guarantee. `exec` keeps redis-server as PID 1 so SIGTERM reaches it directly.
+  redis:
+    command:
+      - sh
+      - -c
+      - >-
+        set -e;
+        umask 077;
+        printf 'requirepass %s\n' "$$(cat /run/secrets/redis_password)" > /tmp/redis.conf;
+        exec redis-server /tmp/redis.conf --appendonly yes --appendfsync everysec
+    # The base healthcheck (`redis-cli ping`) returns NOAUTH once a password is set, which would
+    # hold the service permanently unhealthy and block every `depends_on: service_healthy`.
+    # REDISCLI_AUTH authenticates without placing the password in argv.
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/redis_password)\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    secrets:
+      - redis_password
+
+  # B2: PostgreSQL credentials from a Docker Secret instead of the base file's literal `mbs`.
+  # Setting POSTGRES_PASSWORD to null UNSETS the base value (verified: a null `environment` key
+  # removes a base literal), so only POSTGRES_PASSWORD_FILE remains and the image reads the
+  # secret. POSTGRES_USER stays as-is: it is the instance SUPERUSER and is deliberately NOT the
+  # role the application connects with -- DATABASE_URL points at a least-privileged role.
+  #
+  # !! ROTATION IS NOT AUTOMATIC !! `initdb` runs only on an EMPTY data directory, so on an
+  # existing postgres_data volume this changes nothing about the stored password. Rotating a
+  # live database requires an explicit ALTER ROLE -- see docs/runbooks/deployment.md.
+  postgres:
+    environment:
+      POSTGRES_PASSWORD:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  # B2: MinIO root credentials from Docker Secrets instead of `minioadmin`/`minioadmin`. Same
+  # null-unset mechanism as postgres. Like postgres, these apply at FIRST START; an existing
+  # minio_data volume keeps its current root credentials until rotated explicitly.
+  minio:
+    environment:
+      MINIO_ROOT_USER:
+      MINIO_ROOT_PASSWORD:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+    secrets:
+      - minio_root_user
+      - minio_root_password
 
   # Email alerts (E1..E5). Default OFF -- flip EMAIL_ENABLED=true and fill SMTP_* to turn on.
   # The email delivery task runs on worker-default; the password is a Docker Secret (*_FILE).
@@ -156,6 +257,8 @@ volumes:
   # R4: durable Alertmanager state (silences, notification log) across recreation.
   alertmanager_data:
 
+# Every file below lives in infra/secrets/, which is gitignored -- generate them on the host
+# before the first `up` and never commit them. See docs/runbooks/deployment.md.
 secrets:
   jwt_secret_key:
     file: ./secrets/jwt_secret_key.txt
@@ -165,6 +268,27 @@ secrets:
     file: ./secrets/s3_secret_key.txt
   metrics_token:
     file: ./secrets/metrics_token.txt
+  # B2: object-storage access key (paired with s3_secret_key above).
+  s3_access_key:
+    file: ./secrets/s3_access_key.txt
+  # B2: full DSN for the least-privileged application role, e.g.
+  #   postgresql+asyncpg://mbs_app:<password>@postgres:5432/mbs
+  database_url:
+    file: ./secrets/database_url.txt
+  # B2: PostgreSQL SUPERUSER password, consumed by the postgres image at FIRST START only.
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  # B2: MinIO root credentials, consumed by the minio image at FIRST START only.
+  minio_root_user:
+    file: ./secrets/minio_root_user.txt
+  minio_root_password:
+    file: ./secrets/minio_root_password.txt
+  # B3: Redis password. redis_url must embed this SAME value -- they are two views of one
+  # credential and drift between them breaks every broker/cache consumer at once.
+  redis_password:
+    file: ./secrets/redis_password.txt
+  redis_url:
+    file: ./secrets/redis_url.txt
   # DR-2: master key for AES-256-GCM backup encryption at rest.
   backup_encryption_key:
     file: ./secrets/backup_encryption_key.txt
