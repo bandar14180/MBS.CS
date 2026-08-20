@@ -7,6 +7,15 @@ services:
     # Single-worker hot-reload for local iteration (base image default is
     # multi-worker, no reload).
     command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # Direct host access to the API (http://localhost:8000, /docs) for local iteration.
+    # This publication lives HERE rather than in the base file: compose APPENDS `ports`
+    # across `-f` files instead of replacing them, so a base publication could not be
+    # withdrawn by the production overlay and would leave :8000 exposed on every
+    # interface in production -- which would make any non-zero TRUSTED_PROXY_COUNT
+    # attacker-controlled. A bare `docker compose up` auto-merges this file, so dev keeps
+    # the port; explicit `-f docker-compose.yml -f docker-compose.prod.yml` does not.
+    ports:
+      - "8000:8000"
     volumes:
       - ../apps/api:/srv/apps/api
       - ../db:/srv/db

@@ -88,6 +88,12 @@ docker compose $COMPOSE stop -t 60 worker           # -t >= stop_grace_period
 **The API refuses to start in production unless this is set explicitly.** There is no safe
 default to inherit, so the guard forces a decision rather than assuming your topology.
 
+**The shipped overlay declares `TRUSTED_PROXY_COUNT: "1"`** — correct for the bundled topology
+and nothing else. Set it in `infra/docker-compose.prod.yml`, **not in `.env`**: that service's
+`environment:` mapping overrides the base file's `env_file: ../.env`, so a value placed in
+`.env` is silently ignored for the API. `apps/api/tests/test_deployment_config.py` asserts the
+overlay keeps satisfying `validate_production()`, so a future guard cannot regress unnoticed.
+
 **What it is.** The number of proxies in front of this app that **append** to `X-Forwarded-For`.
 The client's own address is then read as the **Nth entry from the right** — everything further
 left is caller-supplied and forgeable. It is used for one thing: the rate-limit bucket key for
@@ -111,11 +117,23 @@ to `X-Forwarded-For` still counts as a hop.
   mint a fresh bucket per request by varying the header. This is worse than having no limiter.
 
 **Prerequisite before using any non-zero value.** The API must be unreachable except *through*
-the proxy chain. `infra/docker-compose.yml` binds the API to `8000:8000`, and the production
-overlay adds no `ports` override, so that direct path survives the compose merge. If a client can
-reach `:8000` directly, it supplies the whole `X-Forwarded-For` header and any `N > 0` becomes
-attacker-controlled. Remove or firewall that binding (security group / host firewall / bind to
-loopback) **before** raising the value above `0`.
+the proxy chain. If a client can reach `:8000` directly, it supplies the whole
+`X-Forwarded-For` header and any `N > 0` becomes attacker-controlled.
+
+The shipped files already satisfy this, and the arrangement is deliberate: a compose `ports`
+list is **appended** across `-f` files, never replaced, so a publication in the base file could
+not be withdrawn by an overlay. Therefore:
+
+| File | API host port | Applies to |
+|---|---|---|
+| `docker-compose.yml` (base) | none | always — in-network `api:8000` only |
+| `docker-compose.override.yml` | `8000:8000` | dev only; auto-merged by a bare `docker compose up`, excluded from any explicit `-f` list |
+| `docker-compose.prod.yml` | `127.0.0.1:8000:8000` | production — host-local ops (`curl http://127.0.0.1:8000/ready`) |
+
+In production the only externally reachable entrypoint is `nginx` on `:80`. **If you publish
+the API port yourself, put it back behind a firewall or return `TRUSTED_PROXY_COUNT` to `0`** —
+`apps/api/tests/test_deployment_config.py` fails the build if any file in the production merge
+publishes the API on a routable interface while the hop count is non-zero.
 
 Note the bundled `nginx.conf` listens on `:80` with no TLS directives. If you serve HTTPS,
 something upstream terminates TLS — and that hop counts.
