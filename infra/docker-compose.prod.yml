@@ -151,15 +151,33 @@ services:
   # it never appears in the container's process arguments. `--appendonly/--appendfsync` stay on
   # the command line and still win over the generated file, preserving the R1a durability
   # guarantee. `exec` keeps redis-server as PID 1 so SIGTERM reaches it directly.
+  #
+  # PRIVILEGE DROP: the config is generated as ROOT and then handed to the image's OWN entrypoint
+  # with $1 = "redis-server", which is the condition under which docker-entrypoint.sh chowns
+  # /data and re-execs via setpriv as the unprivileged `redis` user. Overriding `command:` alone
+  # left $1 = "sh", silently skipping BOTH -- the server ran as root and wrote root-owned 0600
+  # AOF files that a later non-root start could not read.
+  #
+  # `chown redis:redis /tmp/redis.conf` is REQUIRED, not cosmetic: umask 077 as root leaves the
+  # file root-only, and the dropped process must still read it. The SECRET is read while we are
+  # root, so operators can keep `chmod 600` on infra/secrets/*.txt -- which is also why
+  # `user: redis` was rejected: it would run the command and the healthcheck as uid 999, unable
+  # to read a 0600 secret, and would skip the /data chown entirely.
+  #
+  # `command: []` stops the base file's `redis-server ...` list being appended to the inline
+  # script as stray positional arguments.
   redis:
-    command:
+    entrypoint:
       - sh
       - -c
       - >-
         set -e;
         umask 077;
         printf 'requirepass %s\n' "$$(cat /run/secrets/redis_password)" > /tmp/redis.conf;
-        exec redis-server /tmp/redis.conf --appendonly yes --appendfsync everysec
+        chown redis:redis /tmp/redis.conf;
+        exec /usr/local/bin/docker-entrypoint.sh redis-server /tmp/redis.conf
+        --appendonly yes --appendfsync everysec
+    command: []
     # The base healthcheck (`redis-cli ping`) returns NOAUTH once a password is set, which would
     # hold the service permanently unhealthy and block every `depends_on: service_healthy`.
     # REDISCLI_AUTH authenticates without placing the password in argv.

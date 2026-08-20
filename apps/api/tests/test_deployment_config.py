@@ -315,18 +315,30 @@ def _prod_service(name: str) -> dict:
     return _compose(PROD_COMPOSE)["services"][name]
 
 
+def _redis_invocation() -> str:
+    """The EFFECTIVE Redis invocation: entrypoint plus command, joined.
+
+    Reading `command` alone would be wrong -- and silently vacuous. The startup logic lives in
+    `entrypoint` precisely so the image's own docker-entrypoint.sh still performs its privilege
+    drop, which leaves `command` empty; assertions scoped to `command` would then pass against
+    an empty string no matter what the service actually runs."""
+    svc = _prod_service("redis")
+    parts = list(svc.get("entrypoint") or []) + list(svc.get("command") or [])
+    return " ".join(map(str, parts))
+
+
 def test_production_redis_requires_a_password():
     """Redis backs the Celery broker, the DLQ and the rate-limit / AI-budget / MFA-lockout
     counters. Unauthenticated it allows task injection and tampering with those controls, so
     production must set a password -- sourced from a Docker Secret, never a literal."""
     _require_compose(PROD_COMPOSE)
-    command = " ".join(map(str, _prod_service("redis")["command"]))
-    assert "requirepass" in command, "production Redis must require authentication"
-    assert "/run/secrets/redis_password" in command, \
+    invocation = _redis_invocation()
+    assert "requirepass" in invocation, "production Redis must require authentication"
+    assert "/run/secrets/redis_password" in invocation, \
         "the Redis password must come from a Docker Secret, not an inline value"
     assert "redis_password" in _prod_service("redis")["secrets"]
-    # durability (R1a) must survive the command override
-    assert "--appendonly yes" in command
+    # durability (R1a) must survive the entrypoint override
+    assert "--appendonly yes" in invocation
 
 
 def test_production_redis_healthcheck_authenticates():
@@ -353,9 +365,42 @@ def test_redis_password_is_not_in_the_process_arguments():
     """Defence in depth: the value is written to a config file, so it never appears in the
     container's argv (visible to anything that can read /proc)."""
     _require_compose(PROD_COMPOSE)
-    command = " ".join(map(str, _prod_service("redis")["command"]))
-    assert "--requirepass" not in command, \
+    invocation = _redis_invocation()
+    assert invocation, "the Redis invocation must not be empty (guards against a vacuous check)"
+    assert "--requirepass" not in invocation, \
         "pass the password via a generated config file, not as a command-line argument"
+
+
+def test_production_redis_preserves_the_image_privilege_drop():
+    """THE REGRESSION. redis:7-alpine drops to the unprivileged `redis` user only when its
+    entrypoint receives `redis-server` as $1 -- that single condition guards BOTH the drop
+    (`setpriv --reuid redis`) and the `chown` that normalises /data ownership.
+
+    Overriding `command:` with a bare `sh -c` made $1 = "sh", so both were skipped: the server
+    ran as root and wrote root-owned 0600 AOF files into the data volume. That is not merely a
+    privilege issue -- it poisons /data, because a later non-root start then fails with
+    "Error moving temp append only file on the final destination: Permission denied".
+
+    So production must hand off to the image entrypoint rather than exec redis-server itself.
+    `user: redis` was rejected as the fix: it skips the chown entirely and runs the command and
+    healthcheck as uid 999, which cannot read a 0600 secret file mounted from the host."""
+    _require_compose(PROD_COMPOSE)
+    svc = _prod_service("redis")
+    entrypoint = " ".join(map(str, svc.get("entrypoint") or []))
+    assert "docker-entrypoint.sh redis-server" in entrypoint, (
+        "the image entrypoint must receive 'redis-server' as $1, or it silently skips the "
+        "privilege drop and the /data chown"
+    )
+    # the dropped process must still be able to read the generated config (umask 077 as root
+    # would otherwise leave it root-only and Redis would fail to start)
+    assert "chown redis:redis /tmp/redis.conf" in entrypoint
+    # no `user:` override -- it would defeat the entrypoint's chown and the 0600 secret read
+    assert "user" not in svc, "do not set `user:`; the image entrypoint performs the drop"
+    # nothing may be appended as stray positional arguments to the inline script
+    assert not svc.get("command")
+    # the rest of the B3 guarantees survive the restructure
+    assert "--appendonly yes" in entrypoint
+    assert "--requirepass" not in entrypoint
 
 
 # --- 5. Datastore credentials (B2) ------------------------------------------------------
