@@ -67,8 +67,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "8000:8000"
+    # NO host port is published here, deliberately. The API is reachable in-network as
+    # `api:8000` (nginx, web, Prometheus), which is all any deployment needs. Publishing it
+    # from the BASE file is unsafe because a compose `ports` list is APPENDED across `-f`
+    # files, never replaced -- so a production overlay CANNOT take a base publication away,
+    # and `8000:8000` on every interface would survive the merge. That directly undermines
+    # TRUSTED_PROXY_COUNT: any client able to reach :8000 supplies the whole X-Forwarded-For
+    # header, making every non-zero hop count attacker-controlled.
+    # Local DX is unchanged: docker-compose.override.yml (auto-merged by a bare
+    # `docker compose up`) publishes 8000, and the production overlay publishes it on
+    # loopback only. Explicit `-f` invocations exclude the dev override by design.
     # Graceful shutdown (Phase 1.5): on `docker stop`, uvicorn (PID 1, exec form) gets
     # SIGTERM and drains in-flight HTTP requests before exit. 30s is ample for API calls.
     stop_grace_period: 30s

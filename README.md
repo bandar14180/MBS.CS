@@ -44,9 +44,13 @@
 
 ```bash
 cp .env.example .env          # (Windows: copy .env.example .env)
-docker compose -f infra/docker-compose.yml up --build -d
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.override.yml up --build -d
 docker compose -f infra/docker-compose.yml exec api sh -c "cd /srv/db && alembic upgrade head"
 ```
+
+> `docker-compose.override.yml` carries the dev-only bits — hot reload, code bind mounts, and
+> the `localhost:8000` API port. Compose auto-merges it only when **no** `-f` is given, so any
+> explicit `-f` list has to name it. Production deliberately leaves it out.
 
 - **App (landing + dashboard)** — http://localhost  (also http://localhost:3000)
 - **API** — http://localhost:8000/health · interactive docs at http://localhost:8000/docs
@@ -82,7 +86,7 @@ Everything works without AI (graceful fallback). To activate the AI Planner / Co
 ```bash
 # .env
 ANTHROPIC_API_KEY=sk-ant-...
-docker compose -f infra/docker-compose.yml up -d api worker
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.override.yml up -d api worker
 ```
 
 ### Try a scan

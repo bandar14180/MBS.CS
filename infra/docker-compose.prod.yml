@@ -17,11 +17,39 @@ services:
       # Explicit hostnames/origins are REQUIRED in production (wildcards are rejected).
       TRUSTED_HOSTS: '["mbs.example.com"]'
       CORS_ALLOW_ORIGINS: '["https://mbs.example.com"]'
+      # Rate-limit IDENTITY. The API REFUSES TO START in production unless this is declared
+      # (core/config.py::validate_production) -- there is no safe default to inherit, so the
+      # value must be a decision. It is the number of proxies in front of the API that APPEND
+      # to X-Forwarded-For; the caller's own hop is then read as the Nth entry from the right.
+      #
+      # "1" matches THIS stack exactly: the only externally reachable entrypoint is the bundled
+      # nginx on :80, whose `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
+      # appends precisely one entry. The API itself is published on loopback only (see `ports`
+      # below), so no client can bypass nginx and forge the header.
+      #
+      # RECOUNT THIS FOR YOUR TOPOLOGY. Anything else that appends in front of nginx -- a load
+      # balancer, a CDN, a TLS terminator -- is another hop, making the correct value 2 or more.
+      # Too low collapses every anonymous client into one rate-limit bucket; too high reads
+      # caller-supplied entries and lets anyone mint a fresh bucket per request. Determine it
+      # empirically (docs/runbooks/deployment.md), never by guessing.
+      #
+      # CHANGE IT HERE, NOT IN `.env`: this `environment:` mapping overrides the base file's
+      # `env_file: ../.env`, so a value set in .env is silently ignored for this service.
+      TRUSTED_PROXY_COUNT: "1"
       AI_PROVIDER: openrouter
       # Secrets come from files (Docker Secrets / Vault Agent), not inline env.
       JWT_SECRET_KEY_FILE: /run/secrets/jwt_secret_key
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
       S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+    # LOOPBACK ONLY -- never publish the API on a routable interface in production. External
+    # traffic must arrive through nginx (:80), because TRUSTED_PROXY_COUNT above trusts exactly
+    # one appended X-Forwarded-For hop; a client that could reach :8000 directly would supply
+    # the entire header and forge its own rate-limit bucket at will. This binding exists only
+    # for host-local operations (`curl http://127.0.0.1:8000/ready`), mirroring how Prometheus
+    # and Alertmanager are published below. The base file publishes no host port at all, so
+    # this is the only api publication in the production merge.
+    ports:
+      - "127.0.0.1:8000:8000"
     secrets:
       - jwt_secret_key
       - openrouter_api_key
