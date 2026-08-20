@@ -33,6 +33,124 @@ docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml run 
 Migrations in this repo are additive; a brief window where old code runs against the new schema is
 tolerated. Never roll app code that requires a migration that hasn't been applied yet.
 
+
+## Production secrets (required before the first `up`)
+
+Every production credential is a Docker Secret read from `infra/secrets/*.txt`. That directory
+is gitignored — generate the files on the host and never commit them. The API refuses to start
+if a declared `*_FILE` cannot be read, so a missing file fails fast rather than silently falling
+back to a development default.
+
+```bash
+mkdir -p infra/secrets && chmod 700 infra/secrets
+cd infra/secrets
+
+# --- application secrets -------------------------------------------------------------
+openssl rand -hex 32  > jwt_secret_key.txt
+openssl rand -hex 32  > metrics_token.txt
+openssl rand -base64 32 | tr -d '\n' > ../../.mfa_key && mv ../../.mfa_key mfa_encryption_key.txt
+printf '%s' "$YOUR_OPENROUTER_KEY" > openrouter_api_key.txt
+
+# --- datastore credentials -----------------------------------------------------------
+openssl rand -hex 24 > postgres_password.txt      # PostgreSQL SUPERUSER password
+openssl rand -hex 24 > redis_password.txt         # Redis requirepass
+printf 'mbs_s3'      > minio_root_user.txt
+openssl rand -hex 24 > minio_root_password.txt
+printf 'mbs_s3'      > s3_access_key.txt          # must match minio_root_user
+cp minio_root_password.txt s3_secret_key.txt      # must match minio_root_password
+
+# --- derived URLs (must embed the passwords generated above) -------------------------
+printf 'redis://:%s@redis:6379/0' "$(cat redis_password.txt)" > redis_url.txt
+printf 'postgresql+asyncpg://mbs_app:%s@postgres:5432/mbs' "$APP_DB_PASSWORD" > database_url.txt
+
+chmod 600 *.txt
+```
+
+**Consistency rules the tests cannot check for you** (they live in files that are never
+committed, so keep them right by hand):
+
+| These must match | Why |
+|---|---|
+| `redis_password.txt` ↔ password inside `redis_url.txt` | one is the server's `requirepass`, the other is how every client authenticates; drift breaks the broker, cache, rate limiter and MFA lockouts at once |
+| `minio_root_user/password.txt` ↔ `s3_access_key/s3_secret_key.txt` | MinIO root credentials *are* the S3 credentials the app uses |
+| the role in `database_url.txt` ↔ a real PostgreSQL role | see least-privilege below |
+
+> Verifying Redis by hand: `redis-cli -u redis://:PASS@host` reports `WRONGPASS` because it
+> sends a two-argument `AUTH` with an empty username. That is a redis-cli quirk, not a
+> misconfiguration — the URL form is correct for `redis-py`/Celery. Use
+> `REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli ping` instead.
+
+## Least-privileged application database role
+
+`DATABASE_URL` must **not** point at the `mbs` superuser. `startup_checks.py` refuses to start in
+production on a superuser role, because a superuser bypasses FORCE Row-Level Security and with it
+every workspace-isolation guarantee. Create a dedicated role once:
+
+```sql
+-- as the superuser, against the mbs database
+CREATE ROLE mbs_app LOGIN PASSWORD 'the-value-you-put-in-database_url.txt';
+GRANT CONNECT ON DATABASE mbs TO mbs_app;
+GRANT USAGE ON SCHEMA public TO mbs_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mbs_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mbs_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mbs_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO mbs_app;
+```
+
+Migrations still run as the owner/superuser (`alembic upgrade head` via `compose run api`), which
+is why the schema grants above use `ALTER DEFAULT PRIVILEGES` — new tables added by a later
+migration are then usable by `mbs_app` without a follow-up grant.
+
+## ⚠️ Rotating credentials on an EXISTING deployment
+
+**Changing a password in compose does not rotate anything on a volume that already exists.**
+`initdb` and MinIO's first-start provisioning run only against an *empty* data directory, so on a
+live `postgres_data` / `minio_data` volume the new secret file is simply ignored and the services
+keep their original credentials — while the application starts using the new value and fails to
+connect. Rotate deliberately:
+
+**PostgreSQL**
+```bash
+# 1) change the role's password IN the database (superuser session)
+docker compose $COMPOSE exec postgres \
+  psql -U mbs -d mbs -c "ALTER ROLE mbs_app WITH PASSWORD 'new-password';"
+# 2) update the secret file to match, then restart the consumers
+printf 'postgresql+asyncpg://mbs_app:new-password@postgres:5432/mbs' > infra/secrets/database_url.txt
+docker compose $COMPOSE up -d --no-deps api worker worker-default beat
+```
+
+**Redis** — `requirepass` is read at start, so update the secret and restart the server *with* its
+clients (a mismatch between `redis_password.txt` and `redis_url.txt` locks every consumer out):
+```bash
+printf 'new-password' > infra/secrets/redis_password.txt
+printf 'redis://:new-password@redis:6379/0' > infra/secrets/redis_url.txt
+docker compose $COMPOSE up -d redis && docker compose $COMPOSE up -d --no-deps api worker worker-default beat
+```
+In-flight Celery messages survive (AOF persistence, R1a), but expect a brief window where workers
+reconnect.
+
+**MinIO** — root credentials on an existing volume are changed through MinIO itself (`mc admin
+user svcacct` / root rotation), then mirrored into `minio_root_password.txt` and `s3_secret_key.txt`.
+Never delete `minio_data` to force new credentials: it holds scan evidence and generated reports.
+
+## Network exposure (production)
+
+The production merge publishes **one** routable port. Everything else talks over the compose
+network by service name.
+
+| Service | Host publication | Reachable from |
+|---|---|---|
+| `nginx` | `80` | anywhere — the only public entrypoint |
+| `api` | `127.0.0.1:8000` | the host only (`curl http://127.0.0.1:8000/ready`) |
+| `prometheus` / `alertmanager` | `127.0.0.1:9090` / `127.0.0.1:9093` | the host only |
+| `postgres` / `redis` / `minio` / `web` | **none** | in-network only (`postgres:5432`, `redis:6379`, `minio:9000`, `web:3000`) |
+
+Dev keeps direct access to all of them via `docker-compose.override.yml`, which compose
+auto-merges for a bare `docker compose up` and which the production `-f` list excludes.
+`apps/api/tests/test_deployment_config.py` fails the build if any service other than nginx
+becomes reachable from off-host.
+
 ## TLS trust at build time
 Production builds require **no** local CA file: the images verify PyPI / GitHub / npm
 against the public root store shipped in their base image, and no interception root is

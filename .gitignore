@@ -29,6 +29,12 @@ infra/docker/norton-webmail-root.crt
 infra/docker/norton-webmail-root.cer
 infra/docker-compose.local-ca.yml
 
+# Production Docker Secrets. docker-compose.prod.yml mounts every credential from
+# infra/secrets/*.txt -- database DSN, Redis/Postgres/MinIO passwords, JWT and API keys.
+# These are generated per-deployment on the host and must NEVER be committed. The
+# directory itself is ignored so a new secret file cannot be added by accident.
+infra/secrets/
+
 # Claude Code local session state (agent worktrees, etc.) -- already excluded from
 # the Docker build context via .dockerignore.
 .claude/

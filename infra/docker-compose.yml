@@ -6,8 +6,12 @@ services:
       POSTGRES_USER: mbs
       POSTGRES_PASSWORD: mbs
       POSTGRES_DB: mbs
-    ports:
-      - "5432:5432"
+    # B1: NO host publication. The database is reachable in-network as `postgres:5432` by
+    # api/worker/worker-default/beat, and migrations run via `compose exec|run api`, so a host
+    # port buys nothing in production while exposing a superuser role to the network. Compose
+    # APPENDS `ports` across -f files rather than replacing them, so a publication here could
+    # not be withdrawn by the production overlay -- dev access lives in
+    # docker-compose.override.yml instead.
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -27,8 +31,10 @@ services:
     # never evicted. Additive + reversible; no consumer behavior changes (all are idempotent /
     # fail-open, and task replay is safe via the atomic scan claim + orphan reaper).
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
-    ports:
-      - "6379:6379"
+    # B1: NO host publication -- see the postgres note. Redis backs the Celery broker, the DLQ
+    # and the rate-limit / AI-budget / MFA-lockout counters; an exposed, unauthenticated
+    # instance allows task injection and tampering with those controls. In-network `redis:6379`
+    # serves every consumer; dev access lives in docker-compose.override.yml.
     volumes:
       - redis_data:/data
     healthcheck:
@@ -44,9 +50,10 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    # B1: NO host publication -- see the postgres note. The buckets hold scan evidence and
+    # generated reports; the API streams both to the browser itself (reports/router.py) and the
+    # storage provider issues no presigned URLs, so nothing outside the compose network ever
+    # needs to reach MinIO. Dev access (incl. the :9001 console) lives in the dev override.
     volumes:
       - minio_data:/data
     healthcheck:
@@ -186,8 +193,10 @@ services:
       API_INTERNAL_URL: http://api:8000
     depends_on:
       - api
-    ports:
-      - "3000:3000"
+    # B1: NO host publication -- see the postgres note. nginx proxies `/` to `web:3000`
+    # in-network, so the app is served through the single public entrypoint. Publishing 3000
+    # bypasses nginx entirely and, since the image runs `next dev`, exposes a development
+    # server. Dev access lives in docker-compose.override.yml.
     volumes:
       - ../apps/web:/srv
       - web_node_modules:/srv/node_modules
