@@ -151,25 +151,60 @@ path. *(This is single-node durability, not HA — Redis failover/replication is
 
 ## Recovery evidence — status
 
-**No backup has been created and no restore drill has been executed in any environment yet.**
-The mechanisms below are implemented and unit-tested (the DR suites use an injected fake
-`PgRunner`/object store, so they exercise the naming, checksum, verification, retention and
-drill-safety logic — **not** real `pg_dump`/`pg_restore`). Recoverability is therefore
-**unproven** until a real backup set and a drill evidence artifact exist.
+**Database-loss recovery has been demonstrated on the local Docker Compose stack, including
+from an encrypted backup set. The other three scenarios remain designed but not demonstrated
+end-to-end.** This is partial DR evidence, not DR readiness: nothing here has been exercised
+against a production deployment.
 
-Closing that gap is the top DR priority: run `dr backup`, then `dr drill` against a scratch
-database, and keep `<BACKUP_DIRECTORY>/drills/drill-<ts>.json` as the evidence. Until then,
-treat the scenarios below as *designed* recovery paths, not *demonstrated* ones — and do not
-enable live retention deletion (see `retention.md`, Stage 2), which depends on a restorable
-backup existing.
+What exists today under `<BACKUP_DIRECTORY>` (the `infra_backup_data` volume): **7 backup sets**
+(`20260818T161440Z` … `20260819T103507Z`), each carrying `MANIFEST.json`, `db.dump` +
+`db.dump.sha256`, `objects.tar.gz` + `objects.tar.gz.sha256` and `objects.meta.json`. **4 of the
+7 are encrypted at rest** (DR-2) — their manifests record `"encryption": {"enabled": true,
+"alg": "AES-256-GCM"}` and their `db.dump` carries the `MBSENC1` marker; the other 3 are
+plaintext `PGDMP`, taken before encryption was switched on.
+
+`drills/` holds **3 drill artifacts**, of which **2 succeeded**. The most recent,
+`drill-20260819T113930Z.json`, drilled set `20260819T103357Z` — an **encrypted** set — and
+records `restored: true`, `verified: true`, `ok: true`, with checks `connect`, `has_tables`,
+`rls_policies_present` and `force_rls_present` all true. That single artifact therefore
+demonstrates the whole chain: decrypt → real `pg_restore` into a scratch database → a
+schema-complete, RLS-intact result. The earliest artifact, `drill-20260818T162729Z.json`
+(set `20260818T161440Z`), records `verified: true` but `restored: false` with no checks — the
+first attempt verified the set but did not complete a restore; it is retained deliberately.
+
+Note the two kinds of evidence differ. The mechanisms are implemented and unit-tested, but the
+DR suites use an injected fake `PgRunner`/object store — they exercise naming, checksum,
+verification, retention and drill-safety logic, **not** real `pg_dump`/`pg_restore`. The restore
+evidence above comes from manual `dr backup` / `dr drill` runs, not from CI, so it will not
+re-verify itself as the code changes.
+
+Remaining DR priorities, in order:
+1. Demonstrate the object-storage restore path (`restore --objects`) and keep its evidence.
+2. Re-run `dr backup` + `dr drill` in the **production** environment once one exists; the
+   evidence above says nothing about production storage, credentials or data volume.
+3. Turn on the operational toggles: `BACKUP_ENABLED` (no schedule is running — the 7 sets are
+   manual), `BACKUP_ENCRYPTION_ENABLED` (demonstrated, currently off), and
+   `BACKUP_OFFSITE_ENABLED` (DR-3: implemented and wired into the backup flow, never exercised).
+
+**On retention:** `retention.md` Stage 2 step 3 requires a verified DR backup before live
+deletion is enabled. That prerequisite is now *satisfiable* — a restorable database backup has
+been demonstrated — but this is **not** authorization to set `RETENTION_DRY_RUN=false`. Stage 2
+is a five-step checklist: step 3 calls for a **fresh** backup taken at that moment, not a
+historical set, and steps 1, 2, 4 and 5 (dry-run cycles validated, `MbsRetentionFailing` flat,
+gated flip, post-flip monitoring) are independent and remain outstanding. Follow `retention.md`
+in full; deleted data is recoverable only by restoring the pre-Stage-2 backup.
 
 ### The four required scenarios
-- **Database loss** → `dr restore` / `dr drill` (pg_restore into a clean DB; migration-consistent).
-- **Object storage failure** → object verify + `restore --objects` (faithful metadata).
-- **Accidental data deletion** → timestamped retained sets (`min_keep` never erases the newest);
-  restore point-in-time-of-backup. *(MinIO versioning/object-lock recommended — see DR-5.)*
-- **Infrastructure failure** → durable volumes (DR-1 backups, R1a Redis) + off-site copy (DR-3)
-  survive host loss.
+- **Database loss** — **DEMONSTRATED** (local, from an encrypted set). `dr restore` / `dr drill`:
+  decrypt + pg_restore into a clean DB; migration-consistent; RLS + FORCE-RLS verified.
+- **Object storage failure** — *designed, not demonstrated.* Object verify +
+  `restore --objects` (faithful metadata). No drill has exercised the object path.
+- **Accidental data deletion** — *not demonstrated end-to-end*, though its database half rests on
+  the demonstrated restore path above. Timestamped retained sets (`min_keep` never erases the
+  newest); restore point-in-time-of-backup. *(MinIO versioning/object-lock recommended — see DR-5.)*
+- **Infrastructure failure** — *designed, not demonstrated.* Durable volumes (DR-1 backups,
+  R1a Redis) + off-site copy (DR-3) survive host loss — but DR-3 is currently disabled, so no
+  off-site copy exists yet.
 
 ## DR-5 — Future production evolution (NOT implemented)
 Deferred, larger-scope items for a future phase:
