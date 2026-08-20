@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Secrets that may be delivered via a `<NAME>_FILE` env var pointing at a file
@@ -370,8 +371,10 @@ class Settings(BaseSettings):
     # own hop is read as the Nth entry FROM THE RIGHT (leftmost entries are attacker-
     # spoofable). 0 (default) = ignore XFF entirely and use the direct peer, so a spoofed
     # header can never mint fresh rate-limit buckets. Set to the real proxy-hop count in
-    # production (e.g. 1 behind a single nginx).
-    trusted_proxy_count: int = 0
+    # production (e.g. 1 behind a single nginx). Negative values are meaningless here, so the
+    # field refuses them outright rather than silently behaving as 0. Production must DECLARE
+    # this value -- see validate_production().
+    trusted_proxy_count: int = Field(0, ge=0)
 
     # --- Logging / observability -------------------------------------------
     log_level: str = "INFO"
@@ -473,6 +476,20 @@ class Settings(BaseSettings):
             problems.append("SSL_VERIFY is disabled; never disable TLS verification in production.")
         if not self.rate_limit_enabled:
             problems.append("RATE_LIMIT_ENABLED must be true in production (unrestricted limits are unsafe).")
+        # Rate-limit IDENTITY. Production mandates rate limiting above, but a limiter is only as
+        # good as the client identity it buckets on. The app cannot observe how many proxies sit
+        # in front of it, and guessing is unsafe in BOTH directions: too low and every anonymous
+        # client shares one bucket; too high and the Nth-from-right read reaches into
+        # caller-controlled X-Forwarded-For entries, letting anyone forge a bucket key. So
+        # production must DECLARE the hop count instead of inheriting the default. 0 remains a
+        # valid and safe answer -- it just has to be a deliberate one.
+        if "trusted_proxy_count" not in self.model_fields_set:
+            problems.append(
+                "TRUSTED_PROXY_COUNT must be set explicitly in production: the number of trusted "
+                "proxies in front of this app that APPEND to X-Forwarded-For (0 = nothing in "
+                "front, so X-Forwarded-For is ignored and the direct peer is used). Determine it "
+                "from the real ingress chain -- never guess. See docs/runbooks/deployment.md."
+            )
         if self.metrics_mode == "public":
             problems.append("METRICS_MODE must not be 'public' in production.")
         # MFA Step 3: production must be able to encrypt TOTP secrets at rest.

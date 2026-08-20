@@ -177,6 +177,7 @@ def _hardened(**overrides) -> Settings:
         rate_limit_enabled=True,
         metrics_mode="token",
         mfa_encryption_key="a-real-mfa-encryption-key",
+        trusted_proxy_count=0,
     )
     base.update(overrides)
     return Settings(**base)
