@@ -83,6 +83,43 @@ docker compose $COMPOSE stop -t 60 worker           # -t >= stop_grace_period
   compose healthcheck on workers yet (tracked as a reliability follow-up); `restart: unless-stopped`
   covers process crashes.
 
+## Production configuration: `TRUSTED_PROXY_COUNT`
+
+**The API refuses to start in production unless this is set explicitly.** There is no safe
+default to inherit, so the guard forces a decision rather than assuming your topology.
+
+**What it is.** The number of proxies in front of this app that **append** to `X-Forwarded-For`.
+The client's own address is then read as the **Nth entry from the right** — everything further
+left is caller-supplied and forgeable. It is used for one thing: the rate-limit bucket key for
+*anonymous* requests (authenticated requests bucket by user id and are unaffected).
+
+- `0` — nothing appends in front. `X-Forwarded-For` is ignored entirely and the direct socket
+  peer is used. **This is a valid and safe answer**; it just has to be chosen deliberately.
+- `1` — one appending proxy (e.g. only the bundled `nginx`).
+- `2` — two, e.g. an external load balancer or CDN in front of `nginx`.
+
+**How to determine it — never guess.** From a client whose public IP you know, send a request to
+production and read the raw `X-Forwarded-For` the API receives. Count the entries: if the header
+holds exactly one entry equal to your real client IP, the answer is `1`; if two, `2`. Count only
+proxies that *append* — a CDN that sets its own header (e.g. `CF-Connecting-IP`) but also appends
+to `X-Forwarded-For` still counts as a hop.
+
+**Why guessing is unsafe in both directions.**
+- Too **low**: every anonymous client collapses into the proxy's single bucket, so the limiter
+  throttles all unauthenticated traffic together — or effectively not at all.
+- Too **high**: the Nth-from-right read reaches into caller-controlled entries, so any client can
+  mint a fresh bucket per request by varying the header. This is worse than having no limiter.
+
+**Prerequisite before using any non-zero value.** The API must be unreachable except *through*
+the proxy chain. `infra/docker-compose.yml` binds the API to `8000:8000`, and the production
+overlay adds no `ports` override, so that direct path survives the compose merge. If a client can
+reach `:8000` directly, it supplies the whole `X-Forwarded-For` header and any `N > 0` becomes
+attacker-controlled. Remove or firewall that binding (security group / host firewall / bind to
+loopback) **before** raising the value above `0`.
+
+Note the bundled `nginx.conf` listens on `:80` with no TLS directives. If you serve HTTPS,
+something upstream terminates TLS — and that hop counts.
+
 ## Post-deploy verification
 - `GET /ready` → `ready`.
 - Prometheus targets `mbs-api`, `mbs-worker` (worker:9100 + worker-default:9100) all `up`.
