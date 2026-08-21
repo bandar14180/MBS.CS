@@ -1,9 +1,21 @@
 from celery import Celery
 
+from apps.api.celery_app.startup_security import (
+    DatabaseRoleSecurityStep,
+    enforce_production_config,
+)
 from apps.api.core.config import get_settings
 import apps.api.core.models_all  # noqa: F401  -- register all ORM models on Base.metadata
 
 settings = get_settings()
+
+# Production configuration is validated HERE, at import, because this module is what every
+# Celery entrypoint loads (`-A apps.api.celery_app.worker.celery_app`) and it is the only
+# hook that aborts BOTH `celery worker` and `celery beat`. Celery signals cannot be used:
+# an exception raised in a signal receiver is swallowed and the worker keeps serving (see
+# startup_security.py). Outside production this is a no-op, so importing the app in tests
+# or from the API is unaffected.
+enforce_production_config(settings)
 
 celery_app = Celery(
     "mbs_sc",
@@ -118,6 +130,13 @@ def register_retention_schedule(app, cfg) -> None:
 register_retention_schedule(celery_app, settings)
 
 celery_app.conf.timezone = "UTC"
+
+# The database-role invariant (a SUPERUSER bypasses FORCE RLS and defeats workspace
+# isolation) needs a live connection, so it runs as a WORKER BOOTSTEP rather than at import:
+# bootsteps abort worker startup when they raise, they execute only in a real worker process
+# -- so `beat`, which opens no engine, is untouched -- and they keep the DB call out of the
+# API's import path, where the lifespan already performs the same check.
+celery_app.steps["worker"].add(DatabaseRoleSecurityStep)
 
 
 # Phase 4.1: start the worker's Prometheus metrics endpoint once the worker is up. Registered
