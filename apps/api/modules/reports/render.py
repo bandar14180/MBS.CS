@@ -13,6 +13,71 @@ from apps.api.modules.reports.data import _ACTIVE_STATUSES, _SEVERITY_ORDER, Rep
 # sort last (lowest rank).
 _SEVERITY_RANK = {sev: len(_SEVERITY_ORDER) - i for i, sev in enumerate(_SEVERITY_ORDER)}
 
+
+def _top_risk_groups(vulns) -> list[dict]:
+    """Executive Top Risks, aggregated at the TEMPLATE level (presentation only -- vulnerability
+    identity, fingerprints, and DB deduplication are unchanged; this only groups already-persisted
+    rows for display). One row per issue-type rather than one per endpoint, so a single template
+    hitting many URLs no longer floods the list or reads as many distinct vulnerabilities.
+
+    Considers only ACTIVE, SCORED findings (final_risk_score not None and status in
+    data._ACTIVE_STATUSES) -- identical to the pre-rollup filter. Findings are grouped by
+    `template_id`; a finding with no template_id falls back to its own `title` as the key, so
+    non-nuclei/legacy findings each stay a distinct row instead of collapsing into one bucket.
+
+    Each group dict carries:
+      * title           -- representative finding: the title of the group's highest-risk member
+                           (deterministic: max risk, then max CVSS, then severity, then title asc);
+      * endpoint_count  -- how many endpoint-level findings the group aggregates (NOT distinct
+                           vulnerabilities -- the renderer labels the column so);
+      * max_risk        -- the group's highest final_risk_score (drives ranking + display);
+      * max_cvss        -- the group's highest CVSS (None only if every member's CVSS is None);
+      * severity        -- the highest severity among the group's members.
+
+    Groups are returned in deterministic order: max_risk DESC, then max_cvss DESC, then severity
+    DESC, then representative title ASC -- the same key discipline the per-finding list used."""
+    active_scored = [
+        v for v in vulns if v.final_risk_score is not None and v.status in _ACTIVE_STATUSES
+    ]
+    buckets: dict[str, list] = {}
+    for v in active_scored:
+        # `tid:`/`title:` prefixes keep a template_id and an identical-looking title from ever
+        # colliding into one bucket.
+        key = f"tid:{v.template_id}" if v.template_id else f"title:{v.title or ''}"
+        buckets.setdefault(key, []).append(v)
+
+    def _member_sort_key(v):
+        return (
+            -v.final_risk_score,
+            -(v.cvss_score if v.cvss_score is not None else -1.0),
+            -_SEVERITY_RANK.get(v.severity, 0),
+            v.title or "",
+        )
+
+    groups: list[dict] = []
+    for members in buckets.values():
+        rep = min(members, key=_member_sort_key)  # highest-risk member (min of negated keys)
+        cvss_values = [m.cvss_score for m in members if m.cvss_score is not None]
+        groups.append(
+            {
+                "title": rep.title,
+                "endpoint_count": len(members),
+                "max_risk": max(m.final_risk_score for m in members),
+                "max_cvss": max(cvss_values) if cvss_values else None,
+                "severity": max(members, key=lambda m: _SEVERITY_RANK.get(m.severity, 0)).severity,
+            }
+        )
+
+    groups.sort(
+        key=lambda g: (
+            -g["max_risk"],
+            -(g["max_cvss"] if g["max_cvss"] is not None else -1.0),
+            -_SEVERITY_RANK.get(g["severity"], 0),
+            g["title"] or "",
+        )
+    )
+    return groups
+
 _SEVERITY_COLORS = {
     "critical": "#7f1d1d",
     "high": "#b91c1c",
@@ -170,30 +235,35 @@ def render_executive(data: ReportData) -> bytes:
     )
     story.append(Spacer(1, 6 * mm))
 
-    # Top risks. ACTIVE findings only -- same active-status set the Security Score uses
-    # (data._ACTIVE_STATUSES: open/confirmed/reopened) -- so a fixed/accepted/false-positive
-    # finding never resurfaces here as a "top risk". Deterministic ordering, so the same data
-    # always renders the same table: business risk DESC, then CVSS DESC, then severity DESC,
-    # then title ASC. (CVSS/severity are pure tie-breakers; final_risk_score stays primary and
-    # its calculation is unchanged.) None CVSS sorts below any real CVSS within a risk tie.
+    # Top risks. ACTIVE, scored findings only -- same active-status set the Security Score uses
+    # (data._ACTIVE_STATUSES: open/confirmed/reopened) -- aggregated at the TEMPLATE level so one
+    # issue-type that hit many endpoints is ONE row (with an endpoint count), not a flood of
+    # look-alike rows that reads as many distinct vulnerabilities. This is presentation grouping
+    # only: vulnerability identity, fingerprints, and DB deduplication are unchanged (see
+    # _top_risk_groups). Deterministic ordering: max business risk DESC -> max CVSS DESC ->
+    # severity DESC -> representative title ASC.
     story.append(Paragraph("Top risks (by business risk score)", styles["H2"]))
-    # Negate the numeric keys for DESC while leaving title as a natural ASC string, so a single
-    # ascending sort yields: risk DESC -> CVSS DESC -> severity DESC -> title ASC (no reverse=,
-    # which would wrongly flip the title too).
-    ranked = sorted(
-        [v for v in data.vulns if v.final_risk_score is not None and v.status in _ACTIVE_STATUSES],
-        key=lambda v: (
-            -v.final_risk_score,
-            -(v.cvss_score if v.cvss_score is not None else -1.0),
-            -_SEVERITY_RANK.get(v.severity, 0),
-            v.title or "",
-        ),
-    )[:10]
-    if ranked:
-        risk_rows = [["Finding", "Severity", "Risk"]]
-        for v in ranked:
-            risk_rows.append([Paragraph(_esc(v.title), styles["Cell"]), v.severity, f"{v.final_risk_score:.1f}"])
-        rtbl = Table(risk_rows, colWidths=[110 * mm, 30 * mm, 25 * mm])
+    groups = _top_risk_groups(data.vulns)[:10]
+    if groups:
+        story.append(
+            Paragraph(
+                "Grouped by issue type. “Endpoints” is how many affected "
+                "endpoints/findings each issue was observed at — not a count of distinct "
+                "vulnerabilities. Risk is the highest business risk score within the group.",
+                styles["Body"],
+            )
+        )
+        risk_rows = [["Issue", "Severity", "Endpoints", "Risk"]]
+        for g in groups:
+            risk_rows.append(
+                [
+                    Paragraph(_esc(g["title"]), styles["Cell"]),
+                    g["severity"],
+                    str(g["endpoint_count"]),
+                    f"{g['max_risk']:.1f}",
+                ]
+            )
+        rtbl = Table(risk_rows, colWidths=[95 * mm, 28 * mm, 22 * mm, 20 * mm])
         rtbl.setStyle(_table_style(colors))
         story.append(rtbl)
     else:

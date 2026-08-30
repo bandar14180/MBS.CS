@@ -425,3 +425,113 @@ def test_summary_singular_vs_plural_wording():
     assert "1 active finding detected" in one    # singular
     many = _findings_summary(_info_only_report(100, 3))
     assert "3 active findings detected" in many   # plural
+
+
+# --- Executive Top Risks: template-level presentation rollup ------------------------------
+# Aggregates active/scored findings by template_id for the Executive report ONLY. Vulnerability
+# identity / fingerprint / DB dedup are unchanged -- this groups already-persisted rows for
+# display so one issue-type across many endpoints is one row (with an endpoint count), not a
+# flood of look-alike rows. Tested against the pure render._top_risk_groups helper.
+from apps.api.modules.reports.render import _top_risk_groups  # noqa: E402
+
+
+def _tr_vuln(title, template_id, *, risk=10.0, cvss=9.8, severity="high", status="open",
+             matched="https://h/x"):
+    return VulnRow(
+        id=uuid.uuid4(), title=title, severity=severity, status=status, category=None,
+        cvss_score=cvss, cvss_vector=None, final_risk_score=risk, risk_rationale=None,
+        compliance=[], evidence_uris=[], template_id=template_id, matcher_name="m",
+        matched_at=matched,
+    )
+
+
+def test_top_risks_collapses_same_template_endpoints_into_one_row():
+    """(1) Many endpoint-level findings sharing a template become ONE Top-Risk row."""
+    vulns = [
+        _tr_vuln("Unix Command Injection", "unix-command-injection", matched=f"https://h/{i}")
+        for i in range(5)
+    ]
+    groups = _top_risk_groups(vulns)
+    assert len(groups) == 1
+    assert groups[0]["title"] == "Unix Command Injection"
+
+
+def test_top_risks_endpoint_count_is_correct():
+    """(2) The endpoint count equals the number of endpoint-level findings in the group."""
+    vulns = [_tr_vuln("Unix CI", "unix-command-injection", matched=f"https://h/{i}") for i in range(7)]
+    groups = _top_risk_groups(vulns)
+    assert groups[0]["endpoint_count"] == 7
+
+
+def test_top_risks_preserves_highest_risk_and_cvss_in_group():
+    """(3) max_risk (and max CVSS) reflect the group's highest members, not the first seen."""
+    vulns = [
+        _tr_vuln("Unix CI", "unix-command-injection", risk=6.0, cvss=6.1),
+        _tr_vuln("Unix CI", "unix-command-injection", risk=10.0, cvss=9.8),
+        _tr_vuln("Unix CI", "unix-command-injection", risk=8.0, cvss=7.5),
+    ]
+    g = _top_risk_groups(vulns)[0]
+    assert g["max_risk"] == 10.0
+    assert g["max_cvss"] == 9.8
+    assert g["endpoint_count"] == 3
+
+
+def test_top_risks_keeps_different_templates_separate():
+    """(4) Distinct templates remain distinct rows -- never merged."""
+    vulns = [
+        _tr_vuln("Unix CI", "unix-command-injection"),
+        _tr_vuln("Windows CI", "windows-command-injection"),
+        _tr_vuln("SQLi", "time-based-sqli", risk=9.0, cvss=9.1),
+    ]
+    groups = _top_risk_groups(vulns)
+    assert len(groups) == 3
+    assert {g["title"] for g in groups} == {"Unix CI", "Windows CI", "SQLi"}
+
+
+def test_top_risks_excludes_inactive_and_unscored_findings():
+    """(5) fixed/accepted/false-positive and None-risk findings never appear."""
+    vulns = [
+        _tr_vuln("Active", "t-active", status="open", risk=10.0),
+        _tr_vuln("Fixed", "t-fixed", status="fixed", risk=10.0),
+        _tr_vuln("Accepted", "t-accepted", status="accepted_risk", risk=10.0),
+        _tr_vuln("FalsePos", "t-fp", status="false_positive", risk=10.0),
+        _tr_vuln("Unscored", "t-unscored", status="open", risk=None),
+    ]
+    titles = {g["title"] for g in _top_risk_groups(vulns)}
+    assert titles == {"Active"}
+
+
+def test_top_risks_deterministic_ordering_by_risk_then_cvss_then_severity_then_title():
+    """(6) Ordering is deterministic: max_risk DESC -> max_cvss DESC -> severity DESC -> title ASC."""
+    vulns = [
+        _tr_vuln("B-issue", "t-b", risk=10.0, cvss=9.8, severity="high"),
+        _tr_vuln("A-issue", "t-a", risk=10.0, cvss=9.8, severity="high"),   # tie w/ B -> title ASC
+        _tr_vuln("Mid", "t-mid", risk=10.0, cvss=7.0, severity="high"),      # same risk, lower cvss
+        _tr_vuln("Low", "t-low", risk=5.0, cvss=9.9, severity="critical"),   # lower risk -> last
+    ]
+    order = [g["title"] for g in _top_risk_groups(vulns)]
+    assert order == ["A-issue", "B-issue", "Mid", "Low"]
+    # Stable across input permutations.
+    assert [g["title"] for g in _top_risk_groups(list(reversed(vulns)))] == order
+
+
+def test_top_risks_rollup_does_not_mutate_underlying_vuln_rows():
+    """(7) Grouping is read-only: the input VulnRow objects/identity are untouched."""
+    vulns = [_tr_vuln("Unix CI", "unix-command-injection", matched=f"https://h/{i}") for i in range(3)]
+    before = [(v.id, v.template_id, v.matched_at, v.final_risk_score, v.status) for v in vulns]
+    _top_risk_groups(vulns)
+    after = [(v.id, v.template_id, v.matched_at, v.final_risk_score, v.status) for v in vulns]
+    assert before == after
+    assert len(vulns) == 3  # no collapse of the underlying rows -- only the display groups
+
+
+def test_top_risks_null_template_falls_back_to_title_not_one_bucket():
+    """A finding with no template_id keys on its own title, so unrelated null-template findings
+    are NOT collapsed into a single bucket."""
+    vulns = [
+        _tr_vuln("Legacy A", None),
+        _tr_vuln("Legacy B", None),
+    ]
+    groups = _top_risk_groups(vulns)
+    assert len(groups) == 2
+    assert {g["title"] for g in groups} == {"Legacy A", "Legacy B"}
