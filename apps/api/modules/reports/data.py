@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.modules.assets.models import Asset
 from apps.api.modules.attack.models import AttackMapping
 from apps.api.modules.compliance.models import ComplianceMapping
 from apps.api.modules.projects.models import Project
@@ -19,6 +20,29 @@ _SEVERITY_PENALTY = {"critical": 25, "high": 15, "medium": 7, "low": 3, "info": 
 _SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
 
 
+def _parse_fingerprint(fingerprint: str | None) -> tuple[str | None, str | None, str | None]:
+    """Recover (template_id, matcher_name, matched_at) from a finding's fingerprint.
+
+    Nuclei fingerprints are built as `template_id|matcher|matched_at` (see
+    nuclei_runner.parse_vulnerabilities). Only the LAST field -- matched_at -- can itself
+    contain a `|`: an injection payload like `?lang=|dir` puts a pipe inside the URL, so a
+    real fingerprint can read `windows-command-injection|time-based|https://h/?lang=|dir`
+    (four segments). So this splits at most TWICE (maxsplit=2): the first two pipes delimit
+    template and matcher, and everything after is the full matched_at, pipes intact.
+
+    Backward-compatible and defensive: a None/empty/malformed fingerprint (fewer than two
+    pipes, e.g. an older non-nuclei finding whose fingerprint is a bare hash) yields None for
+    the missing parts rather than raising -- the report renders those as N/A. This reads the
+    EXISTING fingerprint only; it does not change how fingerprints are built or deduped."""
+    if not fingerprint:
+        return None, None, None
+    parts = fingerprint.split("|", 2)
+    template_id = parts[0] or None if len(parts) >= 1 else None
+    matcher_name = parts[1] or None if len(parts) >= 2 else None
+    matched_at = parts[2] or None if len(parts) >= 3 else None
+    return template_id, matcher_name, matched_at
+
+
 @dataclass
 class VulnRow:
     id: uuid.UUID
@@ -32,6 +56,19 @@ class VulnRow:
     risk_rationale: str | None
     compliance: list[tuple[str, str, str]]  # (framework, control_id, description)
     evidence_uris: list[str]
+    # Where the finding was observed, recovered from the fingerprint (Phase 1: report clarity
+    # only -- no new column, no schema change). Lets the report distinguish many findings that
+    # share a title/severity/evidence but hit different URLs/params. Any may be None (older or
+    # non-nuclei findings); the renderer shows N/A.
+    template_id: str | None = None
+    matcher_name: str | None = None
+    matched_at: str | None = None
+    # The inventoried asset/host this finding is anchored to (assets.value), recovered via the
+    # EXISTING Vulnerability.asset_id -> assets FK (read-only join; no schema change). None when
+    # the finding was never linked to an inventoried asset -- the report must NOT imply an asset
+    # is affected in that case. Distinct from matched_at: asset_value is the host/asset, matched_at
+    # is the exact endpoint/URL observed.
+    asset_value: str | None = None
 
 
 @dataclass
@@ -51,6 +88,20 @@ class ReportData:
     # access_state, module}]. Only evidence-backed states appear (no invented
     # privilege escalation / lateral movement).
     attack_graph: dict = field(default_factory=dict)
+
+    def affected_assets(self) -> list[str]:
+        """Distinct inventoried asset/host values (assets.value) across the findings, sorted.
+        Only non-null asset links -- a finding with no asset_id contributes nothing, so the
+        Executive report never implies an asset is affected when the linkage is absent. Pure
+        (derived from self.vulns), so it adds no query and is directly testable."""
+        return sorted({v.asset_value for v in self.vulns if v.asset_value})
+
+    def affected_endpoint_count(self) -> int:
+        """How many DISTINCT endpoints (matched_at) the findings were observed at. Endpoint is
+        the exact URL/location -- distinct from an asset/host -- so this can exceed the asset
+        count when one host exposes many affected endpoints. Findings without a matched_at
+        (older/non-nuclei) don't count."""
+        return len({v.matched_at for v in self.vulns if v.matched_at})
 
 
 def compute_security_score(active_severity_counts: dict[str, int]) -> int:
@@ -104,7 +155,11 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         await db.scalars(
             select(Vulnerability)
             .where(Vulnerability.project_id == project_id)
-            .order_by(Vulnerability.cvss_score.desc().nullslast(), Vulnerability.created_at)
+            # Phase 0 MySQL cutover: nullslast() dropped -- see the identical comment in
+            # apps/api/modules/vulnerabilities/service.py's list_vulnerabilities; MySQL/
+            # MariaDB already put NULLs last on a plain DESC, and NULLS LAST syntax itself
+            # isn't supported on MariaDB.
+            .order_by(Vulnerability.cvss_score.desc(), Vulnerability.created_at)
         )
     )
     vuln_ids = [v.id for v in vulns]
@@ -114,6 +169,10 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     compliance_by_vuln: dict[uuid.UUID, list[tuple[str, str, str]]] = {}
     evidence_by_vuln: dict[uuid.UUID, list[str]] = {}
     attack_counts: dict[tuple[str, str, str], int] = {}
+    # asset_id -> assets.value, for the vulns that ARE linked to an inventoried asset. Loaded
+    # via the existing Vulnerability.asset_id FK (read-only; no schema change). A vuln whose
+    # asset_id is NULL simply never appears here, so its VulnRow.asset_value stays None.
+    asset_value_by_id: dict[uuid.UUID, str] = {}
     if vuln_ids:
         for r in await db.scalars(select(RiskScore).where(RiskScore.vulnerability_id.in_(vuln_ids))):
             risk_by_vuln[r.vulnerability_id] = r
@@ -137,6 +196,14 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             if uri not in uris:
                 uris.append(uri)
 
+        # Resolve asset_id -> assets.value for the linked findings only.
+        asset_ids = [v.asset_id for v in vulns if v.asset_id is not None]
+        if asset_ids:
+            for aid, value in (
+                await db.execute(select(Asset.id, Asset.value).where(Asset.id.in_(asset_ids)))
+            ).all():
+                asset_value_by_id[aid] = value
+
     severity_counts = {sev: 0 for sev in _SEVERITY_ORDER}
     active_counts = {sev: 0 for sev in _SEVERITY_ORDER}
     rows: list[VulnRow] = []
@@ -159,6 +226,9 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
                 risk_rationale=risk.rationale if risk else None,
                 compliance=sorted(compliance_by_vuln.get(v.id, [])),
                 evidence_uris=evidence_by_vuln.get(v.id, []),
+                asset_value=asset_value_by_id.get(v.asset_id) if v.asset_id else None,
+                **dict(zip(("template_id", "matcher_name", "matched_at"),
+                           _parse_fingerprint(v.fingerprint), strict=True)),
             )
         )
 

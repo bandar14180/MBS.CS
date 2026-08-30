@@ -6,7 +6,12 @@ import html
 from datetime import datetime, timezone
 
 from apps.api.modules.compliance.catalog import framework_name
-from apps.api.modules.reports.data import ReportData, VulnRow
+from apps.api.modules.reports.data import _ACTIVE_STATUSES, _SEVERITY_ORDER, ReportData, VulnRow
+
+# Rank a severity for deterministic tie-breaking: critical=highest. Mirrors data._SEVERITY_ORDER
+# (critical..info) so "higher severity first" is a single source of truth. Unknown severities
+# sort last (lowest rank).
+_SEVERITY_RANK = {sev: len(_SEVERITY_ORDER) - i for i, sev in enumerate(_SEVERITY_ORDER)}
 
 _SEVERITY_COLORS = {
     "critical": "#7f1d1d",
@@ -26,6 +31,46 @@ def _score_band(score: int) -> str:
     if score >= 40:
         return "Weak"
     return "Critical"
+
+
+def _findings_summary(data) -> str:
+    """One sentence reconciling the security score with the finding count, so a reader never
+    reads "100/100" as "zero findings" or "N active findings" as "N vulnerabilities".
+
+    Pure and testable (like _score_band). Uses only ReportData fields that already exist
+    (active_vulns / total_vulns / severity_counts / security_score) -- it does NOT recompute
+    the score or reweight anything. The wording is derived from the ACTUAL scoring model
+    (data.py _SEVERITY_PENALTY: info = 0), so it states plain fact:
+
+      * findings are called "finding(s)/detection(s)", never "vulnerabilities" -- an
+        informational detection is not necessarily a vulnerability;
+      * when the active findings are ALL informational, it says so and explains that
+        informational findings carry no score penalty (which is why the score can be 100);
+      * otherwise it names how many of the active findings are non-informational (the ones
+        that actually move the score), without claiming they are all informational."""
+    active = data.active_vulns
+    if active == 0:
+        return "No active findings. The score is not reduced by any active finding."
+    # active_vulns counts active findings; severity_counts is over ALL findings, so the
+    # "all informational" case is asserted via the non-info active severities below rather
+    # than by comparing active to a total info count.
+    non_info_active = sum(
+        data.severity_counts.get(sev, 0) for sev in ("critical", "high", "medium", "low")
+    )
+    noun = "active finding" if active == 1 else "active findings"
+    non_info_verb = "is" if non_info_active == 1 else "are"
+    if non_info_active == 0:
+        return (
+            f"{active} {noun} detected — all informational. Informational findings are "
+            "reported for visibility and do not reduce the security score under the current "
+            "scoring model, so a score of 100/100 can coexist with informational findings. "
+            "These are detections, not confirmed vulnerabilities."
+        )
+    return (
+        f"{active} {noun} detected, of which {non_info_active} {non_info_verb} of low severity or higher "
+        "and reduce the security score; informational findings are reported for visibility "
+        "but carry no score penalty. Findings are detections, not all confirmed vulnerabilities."
+    )
 
 
 def _esc(text) -> str:
@@ -58,9 +103,10 @@ def render_executive(data: ReportData) -> bytes:
     story.append(Paragraph(f"Security Score: <b>{data.security_score}/100</b> ({band})", styles["Score"]))
     story.append(
         Paragraph(
-            f"{data.active_vulns} active finding(s) out of {data.total_vulns} total. The score "
-            "reflects open, confirmed, and reopened findings weighted by severity; resolved, "
-            "accepted-risk, and false-positive findings do not reduce it.",
+            f"{data.active_vulns} active finding(s) out of {data.total_vulns} total. "
+            + _findings_summary(data)
+            + " The score reflects open, confirmed, and reopened findings weighted by "
+            "severity; resolved, accepted-risk, and false-positive findings do not reduce it.",
             styles["Body"],
         )
     )
@@ -76,12 +122,72 @@ def render_executive(data: ReportData) -> bytes:
     story.append(tbl)
     story.append(Spacer(1, 6 * mm))
 
-    # Top risks
+    # Affected assets / endpoints. Management-level rollup, NOT a per-endpoint dump: the distinct
+    # inventoried assets/hosts (assets.value) plus how many distinct endpoints (matched_at) were
+    # observed. Asset (host) and endpoint (exact URL) are deliberately named separately. Assets
+    # appear ONLY when the finding is linked to an inventoried asset -- an empty list means the
+    # findings carry no asset linkage, never that nothing is affected. Full per-finding endpoints
+    # remain in the technical report.
+    story.append(Paragraph("Affected assets / endpoints", styles["H2"]))
+    assets = data.affected_assets()
+    endpoints = data.affected_endpoint_count()
+    endpoint_phrase = (
+        f"{endpoints} distinct endpoint(s) (URLs/locations) were affected"
+        if endpoints
+        else "No specific endpoint locations were recorded for these findings"
+    )
+    if assets:
+        shown = ", ".join(_esc(a) for a in assets[:15])
+        more = f" (+{len(assets) - 15} more)" if len(assets) > 15 else ""
+        story.append(
+            Paragraph(
+                f"{len(assets)} inventoried asset/host(s) are affected: {shown}{more}. "
+                f"{endpoint_phrase}. An asset/host is the scanned system; an endpoint is the "
+                "specific URL/location on it -- one host can expose many affected endpoints.",
+                styles["Body"],
+            )
+        )
+    else:
+        story.append(
+            Paragraph(
+                f"{endpoint_phrase}. Findings are not linked to inventoried assets for this "
+                "project, so affected hosts are identified by endpoint (see the technical report "
+                "for each finding's exact location).",
+                styles["Body"],
+            )
+        )
+    story.append(Spacer(1, 6 * mm))
+
+    # Scope / limitations -- keep management honest about what the score and findings mean.
+    story.append(
+        Paragraph(
+            "Scope & limitations: results are automated, detection-based findings from the "
+            "configured scan. They indicate where issues were observed and are not manually "
+            "validated confirmed vulnerabilities unless supporting evidence states otherwise. "
+            "Coverage is limited to the assets and endpoints reached by this scan.",
+            styles["Body"],
+        )
+    )
+    story.append(Spacer(1, 6 * mm))
+
+    # Top risks. ACTIVE findings only -- same active-status set the Security Score uses
+    # (data._ACTIVE_STATUSES: open/confirmed/reopened) -- so a fixed/accepted/false-positive
+    # finding never resurfaces here as a "top risk". Deterministic ordering, so the same data
+    # always renders the same table: business risk DESC, then CVSS DESC, then severity DESC,
+    # then title ASC. (CVSS/severity are pure tie-breakers; final_risk_score stays primary and
+    # its calculation is unchanged.) None CVSS sorts below any real CVSS within a risk tie.
     story.append(Paragraph("Top risks (by business risk score)", styles["H2"]))
+    # Negate the numeric keys for DESC while leaving title as a natural ASC string, so a single
+    # ascending sort yields: risk DESC -> CVSS DESC -> severity DESC -> title ASC (no reverse=,
+    # which would wrongly flip the title too).
     ranked = sorted(
-        [v for v in data.vulns if v.final_risk_score is not None],
-        key=lambda v: v.final_risk_score,
-        reverse=True,
+        [v for v in data.vulns if v.final_risk_score is not None and v.status in _ACTIVE_STATUSES],
+        key=lambda v: (
+            -v.final_risk_score,
+            -(v.cvss_score if v.cvss_score is not None else -1.0),
+            -_SEVERITY_RANK.get(v.severity, 0),
+            v.title or "",
+        ),
     )[:10]
     if ranked:
         risk_rows = [["Finding", "Severity", "Risk"]]
@@ -192,6 +298,7 @@ def render_technical(data: ReportData) -> bytes:
     story.append(
         Paragraph(f"Security score {data.security_score}/100 · {data.total_vulns} finding(s).", styles["Meta"])
     )
+    story.append(Paragraph(_findings_summary(data), styles["Small"]))
     story.append(Spacer(1, 6 * mm))
 
     if not data.vulns:
@@ -215,11 +322,23 @@ def _finding_block(idx, v: VulnRow, styles, colors, Paragraph, Table, TableStyle
         Paragraph(f"{idx}. {_esc(v.title)}", styles["H2"]),
         Paragraph(
             f'<font color="{color}"><b>{v.severity.upper()}</b></font> · status: {_esc(v.status)}'
-            + (f" · CVSS {v.cvss_score}" if v.cvss_score is not None else "")
+            # `is not None`, never truthiness: a real CVSS of 0.0 must show as "CVSS 0.0",
+            # only a genuinely absent score (None) shows "CVSS N/A". `x or 0.0`-style logic
+            # would wrongly collapse 0.0 into a fallback, and `if not x` would wrongly treat
+            # 0.0 as missing. This is representation only -- the stored score is untouched.
+            + (f" · CVSS {v.cvss_score}" if v.cvss_score is not None else " · CVSS N/A")
             + (f" · risk {v.final_risk_score:.1f}" if v.final_risk_score is not None else ""),
             styles["Body"],
         ),
     ]
+    # WHERE the finding was observed (Phase 1). Always shown -- N/A when unavailable -- so two
+    # findings that share a title/severity but hit different URLs/params are distinguishable in
+    # the report rather than looking like duplicates. matched_at can be a long URL, so it is
+    # rendered in the monospace style and word-wraps like the evidence URIs below.
+    parts.append(Paragraph(f"Template: {_esc(v.template_id or 'N/A')}", styles["Small"]))
+    parts.append(Paragraph(f"Matcher: {_esc(v.matcher_name or 'N/A')}", styles["Small"]))
+    parts.append(Paragraph(f"Matched at: {_esc(v.matched_at or 'N/A')}", styles["Mono"]))
+    parts.append(Paragraph(f"Status: {_esc(v.status or 'N/A')}", styles["Small"]))
     if v.category:
         parts.append(Paragraph(f"Category: {_esc(v.category)}", styles["Small"]))
     if v.cvss_vector:
