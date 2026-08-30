@@ -410,6 +410,27 @@ async def run_scan(
         return
     except Exception as exc:
         _duration = time.monotonic() - scan_started
+        # ROLL BACK FIRST. The exception may be a failed flush (observed: a duplicate
+        # vulnerability_evidence PK during ingest), which leaves this Session in
+        # PendingRollbackError state -- every subsequent statement on it, and even a lazy
+        # attribute load like `scan.id`, re-raises until the transaction is rolled back.
+        # Without this, `_finalize_status` below crashed instead of marking the scan failed,
+        # so the task died and the scan sat 'running' until the reaper recovered it hours
+        # later. Rolling back discards only the failed, uncommitted ingest work (already lost
+        # anyway); the atomic terminal write is its own statement and is unaffected. Best-
+        # effort: if the connection itself is gone, the terminal write below will surface
+        # that, and the reaper remains the final backstop.
+        try:
+            await db.rollback()
+            # rollback() EXPIRES every ORM object on the session, so `scan.status` /
+            # `scan.execution_token` below and `_finalize_status`'s own `db.refresh(scan)`
+            # would otherwise trigger a lazy reload at an awkward moment. Re-load `scan`
+            # explicitly against the now-clean session so those reads (and the revocation
+            # check) see current, committed state -- which for a requeue is exactly the
+            # cleared token they must observe.
+            scan = await _load_scan(db, scan_id)
+        except Exception:  # noqa: BLE001 -- rollback/reload is recovery; never mask `exc`
+            logger.debug("scan.finalize_rollback_failed scan_id=%s", scan_id, exc_info=True)
         # Atomic terminal write: only running -> failed, and only while WE still own it. If a
         # cancel landed concurrently (Phase 1.5), we lose the race and MUST NOT overwrite
         # 'cancelled'; if ownership was revoked, we lose it too and must not report anything.

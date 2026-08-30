@@ -77,6 +77,16 @@ class NucleiRunner(BaseToolRunner):
 
     def parse_vulnerabilities(self, raw: RawToolOutput) -> list[VulnerabilityFinding]:
         findings: list[VulnerabilityFinding] = []
+        # Dedupe by fingerprint WITHIN a single tool run. nuclei -- and especially
+        # NucleiDastRunner, which inherits this parser -- can emit the same
+        # template|matcher|matched-at more than once (DAST re-hits one template against one
+        # URL while fuzzing its parameters). Every finding in a run shares that run's single
+        # evidence row, so two identical fingerprints dedupe to the same vulnerability and
+        # then both tried to link (vuln, evidence), raising a duplicate-key IntegrityError in
+        # ingest. Collapsing them here (defence in depth alongside the idempotent link in
+        # vulnerabilities/service.py) keeps one finding per distinct fingerprint per run. The
+        # fingerprint format is unchanged.
+        seen_fingerprints: set[str] = set()
         for line in raw.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -93,6 +103,11 @@ class NucleiRunner(BaseToolRunner):
             if not template_id or not matched_at:
                 continue
 
+            fingerprint = f"{template_id}|{matcher}|{matched_at}"
+            if fingerprint in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fingerprint)
+
             classification = info.get("classification") or {}
             cwe = classification.get("cwe-id")
             cve = classification.get("cve-id")
@@ -102,7 +117,7 @@ class NucleiRunner(BaseToolRunner):
 
             findings.append(
                 VulnerabilityFinding(
-                    fingerprint=f"{template_id}|{matcher}|{matched_at}",
+                    fingerprint=fingerprint,
                     title=info.get("name") or template_id,
                     severity=(info.get("severity") or "info").lower(),
                     category=category,

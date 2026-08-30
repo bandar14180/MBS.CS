@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.core.pagination import MAX_LIMIT, Pagination, paginate
@@ -78,11 +79,24 @@ async def ingest_finding(
             vuln.status = "reopened"  # regression: it's back
         # open/confirmed/reopened stay; sticky analyst decisions stay untouched.
 
-    db.add(
-        VulnerabilityEvidence(
-            vulnerability_id=vuln.id, evidence_id=evidence_id, tool_run_id=tool_run_id
-        )
+    # IDEMPOTENT link. The PK is (vulnerability_id, evidence_id), and a single tool_run
+    # produces ONE evidence row shared by every finding it yields -- so two findings in the
+    # same run that dedupe to the SAME vulnerability (same fingerprint) both try to link
+    # (this vuln, this evidence). A plain INSERT raised a 1062 duplicate-key IntegrityError,
+    # which poisoned the whole scan's Session and crashed finalization (observed against
+    # nuclei-dast, which re-hits one template on one URL while fuzzing params). Insert-or-
+    # ignore instead: the pair is already linked, which is exactly the desired end state.
+    #
+    # ON DUPLICATE KEY (not SELECT-then-INSERT) so it is atomic and race-free -- the database
+    # enforces uniqueness in one statement. `tool_run_id` is preserved: a duplicate keeps the
+    # FIRST run that cited this evidence (the update is a no-op on the PK columns), which is
+    # correct since the shared evidence row belongs to this one tool_run anyway. Mirrors the
+    # do-nothing-on-conflict idiom in attack/service.py + compliance/service.py.
+    stmt = mysql_insert(VulnerabilityEvidence.__table__).values(
+        vulnerability_id=vuln.id, evidence_id=evidence_id, tool_run_id=tool_run_id
     )
+    stmt = stmt.on_duplicate_key_update(tool_run_id=VulnerabilityEvidence.tool_run_id)
+    await db.execute(stmt)
     await db.flush()
     return vuln
 
