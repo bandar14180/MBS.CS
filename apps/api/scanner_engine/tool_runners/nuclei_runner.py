@@ -4,13 +4,20 @@ import json
 from apps.api.core.config import get_settings
 from apps.api.scanner_engine.tool_runners._web import web_targets
 from apps.api.scanner_engine.tool_runners.base import (
+    terminate_and_reap,
     BaseToolRunner,
     CommonFinding,
     RawToolOutput,
     VulnerabilityFinding,
 )
 
-DEFAULT_TIMEOUT_SECONDS = 300
+# NO DEFAULT WALL-CLOCK TIMEOUT. nuclei is routinely the longest-running tool in the
+# pipeline (a full template set against a real site legitimately runs for hours), so a fixed
+# ceiling necessarily either kills healthy long scans or is a meaningless large number. By
+# default nuclei runs to natural completion; the reaper (heartbeat-based) recovers a genuinely
+# dead worker, and cancellation still terminates the subprocess (see run()). An optional
+# per-scan cap is still honored via tool_config.nuclei_timeout_seconds (nuclei only) or the
+# shared tool_config.timeout_seconds; a value <= 0 also means no timeout.
 # A broader-but-still-safe default template set for a professional web pentest:
 # common misconfigurations, known CVEs, sensitive exposures, default credentials,
 # subdomain takeovers, and tech fingerprinting. All are gated by
@@ -23,7 +30,9 @@ DEFAULT_TAGS = "misconfig,cve,exposure,default-login,takeover,tech"
 class NucleiRunner(BaseToolRunner):
     name = "nuclei"
     version = "3.11.0"
+    binary = "nuclei"
     requires_active_testing = True  # sends template payloads -> gated on active_testing_allowed (§7)
+    capability = "vulnerability_detection"
     phase = 50  # last: runs against http services discovered earlier in the pipeline
     kill_chain_phase = "delivery"      # delivers detection probes/payloads
     safety_tier = "active_safe"        # DETECTION templates only (no exploitation)
@@ -54,15 +63,47 @@ class NucleiRunner(BaseToolRunner):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Optional timeout precedence: nuclei's own key wins, else the shared key, else NONE.
+        # `nuclei_timeout_seconds` is nuclei-only because raising the SHARED `timeout_seconds`
+        # to accommodate nuclei also raises it for every other runner -- including ffuf, whose
+        # timeout is PER TARGET. When NEITHER key is set (the default), nuclei is NOT bounded
+        # by a wall clock at all: it runs to natural completion, and liveness/cancellation are
+        # handled elsewhere (the heartbeat reaper; the CancelledError branch below). A value
+        # <= 0 is treated the same as unset -- explicitly "no timeout".
+        timeout_seconds = config.get("nuclei_timeout_seconds", config.get("timeout_seconds"))
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            timeout_seconds = None
+
+        stdin_bytes = "\n".join(urls).encode()
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input="\n".join(urls).encode()),
-                timeout=config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
-            )
+            if timeout_seconds is None:
+                # No wall-clock cap: let nuclei finish on its own.
+                stdout, stderr = await proc.communicate(input=stdin_bytes)
+            else:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=stdin_bytes),
+                    timeout=timeout_seconds,
+                )
+        except asyncio.CancelledError:
+            # Scan revoked / worker warm shutdown. Without this the subprocess is
+            # LEFT RUNNING (verified: returncode stays None) -- kill it, then re-raise
+            # so cancellation still propagates.
+            await terminate_and_reap(proc, "nuclei")
+            raise
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            return RawToolOutput(command=" ".join(command), stdout="", stderr="timed out", exit_code=-1)
+            # Only reachable when a caller explicitly set a positive timeout.
+            await terminate_and_reap(proc, "nuclei")
+            return RawToolOutput(
+                command=" ".join(command),
+                stdout="",
+                # Name the knob and the value that actually applied: the previous bare
+                # "timed out" left an operator guessing which of the two keys to raise.
+                stderr=(
+                    f"timed out after {timeout_seconds}s -- raise "
+                    f"tool_config.nuclei_timeout_seconds (nuclei only) if this target matters"
+                ),
+                exit_code=-1,
+            )
 
         return RawToolOutput(
             command=" ".join(command) + f"  (stdin: {', '.join(urls)})",
