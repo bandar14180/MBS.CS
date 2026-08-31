@@ -105,7 +105,8 @@ def _findings_summary(data) -> str:
     Pure and testable (like _score_band). Uses only ReportData fields that already exist
     (active_vulns / total_vulns / severity_counts / security_score) -- it does NOT recompute
     the score or reweight anything. The wording is derived from the ACTUAL scoring model
-    (data.py _SEVERITY_PENALTY: info = 0), so it states plain fact:
+    (scoring.py: info findings are filtered out before scoring, so they cost nothing),
+    so it states plain fact:
 
       * findings are called "finding(s)/detection(s)", never "vulnerabilities" -- an
         informational detection is not necessarily a vulnerability;

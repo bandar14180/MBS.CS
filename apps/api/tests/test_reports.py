@@ -13,19 +13,64 @@ from apps.api.modules.reports.render import _findings_summary
 
 
 # --- Security score (pure) ---
+# compute_security_score now takes FINDINGS, not severity counts: the score is computed
+# over distinct underlying issues rather than per-row severity tallies. The model itself
+# is exercised in test_security_score.py; these keep the report-layer contract honest.
+
+def _row(severity: str, status: str = "open", template_id: str = "tpl", matched_at: str = "u", **kw) -> VulnRow:
+    """A minimal VulnRow, to confirm the scorer reads the report's own row type."""
+    return VulnRow(
+        id=uuid.uuid4(),
+        title=kw.pop("title", f"{severity} finding"),
+        severity=severity,
+        status=status,
+        category=None,
+        cvss_score=kw.pop("cvss_score", None),
+        cvss_vector=None,
+        final_risk_score=kw.pop("final_risk_score", None),
+        risk_rationale=None,
+        compliance=[],
+        evidence_uris=[],
+        template_id=template_id,
+        matched_at=matched_at,
+    )
+
 
 def test_score_perfect_when_no_active() -> None:
-    assert compute_security_score({"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}) == 100
+    assert compute_security_score([]) == 100
+    assert compute_security_score([_row("critical", status="fixed")]) == 100
 
 
 def test_score_penalizes_by_severity() -> None:
-    assert compute_security_score({"critical": 1}) == 75  # 100 - 25
-    assert compute_security_score({"high": 1, "medium": 2}) == 100 - 15 - 14
-    assert compute_security_score({"info": 5}) == 100  # info costs nothing
+    """Ordering, not magic numbers: higher severity => lower score."""
+    critical = compute_security_score([_row("critical", template_id="c")])
+    high = compute_security_score([_row("high", template_id="h")])
+    medium = compute_security_score([_row("medium", template_id="m")])
+    low = compute_security_score([_row("low", template_id="l")])
+    assert critical < high < medium < low < 100
 
 
-def test_score_floors_at_zero() -> None:
-    assert compute_security_score({"critical": 10}) == 0
+def test_score_ignores_informational_findings() -> None:
+    assert compute_security_score([_row("info", template_id=f"i{i}") for i in range(5)]) == 100
+
+
+def test_score_groups_one_issue_across_many_endpoints() -> None:
+    """Regression for the old per-row model: 10 endpoints of one issue is not 10 issues."""
+    spread = compute_security_score(
+        [_row("high", template_id="same", matched_at=f"u{i}") for i in range(10)]
+    )
+    distinct = compute_security_score(
+        [_row("high", template_id=f"t{i}", matched_at="u") for i in range(10)]
+    )
+    assert spread > distinct
+    assert spread > 0  # breadth alone can never floor the score
+
+
+def test_score_stays_within_bounds() -> None:
+    score = compute_security_score(
+        [_row("critical", template_id=f"t{i}", cvss_score=10.0, final_risk_score=10.0) for i in range(100)]
+    )
+    assert 0 <= score <= 100
 
 
 # --- PDF rendering (needs reportlab; smoke that output is a valid PDF) ---

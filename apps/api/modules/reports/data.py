@@ -8,15 +8,17 @@ from apps.api.modules.assets.models import Asset
 from apps.api.modules.attack.models import AttackMapping
 from apps.api.modules.compliance.models import ComplianceMapping
 from apps.api.modules.projects.models import Project
+from apps.api.modules.reports.scoring import ACTIVE_STATUSES, compute_security_score
 from apps.api.modules.risk.models import RiskScore
 from apps.api.modules.vulnerabilities.models import Vulnerability
 from apps.api.scanner_engine.models import Evidence
 
 # Statuses that still count against a project's security posture. A finding
 # that's fixed / false-positive / accepted-risk no longer subtracts from the score.
-_ACTIVE_STATUSES = {"open", "confirmed", "reopened"}
-# Score penalty per active finding, by severity.
-_SEVERITY_PENALTY = {"critical": 25, "high": 15, "medium": 7, "low": 3, "info": 0}
+# Single source of truth lives in scoring.ACTIVE_STATUSES; re-exported here (as a set,
+# unchanged in meaning) because render.py and the severity tallies below import it from
+# this module.
+_ACTIVE_STATUSES = set(ACTIVE_STATUSES)
 _SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
 
 
@@ -102,11 +104,6 @@ class ReportData:
         count when one host exposes many affected endpoints. Findings without a matched_at
         (older/non-nuclei) don't count."""
         return len({v.matched_at for v in self.vulns if v.matched_at})
-
-
-def compute_security_score(active_severity_counts: dict[str, int]) -> int:
-    penalty = sum(_SEVERITY_PENALTY.get(sev, 0) * n for sev, n in active_severity_counts.items())
-    return max(0, 100 - penalty)
 
 
 async def _gather_attack_graph(db: AsyncSession, project_id: uuid.UUID) -> dict:
@@ -241,7 +238,7 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
 
     return ReportData(
         project_name=project_name,
-        security_score=compute_security_score(active_counts),
+        security_score=compute_security_score(rows),
         severity_counts=severity_counts,
         total_vulns=len(vulns),
         active_vulns=sum(active_counts.values()),
