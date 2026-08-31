@@ -1,0 +1,11 @@
+# Worker-only dependencies.
+#
+# These are installed in the WORKER image on top of requirements.txt, and deliberately NOT in
+# the API image. The API renders reports (reading already-stored evidence) and must stay small;
+# only the worker runs scans, and only the worker captures screenshots.
+#
+# playwright drives a headless Chromium to capture visual evidence for non-info web findings
+# (scanner_engine/screenshot.py). The Python package is small; the browser binary it downloads
+# is not (~400MB installed, including the system libraries Chromium needs). That cost is why
+# this is a separate file and why screenshot_evidence_enabled defaults to false.
+playwright==1.49.1

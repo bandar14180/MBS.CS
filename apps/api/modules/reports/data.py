@@ -58,6 +58,12 @@ class VulnRow:
     risk_rationale: str | None
     compliance: list[tuple[str, str, str]]  # (framework, control_id, description)
     evidence_uris: list[str]
+    # Visual evidence captured during the scan: [(storage_uri, sha256)] for this
+    # finding's evidence_type='screenshot' rows. Empty when capture was disabled,
+    # ineligible (info severity / non-HTTP location) or failed -- the report then
+    # simply shows no image. Defaults to an empty list so every existing VulnRow
+    # construction site keeps working unchanged.
+    screenshots: list[tuple[str, str]] = field(default_factory=list)
     # Where the finding was observed, recovered from the fingerprint (Phase 1: report clarity
     # only -- no new column, no schema change). Lets the report distinguish many findings that
     # share a title/severity/evidence but hit different URLs/params. Any may be None (older or
@@ -165,6 +171,8 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     risk_by_vuln: dict[uuid.UUID, RiskScore] = {}
     compliance_by_vuln: dict[uuid.UUID, list[tuple[str, str, str]]] = {}
     evidence_by_vuln: dict[uuid.UUID, list[str]] = {}
+    # vulnerability_id -> [(storage_uri, checksum)] for evidence_type='screenshot'.
+    screenshot_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
     attack_counts: dict[tuple[str, str, str], int] = {}
     # asset_id -> assets.value, for the vulns that ARE linked to an inventoried asset. Loaded
     # via the existing Vulnerability.asset_id FK (read-only; no schema change). A vuln whose
@@ -184,11 +192,24 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
 
         evidence_rows = await db.execute(
-            select(VulnerabilityEvidence.vulnerability_id, Evidence.storage_uri)
+            select(
+                VulnerabilityEvidence.vulnerability_id,
+                Evidence.storage_uri,
+                Evidence.evidence_type,
+                Evidence.checksum,
+            )
             .join(Evidence, Evidence.id == VulnerabilityEvidence.evidence_id)
             .where(VulnerabilityEvidence.vulnerability_id.in_(vuln_ids))
         )
-        for vid, uri in evidence_rows.all():
+        # Screenshots are split out from the log/raw-output evidence so the Technical Report
+        # can embed the image while still listing the textual artifacts. The checksum rides
+        # along so the renderer can drop byte-identical duplicates without fetching them.
+        for vid, uri, etype, checksum in evidence_rows.all():
+            if etype == "screenshot":
+                shots = screenshot_by_vuln.setdefault(vid, [])
+                if (uri, checksum) not in shots:
+                    shots.append((uri, checksum))
+                continue
             uris = evidence_by_vuln.setdefault(vid, [])
             if uri not in uris:
                 uris.append(uri)
@@ -223,6 +244,7 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
                 risk_rationale=risk.rationale if risk else None,
                 compliance=sorted(compliance_by_vuln.get(v.id, [])),
                 evidence_uris=evidence_by_vuln.get(v.id, []),
+                screenshots=screenshot_by_vuln.get(v.id, []),
                 asset_value=asset_value_by_id.get(v.asset_id) if v.asset_id else None,
                 **dict(zip(("template_id", "matcher_name", "matched_at"),
                            _parse_fingerprint(v.fingerprint), strict=True)),

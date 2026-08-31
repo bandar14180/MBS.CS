@@ -190,7 +190,10 @@ def _finding_block_text(v: VulnRow) -> str:
     from reportlab.platypus import Paragraph, Table, TableStyle
 
     styles = render._styles(getSampleStyleSheet, ParagraphStyle, colors)
-    block = render._finding_block(1, v, styles, colors, Paragraph, Table, TableStyle, mm)
+    # _finding_block now takes a GROUP (one vulnerability, many locations), so build the
+    # group the same way the renderer does rather than passing the row straight through.
+    (group,) = render._finding_groups([v])
+    block = render._finding_block(1, group, styles, colors, Paragraph, Table, TableStyle, mm)
 
     texts: list[str] = []
 
@@ -201,6 +204,32 @@ def _finding_block_text(v: VulnRow) -> str:
                 _walk(child)
         elif hasattr(flowable, "getPlainText"):
             texts.append(flowable.getPlainText())
+
+    _walk(block)
+    return "\n".join(texts)
+
+
+def _group_block_text(group: dict) -> str:
+    """Rendered text of one GROUPED finding block (see _finding_block_text)."""
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, Table, TableStyle
+
+    styles = render._styles(getSampleStyleSheet, ParagraphStyle, colors)
+    block = render._finding_block(1, group, styles, colors, Paragraph, Table, TableStyle, mm)
+
+    texts: list[str] = []
+
+    def _walk(flowable):
+        content = getattr(flowable, "_content", None)
+        if content is not None:
+            for child in content:
+                _walk(child)
+            return
+        text = getattr(flowable, "text", None)
+        if text is not None:
+            texts.append(str(text))
 
     _walk(block)
     return "\n".join(texts)
@@ -232,7 +261,9 @@ def test_technical_report_shows_template_matcher_matched_at_and_status():
     # The four Phase-1 lines are rendered with their real values.
     assert "Template: unix-command-injection" in text
     assert "Matcher: time-based" in text
-    assert "Matched at: https://x/a?p=1" in text
+    # One location -> listed under "Affected locations", still showing the full URL.
+    assert "Affected locations (1):" in text
+    assert "https://x/a?p=1" in text
     assert "Status: open" in text
     # And the whole report still renders to a valid PDF.
     data = ReportData(
@@ -243,9 +274,9 @@ def test_technical_report_shows_template_matcher_matched_at_and_status():
     assert render.render("technical", data)[:5] == b"%PDF-"
 
 
-def test_two_findings_same_everything_but_matched_at_show_their_own_url():
-    """The whole point: two findings sharing title/severity/template/matcher but DIFFERENT
-    URLs each render their own matched_at -- not duplicates."""
+def test_two_locations_of_one_vulnerability_are_one_block_listing_both_urls():
+    """Two rows sharing title/severity/template/matcher but DIFFERENT URLs are ONE
+    vulnerability observed twice -- a single block listing both locations, not two blocks."""
     a = _vuln_row_with_fingerprint("unix-command-injection|time-based|https://x/a?p=1")
     b = _vuln_row_with_fingerprint("unix-command-injection|time-based|https://x/b?p=2")
     # Same on every axis except the URL.
@@ -253,11 +284,13 @@ def test_two_findings_same_everything_but_matched_at_show_their_own_url():
            (b.title, b.severity, b.template_id, b.matcher_name)
     assert a.matched_at != b.matched_at
 
-    text_a = _finding_block_text(a)
-    text_b = _finding_block_text(b)
-    # Each block shows ITS OWN url and not the other's.
-    assert "Matched at: https://x/a?p=1" in text_a and "https://x/b?p=2" not in text_a
-    assert "Matched at: https://x/b?p=2" in text_b and "https://x/a?p=1" not in text_b
+    groups = render._finding_groups([a, b])
+    assert len(groups) == 1, "same template at two URLs must be ONE finding"
+    text = _group_block_text(groups[0])
+    # The single block lists BOTH urls, and the shared metadata appears only once.
+    assert "Affected locations (2):" in text
+    assert "https://x/a?p=1" in text and "https://x/b?p=2" in text
+    assert text.count("Template: unix-command-injection") == 1
 
     data = ReportData(
         project_name="P", security_score=0,
@@ -274,9 +307,9 @@ def test_report_matched_at_keeps_a_pipe_url_whole_not_just_the_payload():
           "https://universities.brightvision-og.com/university/nilai-university/?lang=|dir")
     row = _vuln_row_with_fingerprint(fp)
     text = _finding_block_text(row)
-    assert ("Matched at: https://universities.brightvision-og.com/university/"
+    assert ("https://universities.brightvision-og.com/university/"
             "nilai-university/?lang=|dir") in text
-    assert "Matched at: dir" not in text          # never the mangled tail
+    assert "• dir" not in text                    # never the mangled tail alone
     assert "Template: windows-command-injection" in text
     assert "Matcher: time-based" in text
 
@@ -288,7 +321,7 @@ def test_report_renders_na_when_location_is_unavailable():
     text = _finding_block_text(row)
     assert "Template: legacy-hash-only" in text    # the one part it could recover
     assert "Matcher: N/A" in text
-    assert "Matched at: N/A" in text
+    assert "Affected locations: N/A" in text
     data = ReportData(
         project_name="P", security_score=85,
         severity_counts={"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 0},
@@ -310,7 +343,7 @@ def test_report_renders_na_for_a_completely_empty_fingerprint():
         text = _finding_block_text(row)
         assert "Template: N/A" in text
         assert "Matcher: N/A" in text
-        assert "Matched at: N/A" in text
+        assert "Affected locations: N/A" in text
 
 
 # --- P0 #1: CVSS 0.0 vs N/A must stay distinguishable in the report -----------------------
@@ -580,3 +613,236 @@ def test_top_risks_null_template_falls_back_to_title_not_one_bucket():
     groups = _top_risk_groups(vulns)
     assert len(groups) == 2
     assert {g["title"] for g in groups} == {"Legacy A", "Legacy B"}
+
+
+# --- Technical Report finding grouping ----------------------------------------------------
+# One block per VULNERABILITY (scoring.issue_key identity), not per (template|matcher|url) row.
+# A row is one LOCATION, so the old per-row loop turned 21 issue types into 201 near-identical
+# blocks on the real dataset. Grouping is presentation only: identity, fingerprints, DB dedup,
+# matched_at parsing, the Security Score and the Executive Report are all unchanged.
+
+
+def _g_row(template_id, matched_at, severity="high", cvss=9.8, **over):
+    base = dict(
+        id=uuid.uuid4(), title=f"{template_id} title", severity=severity, status="open",
+        category="cwe-77", cvss_score=cvss, cvss_vector=None, final_risk_score=10.0,
+        risk_rationale=None, compliance=[], evidence_uris=[],
+        template_id=template_id, matcher_name="time-based", matched_at=matched_at,
+    )
+    base.update(over)
+    return VulnRow(**base)
+
+
+def test_same_template_many_locations_renders_one_finding():
+    """1. Multiple rows sharing a template_id collapse into ONE technical finding."""
+    rows = [_g_row("unix-command-injection", f"https://h/p{i}") for i in range(20)]
+    groups = render._finding_groups(rows)
+    assert len(groups) == 1
+    assert groups[0]["occurrence_count"] == 20
+
+
+def test_all_unique_locations_are_retained_under_the_finding():
+    """2. No location is lost, and duplicates of the same URL collapse to one entry."""
+    urls = [f"https://h/p{i}" for i in range(20)]
+    rows = [_g_row("unix-command-injection", u) for u in urls]
+    rows.append(_g_row("unix-command-injection", urls[0]))  # duplicate location
+    (group,) = render._finding_groups(rows)
+    assert group["matched_ats"] == sorted(set(urls))
+    assert len(group["matched_ats"]) == 20
+    assert group["occurrence_count"] == 21  # every row still counted
+    text = _group_block_text(group)
+    assert "Affected locations (20):" in text
+    for u in urls:
+        assert u in text
+
+
+def test_different_templates_remain_separate_findings():
+    """3. Genuinely different vulnerabilities must NOT be merged."""
+    rows = [
+        _g_row("unix-command-injection", "https://h/a"),
+        _g_row("windows-command-injection", "https://h/a"),
+        _g_row("time-based-sqli", "https://h/a", severity="critical", cvss=9.5),
+    ]
+    groups = render._finding_groups(rows)
+    assert len(groups) == 3
+    assert {g["template_id"] for g in groups} == {
+        "unix-command-injection", "windows-command-injection", "time-based-sqli"
+    }
+
+
+def test_severity_cvss_and_risk_are_not_incorrectly_merged():
+    """4. The group header reports the WORST case, never a blend or an arbitrary member."""
+    rows = [
+        _g_row("t", "https://h/a", severity="low", cvss=2.0, final_risk_score=3.0),
+        _g_row("t", "https://h/b", severity="critical", cvss=9.5, final_risk_score=10.0),
+        _g_row("t", "https://h/c", severity="medium", cvss=5.0, final_risk_score=6.0),
+    ]
+    (group,) = render._finding_groups(rows)
+    assert group["severity"] == "critical"
+    assert group["cvss_score"] == 9.5
+    assert group["final_risk_score"] == 10.0
+    text = _group_block_text(group)
+    assert "CRITICAL" in text and "CVSS 9.5" in text
+
+
+def test_single_location_finding_still_renders_normally():
+    """5. The common one-location case is unaffected."""
+    (group,) = render._finding_groups([_g_row("CVE-2022-0591", "https://h/only")])
+    assert group["occurrence_count"] == 1
+    text = _group_block_text(group)
+    assert "Affected locations (1):" in text
+    assert "https://h/only" in text
+    assert "Template: CVE-2022-0591" in text
+
+
+def test_grouping_uses_the_same_identity_as_the_security_score():
+    """The Technical Report, the Executive Report and the Security Score must agree on
+    what one vulnerability is -- otherwise the counts contradict each other."""
+    from apps.api.modules.reports.scoring import group_issues, issue_key
+
+    rows = [_g_row("unix-command-injection", f"https://h/p{i}") for i in range(12)]
+    rows += [_g_row("time-based-sqli", "https://h/x", severity="critical", cvss=9.5)]
+    tech = render._finding_groups(rows)
+    assert len(tech) == len(group_issues(rows)) == 2
+    assert {g["key"] for g in tech} == {issue_key(r) for r in rows}
+
+
+def test_legacy_rows_without_template_id_group_by_title():
+    """Non-nuclei/legacy rows fall back to title, so they stay distinct findings."""
+    rows = [
+        _g_row(None, "https://h/a", title="Legacy A"),
+        _g_row(None, "https://h/b", title="Legacy B"),
+        _g_row(None, "https://h/c", title="Legacy A"),
+    ]
+    groups = render._finding_groups(rows)
+    assert len(groups) == 2
+    by_title = {g["title"]: g for g in groups}
+    assert len(by_title["Legacy A"]["matched_ats"]) == 2
+    assert len(by_title["Legacy B"]["matched_ats"]) == 1
+
+
+def test_unlocated_occurrences_are_reported_not_dropped():
+    """A member with no matched_at must still be accounted for."""
+    rows = [
+        _g_row("t", "https://h/a"),
+        _g_row("t", None),
+        _g_row("t", None),
+    ]
+    (group,) = render._finding_groups(rows)
+    assert group["unlocated_count"] == 2
+    assert group["occurrence_count"] == 3
+    assert "(+2 occurrence(s) with no recorded location)" in _group_block_text(group)
+
+
+def test_grouping_is_deterministic_and_severity_ordered():
+    rows = [
+        _g_row("low-issue", "https://h/a", severity="low", cvss=2.0),
+        _g_row("crit-issue", "https://h/b", severity="critical", cvss=9.5),
+        _g_row("high-issue", "https://h/c", severity="high", cvss=8.0),
+    ]
+    keys = [g["key"] for g in render._finding_groups(rows)]
+    assert keys == [g["key"] for g in render._finding_groups(list(reversed(rows)))]
+    assert keys[0] == "template:crit-issue"  # worst first
+
+
+def test_technical_report_no_longer_repeats_one_issue_per_location():
+    """6/end-to-end: the real shape -- many locations of a few issues -- renders a small
+    number of blocks and still produces a valid PDF."""
+    rows = [_g_row("unix-command-injection", f"https://h/u{i}") for i in range(24)]
+    rows += [_g_row("windows-command-injection", f"https://h/w{i}") for i in range(19)]
+    rows += [_g_row("time-based-sqli", "https://h/s", severity="critical", cvss=9.5)]
+    assert len(rows) == 44
+    assert len(render._finding_groups(rows)) == 3  # not 44
+
+    data = ReportData(
+        project_name="P", security_score=3,
+        severity_counts={"critical": 1, "high": 43, "medium": 0, "low": 0, "info": 0},
+        total_vulns=len(rows), active_vulns=len(rows), vulns=rows,
+    )
+    assert render.render("technical", data)[:5] == b"%PDF-"
+
+
+def test_executive_top_risk_grouping_is_unchanged_by_technical_grouping():
+    """7. The Executive Report keeps its own (active+scored) grouping semantics."""
+    rows = [_g_row("unix-command-injection", f"https://h/p{i}") for i in range(5)]
+    rows.append(_g_row("fixed-issue", "https://h/z", status="fixed"))
+    exec_groups = render._top_risk_groups(rows)
+    # Executive filters to ACTIVE+scored, so the fixed finding is excluded there...
+    assert [g["title"] for g in exec_groups] == ["unix-command-injection title"]
+    assert exec_groups[0]["endpoint_count"] == 5
+    # ...while the Technical Report keeps it, being the full record.
+    assert len(render._finding_groups(rows)) == 2
+
+
+# --- matched_at integrity (regression) ----------------------------------------------------
+# An audit initially reported matched_at as "corrupted" -- values like `sleep+5` and `dir`
+# appearing instead of URLs. That was an ARTIFACT OF THE AUDIT QUERY, not of the code: the
+# query used SQL SUBSTRING_INDEX(fingerprint,'|',-1), which takes the text after the LAST
+# pipe, while a real matched_at can itself contain pipes (an injection payload such as
+# `?lang=|sleep+5` is part of the URL nuclei probed). _parse_fingerprint splits at most TWICE
+# from the left, so the trailing field keeps every pipe. These tests pin that, using the exact
+# production fingerprints, so the same false alarm cannot be raised again.
+
+
+def test_matched_at_keeps_injection_payload_pipe_whole():
+    """Production fingerprints whose URL contains `|<payload>`. The payload is part of the
+    URL, not a delimiter: taking the text after the last pipe would yield `sleep+5`/`dir`."""
+    for payload in ("sleep+5", "dir"):
+        url = f"https://universities.brightvision-og.com/university/nilai-university/?lang=|{payload}"
+        tid, matcher, matched = _parse_fingerprint(f"unix-command-injection|time-based|{url}")
+        assert tid == "unix-command-injection"
+        assert matcher == "time-based"
+        assert matched == url                      # full URL, pipe intact
+        assert matched != payload                  # never the bare payload
+        assert matched.startswith("https://")
+
+
+def test_matched_at_is_never_reduced_to_the_last_pipe_segment():
+    """The exact mistake to guard against: rsplit('|', 1)[-1] is NOT how matched_at is read."""
+    url = "https://h/?a=|b|c"
+    _, _, matched = _parse_fingerprint(f"t|m|{url}")
+    assert matched == url
+    assert matched != url.rsplit("|", 1)[-1]       # would be "c"
+
+
+def test_normal_url_round_trips_unchanged():
+    for url in (
+        "https://example.com/",
+        "https://example.com/path?x=1&y=2",
+        "https://example.com/p?q=1#frag",
+        "http://example.com:8080/a",
+    ):
+        assert _parse_fingerprint(f"tpl|matcher|{url}")[2] == url
+
+
+def test_matcher_name_survives_a_piped_url():
+    """Matcher must not be polluted by pipes further right in the URL."""
+    tid, matcher, matched = _parse_fingerprint("windows-command-injection|time-based|https://h/?x=|dir")
+    assert (tid, matcher) == ("windows-command-injection", "time-based")
+    assert matched == "https://h/?x=|dir"
+
+
+def test_host_port_matched_at_is_preserved_and_is_not_a_url():
+    """Nuclei falls back to `host` when matched-at is absent (e.g. SSH findings), so a
+    matched_at is not always an http(s) URL. It must be preserved verbatim -- and anything
+    that later fetches a location must treat these as NOT fetchable."""
+    for value in ("brightvision-og.com:22", "system.brightvision-og.com"):
+        _, _, matched = _parse_fingerprint(f"ssh-sha1-hmac-algo||{value}")
+        assert matched == value
+        assert not matched.startswith(("http://", "https://"))
+
+
+def test_piped_urls_stay_distinct_findings_and_group_correctly():
+    """5/6: two payload-bearing URLs of one template are distinct LOCATIONS of ONE
+    vulnerability -- fingerprints differ (no wrong dedup), grouping yields one finding."""
+    base = "https://universities.brightvision-og.com/university"
+    fp_a = f"unix-command-injection|time-based|{base}/nilai-university/?lang=|sleep+5"
+    fp_b = f"unix-command-injection|time-based|{base}/segi-university/?lang=|sleep+5"
+    assert fp_a != fp_b                                   # dedup keeps them separate
+    a = _vuln_row_with_fingerprint(fp_a)
+    b = _vuln_row_with_fingerprint(fp_b)
+    assert a.matched_at != b.matched_at
+    groups = render._finding_groups([a, b])
+    assert len(groups) == 1                               # one vulnerability
+    assert len(groups[0]["matched_ats"]) == 2             # two real locations
+    assert all(u.startswith("https://") for u in groups[0]["matched_ats"])

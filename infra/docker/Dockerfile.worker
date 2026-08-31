@@ -68,6 +68,9 @@ RUN --mount=type=secret,id=extra_ca \
     && rm -f /tmp/ca-build.pem
 
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
+# Worker-only extras (playwright). Kept in a separate file so the API image, which never
+# captures screenshots, does not pull a browser driver.
+COPY apps/api/requirements-worker.txt ./apps/api/requirements-worker.txt
 # PyPI over HTTPS -- same optional-secret pattern as above.
 RUN --mount=type=secret,id=extra_ca \
     if [ -f /run/secrets/extra_ca ]; then \
@@ -76,7 +79,47 @@ RUN --mount=type=secret,id=extra_ca \
                REQUESTS_CA_BUNDLE=/tmp/ca-build.pem; \
     fi; \
     pip install --no-cache-dir -r apps/api/requirements.txt \
+    && pip install --no-cache-dir -r apps/api/requirements-worker.txt \
     && rm -f /tmp/ca-build.pem
+
+# Chromium for screenshot evidence. `chromium` alone (not "all") keeps Firefox/WebKit out of
+# the image. Runs as root because it installs OS packages, before the USER appuser switch.
+#
+# The system libraries are installed EXPLICITLY rather than via `playwright install
+# --with-deps`. That flag hardcodes Ubuntu package names, two of which (ttf-unifont,
+# ttf-ubuntu-font-family) do not exist in this image's Debian base -- apt then exits 100 and
+# aborts the WHOLE dependency install, so Chromium's real libraries never land. The list below
+# is the same set of runtime libraries under their Debian names, verified to let Chromium
+# launch (v131).
+#
+# `--only-shell` installs ONLY chromium_headless_shell and skips the full headed Chromium.
+# That is not a guess: from Playwright 1.49, `chromium.launch(headless=True)` -- exactly what
+# screenshot.py calls -- executes chromium_headless_shell/headless_shell, verified by reading
+# /proc/*/exe of the live browser process. The headed build (549MB) is never executed by this
+# application, while the shell (309MB) is; deleting the shell instead breaks launch outright.
+# Using the supported flag rather than deleting directories keeps the install self-consistent,
+# so Playwright never tries to re-download what was pruned.
+#
+# This step is deliberately NOT best-effort: if Chromium cannot be installed the build FAILS.
+# A worker image that silently lacks a browser would report a successful build while every
+# capture failed soft at runtime, producing no evidence and no obvious cause.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN --mount=type=secret,id=extra_ca \
+    set -eux; \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export SSL_CERT_FILE=/tmp/ca-build.pem REQUESTS_CA_BUNDLE=/tmp/ca-build.pem; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libxcb1 libxkbcommon0 libatspi2.0-0 libx11-6 libxcomposite1 \
+        libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+        libcairo2 libasound2 fonts-liberation fonts-dejavu-core; \
+    rm -rf /var/lib/apt/lists/*; \
+    playwright install --only-shell chromium; \
+    chmod -R a+rX /ms-playwright; \
+    rm -f /tmp/ca-build.pem
 
 # Run scans as an unprivileged user. The default recon config uses connect scans
 # (naabu/nmap) which do NOT need root/raw sockets, so no capabilities are lost.

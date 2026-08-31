@@ -891,6 +891,89 @@ async def _graph_findings(db: AsyncSession, scan: Scan) -> list:
     ]
 
 
+async def _maybe_capture_screenshot(
+    db: AsyncSession,
+    *,
+    vuln,
+    matched_at: str | None,
+    tool_run_id,
+    target_type: str,
+    target_value: str,
+    extra_authorized_hosts,
+) -> None:
+    """Capture and persist a screenshot of a finding's affected URL. BEST EFFORT.
+
+    Uses the EXISTING evidence model -- one Evidence row with evidence_type='screenshot'
+    (a free-form varchar; no schema change) linked to this vulnerability through the
+    EXISTING VulnerabilityEvidence M:N table. That gives the report a per-FINDING image
+    rather than the per-tool-run log excerpt every finding currently shares.
+
+    Every failure mode -- feature off, ineligible URL, blocked scope/SSRF, browser missing,
+    timeout, oversize image, storage outage -- leaves the finding, its existing evidence and
+    the scan completely untouched. Nothing is written unless a real image was captured and
+    stored, so no empty or placeholder screenshot evidence can ever exist."""
+    from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+    from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
+    from apps.api.scanner_engine import screenshot as screenshot_mod
+
+    if not screenshot_mod.is_enabled():
+        return
+
+    eligibility = screenshot_mod.check_eligibility(
+        matched_at,
+        vuln.severity,
+        target_type,
+        target_value,
+        extra_authorized_hosts=extra_authorized_hosts,
+    )
+    if not eligibility.eligible:
+        logger.debug(
+            "screenshot.skipped vuln=%s reason=%s", vuln.id, eligibility.reason
+        )
+        return
+
+    try:
+        image = await screenshot_mod.capture_screenshot(
+            eligibility.url,
+            target_type,
+            target_value,
+            extra_authorized_hosts=extra_authorized_hosts,
+        )
+    except Exception:  # noqa: BLE001 -- capture_screenshot already swallows, belt and braces
+        logger.warning("screenshot.capture_raised vuln=%s", vuln.id, exc_info=True)
+        return
+    if not image:
+        return  # failure already logged; never fabricate evidence
+
+    try:
+        # Storage is blocking boto3 -> off the event loop, like the raw-output path.
+        storage_uri, checksum = await asyncio.to_thread(
+            evidence_store.store_screenshot, vuln.id, image
+        )
+    except Exception:  # noqa: BLE001 -- a storage outage must not fail the scan
+        logger.warning("screenshot.store_failed vuln=%s", vuln.id, exc_info=True)
+        return
+
+    shot = Evidence(
+        tool_run_id=tool_run_id,
+        evidence_type="screenshot",
+        storage_uri=storage_uri,
+        checksum=checksum,
+    )
+    db.add(shot)
+    await db.flush()  # need shot.id for the link row
+
+    # Idempotent link, mirroring ingest_finding: a re-scan that recaptures the same page
+    # writes the same (vulnerability, evidence) pair rather than raising a duplicate key.
+    stmt = mysql_insert(VulnerabilityEvidence.__table__).values(
+        vulnerability_id=vuln.id, evidence_id=shot.id, tool_run_id=tool_run_id
+    )
+    stmt = stmt.on_duplicate_key_update(tool_run_id=VulnerabilityEvidence.tool_run_id)
+    await db.execute(stmt)
+    logger.info("screenshot.captured vuln=%s bytes=%d uri=%s", vuln.id, len(image), storage_uri)
+
+
 async def _run_exploitation_phase(db: AsyncSession, scan: Scan, target_row, roe, base_step_no: int) -> list:
     """Deterministic, gated exploitation of this scan's confirmed findings using
     curated modules. Non-destructive by construction. Every attempt is triple-gated:
@@ -1242,6 +1325,16 @@ async def _run_single_tool(
         await upsert_risk_score(db, vuln.id, vuln.cvss_score, criticality)
         await sync_mappings(db, vuln.id, vuln.category)
         await sync_attack_mappings(db, vuln.id, vuln.category, vuln_finding.metadata)
+        # Visual evidence for non-info web findings (best effort -- never fails the scan).
+        await _maybe_capture_screenshot(
+            db,
+            vuln=vuln,
+            matched_at=vuln_finding.matched_at,
+            tool_run_id=tool_run.id,
+            target_type=target_type,
+            target_value=target_value,
+            extra_authorized_hosts=extra_scope_hosts,
+        )
 
     tool_run.status = status
     tool_run.completed_at = datetime.now(timezone.utc)

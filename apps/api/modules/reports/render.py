@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from apps.api.modules.compliance.catalog import framework_name
 from apps.api.modules.reports.data import _ACTIVE_STATUSES, _SEVERITY_ORDER, ReportData, VulnRow
+from apps.api.modules.reports.scoring import issue_key
 
 # Rank a severity for deterministic tie-breaking: critical=highest. Mirrors data._SEVERITY_ORDER
 # (critical..info) so "higher severity first" is a single source of truth. Unknown severities
@@ -77,6 +78,118 @@ def _top_risk_groups(vulns) -> list[dict]:
         )
     )
     return groups
+
+def _finding_groups(vulns) -> list[dict]:
+    """Technical Report findings, aggregated per underlying vulnerability (presentation only).
+
+    The Technical Report used to render one block per VulnRow. A row is one
+    (template_id|matcher|matched_at) fingerprint -- one LOCATION, not one issue -- so a single
+    template observed at 24 URLs produced 24 near-identical blocks, repeating the same severity,
+    CVSS, risk, category and compliance text each time. On the real dataset that turned 21
+    distinct issue types into 201 blocks. This collapses them into one block per vulnerability
+    with the affected locations listed underneath.
+
+    Grouping key is `issue_key` from scoring.py -- the SAME identity the Security Score and the
+    Executive Report's _top_risk_groups already use (template_id, falling back to title for
+    legacy/non-nuclei rows). Reusing it is the point: all three surfaces now agree on what "one
+    vulnerability" means, and the identity was validated against the database in the scoring work
+    (no template_id spans more than one title/severity/CVSS/category).
+
+    Unlike _top_risk_groups this keeps EVERY finding -- no active-status or scored-only filter --
+    because the Technical Report is the full record: fixed, false-positive and unscored findings
+    must still appear.
+
+    Each group dict carries:
+      * title/severity/status/category/cvss_score/cvss_vector/final_risk_score/risk_rationale --
+        taken from the group's representative row (highest severity, then highest CVSS), so the
+        header states the worst case rather than an arbitrary member;
+      * matched_ats     -- every DISTINCT location, sorted, None dropped;
+      * unlocated_count -- members with no matched_at, so they are not silently lost;
+      * occurrence_count-- how many rows the group aggregates;
+      * template_id/matcher_names -- provenance; matcher_names is sorted+deduped because one
+        template can match via several matchers;
+      * compliance/evidence_uris  -- union across members, deduped, order-stable.
+
+    Vulnerability identity, fingerprints, DB deduplication, matched_at parsing, the Security
+    Score and the Executive Report are all untouched: this only regroups already-persisted rows
+    for display."""
+    buckets: dict[str, list] = {}
+    for v in vulns:
+        buckets.setdefault(issue_key(v), []).append(v)
+
+    def _rep_key(v):
+        # Worst-case representative: highest severity, then highest CVSS. A None CVSS sorts
+        # below a real 0.0 so a scored member is preferred as the representative.
+        return (
+            _SEVERITY_RANK.get(v.severity, 0),
+            v.cvss_score if v.cvss_score is not None else -1.0,
+        )
+
+    groups: list[dict] = []
+    for key, members in buckets.items():
+        rep = max(members, key=_rep_key)
+
+        matched_ats = sorted({m.matched_at for m in members if m.matched_at})
+        unlocated = sum(1 for m in members if not m.matched_at)
+
+        compliance: list[tuple[str, str, str]] = []
+        for m in members:
+            for c in m.compliance or []:
+                if c not in compliance:
+                    compliance.append(c)
+
+        evidence_uris: list[str] = []
+        for m in members:
+            for uri in m.evidence_uris or []:
+                if uri not in evidence_uris:
+                    evidence_uris.append(uri)
+
+        # Screenshots for this vulnerability, deduplicated BY CHECKSUM: two locations that
+        # rendered byte-identical pages contribute one image, while genuinely different pages
+        # each keep their own. Dedup is on content, never on "same finding" -- distinct
+        # locations with distinct screenshots stay distinct.
+        screenshots: list[tuple[str, str]] = []
+        seen_checksums: set[str] = set()
+        for m in members:
+            for uri, checksum in getattr(m, "screenshots", None) or []:
+                if checksum in seen_checksums:
+                    continue
+                seen_checksums.add(checksum)
+                screenshots.append((uri, checksum))
+
+        groups.append(
+            {
+                "key": key,
+                "title": rep.title,
+                "severity": rep.severity,
+                "status": rep.status,
+                "category": rep.category,
+                "cvss_score": rep.cvss_score,
+                "cvss_vector": rep.cvss_vector,
+                "final_risk_score": rep.final_risk_score,
+                "risk_rationale": rep.risk_rationale,
+                "template_id": rep.template_id,
+                "matcher_names": sorted({m.matcher_name for m in members if m.matcher_name}),
+                "matched_ats": matched_ats,
+                "unlocated_count": unlocated,
+                "occurrence_count": len(members),
+                "compliance": sorted(compliance),
+                "evidence_uris": evidence_uris,
+                "screenshots": screenshots,
+            }
+        )
+
+    # Deterministic: severity DESC, then CVSS DESC, then title ASC, then key ASC.
+    groups.sort(
+        key=lambda g: (
+            -_SEVERITY_RANK.get(g["severity"], 0),
+            -(g["cvss_score"] if g["cvss_score"] is not None else -1.0),
+            g["title"] or "",
+            g["key"],
+        )
+    )
+    return groups
+
 
 _SEVERITY_COLORS = {
     "critical": "#7f1d1d",
@@ -377,55 +490,124 @@ def render_technical(data: ReportData) -> bytes:
         doc.build(story)
         return buf.getvalue()
 
-    for i, v in enumerate(data.vulns, 1):
-        story.append(_finding_block(i, v, styles, colors, Paragraph, Table, TableStyle, mm))
+    # One block per VULNERABILITY, not per row: a template observed at many URLs is a single
+    # finding with its affected locations listed, instead of the same severity/CVSS/risk text
+    # repeated once per location. Presentation only -- see _finding_groups.
+    for i, g in enumerate(_finding_groups(data.vulns), 1):
+        story.append(_finding_block(i, g, styles, colors, Paragraph, Table, TableStyle, mm))
         story.append(Spacer(1, 4 * mm))
 
     doc.build(story)
     return buf.getvalue()
 
 
-def _finding_block(idx, v: VulnRow, styles, colors, Paragraph, Table, TableStyle, mm):
+def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, mm):
+    """Render ONE vulnerability (a group from _finding_groups), with its affected locations
+    listed once at the end instead of the whole block repeating per location."""
     from reportlab.platypus import KeepTogether
 
-    color = _SEVERITY_COLORS.get(v.severity, "#374151")
+    color = _SEVERITY_COLORS.get(g["severity"], "#374151")
     parts = [
-        Paragraph(f"{idx}. {_esc(v.title)}", styles["H2"]),
+        Paragraph(f"{idx}. {_esc(g['title'])}", styles["H2"]),
         Paragraph(
-            f'<font color="{color}"><b>{v.severity.upper()}</b></font> · status: {_esc(v.status)}'
+            f'<font color="{color}"><b>{g["severity"].upper()}</b></font> · status: {_esc(g["status"])}'
             # `is not None`, never truthiness: a real CVSS of 0.0 must show as "CVSS 0.0",
             # only a genuinely absent score (None) shows "CVSS N/A". `x or 0.0`-style logic
             # would wrongly collapse 0.0 into a fallback, and `if not x` would wrongly treat
             # 0.0 as missing. This is representation only -- the stored score is untouched.
-            + (f" · CVSS {v.cvss_score}" if v.cvss_score is not None else " · CVSS N/A")
-            + (f" · risk {v.final_risk_score:.1f}" if v.final_risk_score is not None else ""),
+            + (f" · CVSS {g['cvss_score']}" if g["cvss_score"] is not None else " · CVSS N/A")
+            + (f" · risk {g['final_risk_score']:.1f}" if g["final_risk_score"] is not None else ""),
             styles["Body"],
         ),
     ]
-    # WHERE the finding was observed (Phase 1). Always shown -- N/A when unavailable -- so two
-    # findings that share a title/severity but hit different URLs/params are distinguishable in
-    # the report rather than looking like duplicates. matched_at can be a long URL, so it is
-    # rendered in the monospace style and word-wraps like the evidence URIs below.
-    parts.append(Paragraph(f"Template: {_esc(v.template_id or 'N/A')}", styles["Small"]))
-    parts.append(Paragraph(f"Matcher: {_esc(v.matcher_name or 'N/A')}", styles["Small"]))
-    parts.append(Paragraph(f"Matched at: {_esc(v.matched_at or 'N/A')}", styles["Mono"]))
-    parts.append(Paragraph(f"Status: {_esc(v.status or 'N/A')}", styles["Small"]))
-    if v.category:
-        parts.append(Paragraph(f"Category: {_esc(v.category)}", styles["Small"]))
-    if v.cvss_vector:
-        parts.append(Paragraph(f"CVSS vector: {_esc(v.cvss_vector)}", styles["Small"]))
-    if v.risk_rationale:
-        parts.append(Paragraph(f"Risk: {_esc(v.risk_rationale)}", styles["Small"]))
-    if v.compliance:
-        controls = "; ".join(f"{framework_name(fw)} {cid}" for (fw, cid, _) in v.compliance)
+    parts.append(Paragraph(f"Template: {_esc(g['template_id'] or 'N/A')}", styles["Small"]))
+    parts.append(
+        Paragraph(f"Matcher: {_esc(', '.join(g['matcher_names']) or 'N/A')}", styles["Small"])
+    )
+    parts.append(Paragraph(f"Status: {_esc(g['status'] or 'N/A')}", styles["Small"]))
+    if g["category"]:
+        parts.append(Paragraph(f"Category: {_esc(g['category'])}", styles["Small"]))
+    if g["cvss_vector"]:
+        parts.append(Paragraph(f"CVSS vector: {_esc(g['cvss_vector'])}", styles["Small"]))
+    if g["risk_rationale"]:
+        parts.append(Paragraph(f"Risk: {_esc(g['risk_rationale'])}", styles["Small"]))
+    if g["compliance"]:
+        controls = "; ".join(f"{framework_name(fw)} {cid}" for (fw, cid, _) in g["compliance"])
         parts.append(Paragraph(f"Compliance: {_esc(controls)}", styles["Small"]))
-    if v.evidence_uris:
+
+    # WHERE the finding was observed. Listed once per DISTINCT location under the single
+    # finding, so one issue across many endpoints reads as one vulnerability with a breadth
+    # count -- not as many separate vulnerabilities. Long URLs word-wrap in the mono style.
+    locations = g["matched_ats"]
+    if locations:
+        parts.append(Paragraph(f"Affected locations ({len(locations)}):", styles["Small"]))
+        for loc in locations:
+            parts.append(Paragraph(f"• {_esc(loc)}", styles["Mono"]))
+        # Occurrences with no matched_at are still real findings; say so rather than drop them.
+        if g["unlocated_count"]:
+            parts.append(
+                Paragraph(
+                    f"• (+{g['unlocated_count']} occurrence(s) with no recorded location)",
+                    styles["Small"],
+                )
+            )
+    else:
+        parts.append(Paragraph("Affected locations: N/A", styles["Small"]))
+
+    if g["evidence_uris"]:
         parts.append(Paragraph("Evidence:", styles["Small"]))
-        for uri in v.evidence_uris:
+        for uri in g["evidence_uris"]:
             parts.append(Paragraph(f"• {_esc(uri)}", styles["Mono"]))
     else:
         parts.append(Paragraph("Evidence: (none linked)", styles["Small"]))
+
+    # Visual evidence, embedded under the finding it belongs to. Fail-soft at every step:
+    # a screenshot that cannot be fetched or decoded is simply omitted (the finding and the
+    # rest of the report still render), and nothing is drawn when there are none.
+    for uri, checksum in g.get("screenshots") or []:
+        image = _screenshot_flowable(uri, mm)
+        if image is None:
+            continue
+        parts.append(Paragraph(f"Screenshot ({_esc(checksum[:12])}):", styles["Small"]))
+        parts.append(image)
     return KeepTogether(parts)
+
+
+def _screenshot_flowable(storage_uri: str, mm):
+    """Fetch a stored screenshot and return a reportlab Image scaled to the page width.
+
+    Returns None on ANY problem -- missing object, storage outage, unreadable bytes -- so a
+    broken image can never break report generation. Reading happens here, at render time;
+    the capture itself ran during the scan (see scanner_engine/screenshot.py)."""
+    from io import BytesIO
+
+    try:
+        from reportlab.platypus import Image as RLImage
+
+        from apps.api.scanner_engine.storage_provider import get_storage_provider
+
+        # s3://bucket/key -> key. Anything else is not a fetchable evidence object.
+        if not storage_uri.startswith("s3://"):
+            return None
+        _, _, rest = storage_uri.partition("s3://")
+        bucket, _, key = rest.partition("/")
+        if not key:
+            return None
+
+        data = get_storage_provider(bucket).get(key)
+        if not data:
+            return None
+
+        img = RLImage(BytesIO(data))
+        # Scale to fit the printable width while preserving aspect ratio.
+        max_width = 160 * mm
+        if img.imageWidth and img.imageWidth > max_width:
+            ratio = max_width / float(img.imageWidth)
+            img.drawWidth = max_width
+            img.drawHeight = img.imageHeight * ratio
+        return img
+    except Exception:  # noqa: BLE001 -- evidence is decorative; the report must still build
+        return None
 
 
 def _styles(getSampleStyleSheet, ParagraphStyle, colors):

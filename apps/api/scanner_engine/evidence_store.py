@@ -38,3 +38,28 @@ def store_raw_output(tool_run_id: uuid.UUID, content: bytes, content_type: str =
     client.put_object(Bucket=settings.s3_bucket_evidence, Key=key, Body=content, ContentType=content_type)
 
     return f"s3://{settings.s3_bucket_evidence}/{key}", checksum
+
+
+def store_screenshot(vulnerability_id: uuid.UUID, content: bytes) -> tuple[str, str]:
+    """Upload a PNG screenshot for one vulnerability. Returns (storage_uri, sha256_checksum).
+
+    Keyed by vulnerability + content checksum, which gives three things for free:
+      * the object is addressable per FINDING, not just per tool run;
+      * re-capturing an unchanged page overwrites the same key instead of accumulating
+        near-duplicate objects across re-scans (the write is idempotent);
+      * the checksum in the key is the same value stored on the Evidence row, so the report
+        layer can deduplicate byte-identical screenshots without downloading them.
+
+    Mirrors store_raw_output (same bucket, same client, same return shape) so evidence
+    handling stays uniform. Binary-safe: the content type is image/png, not text."""
+    settings = get_settings()
+    client = _get_s3_client()
+    _ensure_bucket(client, settings.s3_bucket_evidence)
+
+    checksum = hashlib.sha256(content).hexdigest()
+    key = f"vulnerabilities/{vulnerability_id}/screenshot-{checksum[:16]}.png"
+    client.put_object(
+        Bucket=settings.s3_bucket_evidence, Key=key, Body=content, ContentType="image/png"
+    )
+
+    return f"s3://{settings.s3_bucket_evidence}/{key}", checksum

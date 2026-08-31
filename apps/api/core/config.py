@@ -217,6 +217,12 @@ class Settings(BaseSettings):
     # findings are recorded as observations but never actively scanned (fail closed).
     # Kill-switch only -- default True (secure); set False to restore prior behavior.
     scan_enforce_derived_scope: bool = True
+    # Screenshot evidence: capture the affected page for non-info web findings during a scan,
+    # so the Technical Report can show it. OFF by default -- it requires Playwright + Chromium
+    # in the WORKER image, so a deployment without them must not try (and fail) on every
+    # finding. Capture is best effort and fully gated by the existing scope/SSRF guards; see
+    # scanner_engine/screenshot.py.
+    screenshot_evidence_enabled: bool = False
     # EMERGENCY-ONLY acknowledgement to run in PRODUCTION with the control above
     # DISABLED. Left False, production refuses to start when derived-scope enforcement
     # is off (M4.6.1 / F2). Do NOT set this for convenience -- it turns off a security
