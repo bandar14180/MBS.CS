@@ -235,3 +235,149 @@ def test_classify_row_tolerates_rows_without_cve_or_tags():
         title = "Apache Detection"
 
     assert classify_row(Bare()) == DETECTION
+
+
+# =========================================================================================
+# P2-3 -- classification is exposed on the API, derived from the canonical classifier
+# =========================================================================================
+# P1 made DETECTION findings non-scorable. Without this field a client sees an open
+# medium-severity finding that contributes nothing to the security score and has no way to
+# tell why -- the PDF said DETECTION, the API did not. The field is DERIVED on read (not a
+# column): it is a pure function of data already stored, so persisting it would go stale
+# whenever the classifier changes and would need a migration plus a backfill.
+
+import datetime
+
+
+def _orm_vuln(fingerprint, title, cvss, category=None, severity="medium", status="open"):
+    """A stand-in for the ORM Vulnerability row that VulnerabilityRead validates from."""
+
+    class _V:
+        pass
+
+    v = _V()
+    v.id = uuid.uuid4()
+    v.project_id = uuid.uuid4()
+    v.asset_id = None
+    v.first_detected_scan_id = None
+    v.last_seen_scan_id = None
+    v.fingerprint = fingerprint
+    v.title = title
+    v.category = category
+    v.description = None
+    v.severity = severity
+    v.cvss_vector = None
+    v.cvss_score = cvss
+    v.status = status
+    v.status_justification = None
+    v.ai_validated = False
+    v.ai_confidence = None
+    v.created_at = datetime.datetime.now(datetime.timezone.utc)
+    v.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    return v
+
+
+def _classification_of(fingerprint, title, cvss, category=None):
+    from apps.api.modules.vulnerabilities.schemas import VulnerabilityRead
+
+    return VulnerabilityRead.model_validate(
+        _orm_vuln(fingerprint, title, cvss, category)
+    ).classification
+
+
+def test_api_exposes_classification_field():
+    from apps.api.modules.vulnerabilities.schemas import VulnerabilityRead
+
+    dumped = VulnerabilityRead.model_validate(
+        _orm_vuln("tech-detect|m|https://h/", "Apache Detection", None, "cwe-200")
+    ).model_dump()
+    assert "classification" in dumped
+
+
+def test_api_marks_a_technology_detection_as_detection():
+    assert _classification_of("tech-detect|m|https://h/", "Apache Tomcat", None, "cwe-200") == "detection"
+
+
+def test_api_marks_a_waf_detection_as_detection():
+    assert _classification_of("waf-detect|m|https://h/", "WAF Detection", None, "cwe-200") == "detection"
+
+
+def test_api_marks_a_real_vulnerability_as_vulnerability():
+    assert _classification_of("unix-command-injection|m|https://h/", "Command Injection", 9.8, "cwe-78") == "vulnerability"
+
+
+def test_api_cve_recovery_regression():
+    """P1's _recover_cve must still apply through the API path: a CVE in a detection-named
+    template is a VULNERABILITY, never hidden as a bare detection."""
+    assert _classification_of(
+        "apache-detect-cve-2021-41773|m|https://h/", "CVE-2021-41773 Path Traversal", None
+    ) == "vulnerability"
+
+
+def test_api_cve_recovered_from_title():
+    assert _classification_of("some-detect|m|https://h/", "Apache CVE-2021-41773 Traversal", None) == "vulnerability"
+
+
+def test_api_detection_guard_not_weakened_by_a_generic_cwe():
+    """A generic CWE is not vulnerability evidence -- it must not flip a detection."""
+    assert _classification_of("tech-detect|m|https://h/", "nginx", None, "cwe-200") == "detection"
+
+
+def test_api_classification_matches_the_report_classifier_exactly():
+    """No duplicated rules: the API must agree with the canonical classifier on every case."""
+    from apps.api.modules.reports.classification import classify_row
+    from apps.api.modules.reports.data import _parse_fingerprint
+
+    cases = [
+        ("tech-detect|m|https://h/", "Apache", None, "cwe-200"),
+        ("waf-detect|m|https://h/", "WAF", None, "cwe-200"),
+        ("unix-command-injection|m|https://h/", "CI", 9.8, "cwe-78"),
+        ("apache-detect-cve-2021-41773|m|https://h/", "CVE-2021-41773", None, None),
+        ("nginx-version|m|https://h/", "nginx version", None, None),
+    ]
+    for fingerprint, title, cvss, category in cases:
+        template_id, _matcher, _matched = _parse_fingerprint(fingerprint)
+
+        class _Row:
+            pass
+
+        row = _Row()
+        row.template_id = template_id
+        row.title = title
+        row.cvss_score = cvss
+        row.category = category
+
+        assert _classification_of(fingerprint, title, cvss, category) == classify_row(row), fingerprint
+
+
+def test_api_classification_is_backward_compatible():
+    """Every pre-existing field is still present -- the change is purely additive."""
+    from apps.api.modules.vulnerabilities.schemas import VulnerabilityRead
+
+    dumped = VulnerabilityRead.model_validate(
+        _orm_vuln("unix-command-injection|m|https://h/", "CI", 9.8, "cwe-78")
+    ).model_dump()
+    for field in ("id", "project_id", "fingerprint", "title", "severity", "cvss_score",
+                  "cvss_vector", "status", "category", "created_at", "updated_at"):
+        assert field in dumped
+
+
+def test_api_classification_handles_a_legacy_fingerprint():
+    """A non-nuclei row (bare hash, no pipes) has no template_id and must not raise."""
+    assert _classification_of("bare-legacy-hash", "Legacy finding", None) in {"vulnerability", "detection"}
+
+
+def test_api_detection_is_excluded_from_the_security_score():
+    """The field explains real behaviour: what the API calls a detection is what the score drops."""
+    from apps.api.modules.reports.scoring import is_scorable
+
+    class _Row:
+        template_id = "tech-detect"
+        title = "Apache Tomcat"
+        cvss_score = None
+        category = "cwe-200"
+        severity = "medium"
+        status = "open"
+
+    assert _classification_of("tech-detect|m|https://h/", "Apache Tomcat", None, "cwe-200") == "detection"
+    assert is_scorable(_Row()) is False

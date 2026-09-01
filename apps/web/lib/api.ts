@@ -315,6 +315,11 @@ export interface ToolRun {
 export interface Vulnerability {
   id: string; title: string; severity: string; status: string; category: string | null;
   cvss_score: number | null; cvss_vector: string | null; description: string | null; created_at: string;
+  // Derived server-side (never stored): "detection" marks a technology/WAF/version
+  // OBSERVATION rather than a weakness. Detections are excluded from the security score,
+  // so the UI must distinguish them -- otherwise an open finding appears to count and
+  // silently does not. Optional: older API responses omit it.
+  classification?: "vulnerability" | "detection";
 }
 export interface RiskScore {
   final_risk_score: number | null; asset_criticality_weight: number; business_impact_score: number | null; rationale: string | null;

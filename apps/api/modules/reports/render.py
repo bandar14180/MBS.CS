@@ -51,10 +51,12 @@ def _top_risk_groups(vulns) -> list[dict]:
     active = [v for v in vulns if v.status in _ACTIVE_STATUSES]
     buckets: dict[str, list] = {}
     for v in active:
-        # `tid:`/`title:` prefixes keep a template_id and an identical-looking title from ever
-        # colliding into one bucket.
-        key = f"tid:{v.template_id}" if v.template_id else f"title:{v.title or ''}"
-        buckets.setdefault(key, []).append(v)
+        # scoring.issue_key -- the CANONICAL issue identity, shared with the Security Score and
+        # _finding_groups. This used to be a second, local implementation using a `tid:` prefix
+        # instead of `template:`. The partition it produced was provably identical (both
+        # branches are prefix-disjoint from `title:`), so this is a de-duplication, not a
+        # behaviour change -- but it removes the risk of the two drifting apart.
+        buckets.setdefault(issue_key(v), []).append(v)
 
     def _member_sort_key(v):
         # A None risk/CVSS sorts BELOW any real value (including 0.0) rather than raising --
@@ -138,16 +140,41 @@ def _finding_groups(vulns) -> list[dict]:
         buckets.setdefault(issue_key(v), []).append(v)
 
     def _rep_key(v):
-        # Worst-case representative: highest severity, then highest CVSS. A None CVSS sorts
-        # below a real 0.0 so a scored member is preferred as the representative.
+        # ISSUE-LEVEL RISK CONTRACT (shared with _top_risk_groups / the Executive report).
+        #
+        # The representative is the member carrying the HIGHEST BUSINESS RISK, then the
+        # highest severity, then the highest CVSS. Risk leads because the Executive "Top
+        # risks" table ranks and prints the group's max final_risk_score: when the two
+        # reports pick their numbers by different keys they disagree about the same issue.
+        #
+        # They could disagree by a wide margin, because final_risk_score is CVSS re-weighted
+        # by asset criticality (risk/service.py: min(10, cvss * weight), weight 0.5..2.0), so
+        # the highest-CVSS member is NOT necessarily the highest-risk one. Real case: one
+        # template at two locations, CVSS 9.0 on a low-criticality asset (risk 4.5) and CVSS
+        # 5.0 on a critical asset (risk 10.0) -- the Executive printed 10.0 while the
+        # Technical block printed 4.5 for the same issue.
+        #
+        # Selecting a single MEMBER (option A) rather than mixing per-field maxima keeps the
+        # block internally coherent: the risk, its rationale, the CVSS and the vector all
+        # describe the same observation. A synthesised "max of each field" row would print a
+        # rationale that does not explain the number beside it.
+        #
+        # None sorts below any real value (including 0.0) so a scored member wins, and the
+        # None-vs-0.0 distinction is preserved -- nothing is coerced.
         return (
+            v.final_risk_score if v.final_risk_score is not None else -1.0,
             _SEVERITY_RANK.get(v.severity, 0),
             v.cvss_score if v.cvss_score is not None else -1.0,
         )
 
     groups: list[dict] = []
     for key, members in buckets.items():
-        rep = max(members, key=_rep_key)
+        # Prefer an ACTIVE member: the Executive table only ever considers active findings, so
+        # picking a fixed/false-positive member here would reintroduce the disagreement from
+        # the other direction. Groups with no active member (a fully remediated issue, which
+        # the Technical report still lists as the full record) fall back to all members.
+        active_members = [m for m in members if m.status in _ACTIVE_STATUSES]
+        rep = max(active_members or members, key=_rep_key)
 
         matched_ats = sorted({m.matched_at for m in members if m.matched_at})
         unlocated = sum(1 for m in members if not m.matched_at)
@@ -450,7 +477,7 @@ def render_executive(data: ReportData) -> bytes:
     story.append(Spacer(1, 6 * mm))
     story.append(Paragraph("MITRE ATT&CK coverage", styles["H2"]))
     if data.attack_techniques:
-        att_rows = [["Tactic", "Technique", "ID", "Findings"]]
+        att_rows = [["Tactic", "Technique", "ID", "Issues"]]
         for tactic, tid, tname, count in data.attack_techniques[:15]:
             att_rows.append([_esc(tactic), Paragraph(_esc(tname), styles["Cell"]), tid, str(count)])
         atbl = Table(att_rows, colWidths=[45 * mm, 70 * mm, 25 * mm, 20 * mm])
@@ -458,13 +485,16 @@ def render_executive(data: ReportData) -> bytes:
         story.append(atbl)
         story.append(
             Paragraph(
-                "Techniques are mapped to the Cyber Kill Chain; see the scan kill-chain view for the "
-                "sequenced attack path.",
+                "“Issues” counts DISTINCT active issues mapped to each technique — not "
+                "endpoints and not raw findings, so one issue seen at many URLs counts once. "
+                "Resolved, accepted-risk, false-positive, informational and detection-only "
+                "findings are excluded, matching the security score. Techniques are mapped to the "
+                "Cyber Kill Chain; see the scan kill-chain view for the sequenced attack path.",
                 styles["Body"],
             )
         )
     else:
-        story.append(Paragraph("No findings mapped to ATT&CK techniques.", styles["Body"]))
+        story.append(Paragraph("No active issues mapped to ATT&CK techniques.", styles["Body"]))
 
     # Autonomous-engagement attack graph (M4.4.6): evidence-backed asset -> service ->
     # finding -> technique -> access relationships, plus any confirmed access. Present

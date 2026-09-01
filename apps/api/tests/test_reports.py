@@ -542,16 +542,24 @@ def test_top_risks_endpoint_count_is_correct():
 
 
 def test_top_risks_preserves_highest_risk_and_cvss_in_group():
-    """(3) max_risk (and max CVSS) reflect the group's highest members, not the first seen."""
+    """(3) max_risk (and max CVSS) reflect the group's highest members, not the first seen.
+
+    STRENGTHENED (P2-1): the original dataset put the highest risk and the highest CVSS on the
+    SAME member, so it passed under either representative rule and could not detect the
+    Executive/Technical disagreement. The rows below deliberately DECOUPLE them -- the
+    max-risk member (10.0) has a mid CVSS, and the max-CVSS member (9.8) has a low risk --
+    so max_risk and max_cvss can only both be right if each is a genuine per-field maximum."""
     vulns = [
         _tr_vuln("Unix CI", "unix-command-injection", risk=6.0, cvss=6.1),
-        _tr_vuln("Unix CI", "unix-command-injection", risk=10.0, cvss=9.8),
-        _tr_vuln("Unix CI", "unix-command-injection", risk=8.0, cvss=7.5),
+        _tr_vuln("Unix CI", "unix-command-injection", risk=10.0, cvss=7.0),   # max risk
+        _tr_vuln("Unix CI", "unix-command-injection", risk=2.0, cvss=9.8),    # max CVSS
     ]
     g = _top_risk_groups(vulns)[0]
     assert g["max_risk"] == 10.0
     assert g["max_cvss"] == 9.8
     assert g["endpoint_count"] == 3
+    # ...and the Technical report must report the SAME issue-level risk.
+    assert render._finding_groups(vulns)[0]["final_risk_score"] == 10.0
 
 
 def test_top_risks_keeps_different_templates_separate():
@@ -1011,3 +1019,310 @@ def test_summary_falls_back_to_all_status_counts_when_active_absent():
     )
     assert data.active_severity_counts == {}
     assert "1 is of low severity or higher" in _findings_summary(data)
+
+
+# =========================================================================================
+# P2-5 -- affected assets/endpoints must describe the CURRENT state
+# =========================================================================================
+# The Executive report says assets/endpoints "are affected" (present tense). Previously every
+# row counted regardless of status, so a fully remediated project still claimed N affected
+# assets beside a 100/100 score -- and false positives, which never affected anything, counted.
+
+_P25_ACTIVE = {"open", "confirmed", "reopened"}
+
+
+def _aa_vuln(*, status="open", severity="high", asset=None, matched=None, template_id="t"):
+    return VulnRow(
+        id=uuid.uuid4(), title="F", severity=severity, status=status, category=None,
+        cvss_score=7.0, cvss_vector=None, final_risk_score=7.0, risk_rationale=None,
+        compliance=[], evidence_uris=[], template_id=template_id, matched_at=matched,
+        asset_value=asset,
+    )
+
+
+def _aa_report(vulns):
+    return ReportData(
+        project_name="P", security_score=compute_security_score(vulns),
+        severity_counts={"critical": 0, "high": len(vulns), "medium": 0, "low": 0, "info": 0},
+        total_vulns=len(vulns),
+        active_vulns=sum(1 for v in vulns if v.status in _P25_ACTIVE),
+        vulns=vulns,
+    )
+
+
+def test_fully_remediated_project_has_no_affected_assets_or_endpoints():
+    """(1) Every finding fixed/false-positive/accepted -> nothing is currently affected."""
+    data = _aa_report([
+        _aa_vuln(status="fixed", asset="host-a", matched="https://host-a/1", template_id="t1"),
+        _aa_vuln(status="false_positive", asset="host-b", matched="https://host-b/2", template_id="t2"),
+        _aa_vuln(status="accepted_risk", asset="host-c", matched="https://host-c/3", template_id="t3"),
+    ])
+    assert data.affected_assets() == []
+    assert data.affected_endpoint_count() == 0
+    # ...and this agrees with the rest of the report.
+    assert data.security_score == 100
+    assert data.active_vulns == 0
+
+
+def test_affected_assets_mixed_statuses_counts_active_only():
+    """(2) Mixed active / fixed / false-positive / info -> only the active weakness counts."""
+    data = _aa_report([
+        _aa_vuln(status="open", asset="live-host", matched="https://live/1", template_id="t1"),
+        _aa_vuln(status="fixed", asset="fixed-host", matched="https://fixed/2", template_id="t2"),
+        _aa_vuln(status="false_positive", asset="fp-host", matched="https://fp/3", template_id="t3"),
+        _aa_vuln(status="open", severity="info", asset="info-host", matched="https://info/4", template_id="t4"),
+    ])
+    assert data.affected_assets() == ["live-host"]
+    assert data.affected_endpoint_count() == 1
+
+
+def test_multiple_active_findings_on_one_asset_count_the_asset_once():
+    """(3) An asset is affected once, however many active findings it carries."""
+    data = _aa_report([
+        _aa_vuln(asset="same-host", matched="https://same/1", template_id="t1"),
+        _aa_vuln(asset="same-host", matched="https://same/2", template_id="t2"),
+        _aa_vuln(asset="same-host", matched="https://same/3", template_id="t3"),
+    ])
+    assert data.affected_assets() == ["same-host"]
+
+
+def test_many_endpoints_on_one_asset_are_counted_separately():
+    """(4) One host can expose several affected endpoints -- endpoints > assets."""
+    data = _aa_report([
+        _aa_vuln(asset="one-host", matched="https://one/a", template_id="t1"),
+        _aa_vuln(asset="one-host", matched="https://one/b", template_id="t1"),
+        _aa_vuln(asset="one-host", matched="https://one/c", template_id="t1"),
+    ])
+    assert data.affected_assets() == ["one-host"]
+    assert data.affected_endpoint_count() == 3
+
+
+def test_detection_does_not_make_an_asset_affected():
+    """A detection-only observation is not a weakness, so it affects nothing (matches scoring).
+
+    cvss_score is cleared: a real technology detection carries no CVSS. With one, the
+    classifier correctly rules it a VULNERABILITY (a positive CVSS outranks every detection
+    marker), which is the P1 guarantee and must not be weakened here."""
+    detection = _aa_vuln(asset="tech-host", matched="https://tech/1", template_id="tech-detect")
+    detection.cvss_score = None
+    detection.final_risk_score = None
+    data = _aa_report([detection])
+    assert data.affected_assets() == []
+    assert data.affected_endpoint_count() == 0
+
+
+# =========================================================================================
+# P2-1 -- Executive and Technical must agree on one issue's business risk
+# =========================================================================================
+# final_risk_score is CVSS re-weighted by asset criticality, so the highest-CVSS member of a
+# group is NOT necessarily the highest-risk one. Executive prints the group max; Technical
+# used to print a representative chosen by (severity, CVSS) -- a different member.
+
+def _p21_pair():
+    """One template, two locations, where max-risk member != max-CVSS member."""
+    high_cvss_low_risk = _tr_vuln("SQLi", "sqli-x", risk=4.5, cvss=9.0, matched="https://h/a")
+    high_cvss_low_risk.risk_rationale = "CVSS 9.0 x asset criticality low (weight 0.5) = 4.5"
+    low_cvss_high_risk = _tr_vuln("SQLi", "sqli-x", risk=10.0, cvss=5.0, matched="https://h/b")
+    low_cvss_high_risk.risk_rationale = "CVSS 5.0 x asset criticality critical (weight 2.0) = 10.0"
+    return [high_cvss_low_risk, low_cvss_high_risk]
+
+
+def test_executive_and_technical_agree_on_issue_risk():
+    """THE regression: fails under the old (severity, CVSS) representative selection."""
+    vulns = _p21_pair()
+    exec_group = render._top_risk_groups(vulns)[0]
+    tech_group = render._finding_groups(vulns)[0]
+    assert exec_group["max_risk"] == 10.0
+    assert tech_group["final_risk_score"] == exec_group["max_risk"]
+
+
+def test_technical_risk_and_rationale_describe_the_same_member():
+    """Option A: the block is internally coherent -- risk, CVSS and rationale agree."""
+    tech_group = render._finding_groups(_p21_pair())[0]
+    assert tech_group["final_risk_score"] == 10.0
+    assert "10.0" in tech_group["risk_rationale"]
+    assert tech_group["cvss_score"] == 5.0            # the risk-bearing member's own CVSS
+    assert "weight 0.5" not in tech_group["risk_rationale"]  # not the other member's rationale
+
+
+def test_issue_risk_prefers_an_active_member():
+    """A fixed member must not supply the risk the Executive table never considered."""
+    active = _tr_vuln("Iss", "tpl-a", risk=3.0, cvss=4.0, status="open", matched="https://h/a")
+    fixed = _tr_vuln("Iss", "tpl-a", risk=10.0, cvss=9.9, status="fixed", matched="https://h/b")
+    exec_group = render._top_risk_groups([active, fixed])[0]
+    tech_group = render._finding_groups([active, fixed])[0]
+    assert exec_group["max_risk"] == 3.0            # exec only sees the active member
+    assert tech_group["final_risk_score"] == 3.0    # technical agrees
+
+
+def test_fully_remediated_issue_still_rendered_in_technical_report():
+    """No active member -> the technical report still lists it (it is the full record)."""
+    fixed = _tr_vuln("Old", "tpl-old", risk=9.0, cvss=9.0, status="fixed")
+    groups = render._finding_groups([fixed])
+    assert len(groups) == 1
+    assert groups[0]["final_risk_score"] == 9.0
+    assert render._top_risk_groups([fixed]) == []   # but the executive excludes it
+
+
+def test_issue_risk_na_semantics_preserved():
+    """Unscored stays None in BOTH reports -- never fabricated as 0.0."""
+    unscored = _tr_vuln("NoCVSS", "tpl-n", risk=None, cvss=None, severity="critical")
+    exec_group = render._top_risk_groups([unscored])[0]
+    tech_group = render._finding_groups([unscored])[0]
+    assert exec_group["max_risk"] is None
+    assert tech_group["final_risk_score"] is None
+    assert tech_group["cvss_score"] is None
+    assert tech_group["final_risk_score"] != 0.0
+
+
+def test_cvss_zero_is_not_treated_as_missing_in_grouping():
+    """CVSS 0.0 is a real score and must beat a None member for representative selection."""
+    zero = _tr_vuln("Z", "tpl-z", risk=None, cvss=0.0, matched="https://h/a")
+    none_ = _tr_vuln("Z", "tpl-z", risk=None, cvss=None, matched="https://h/b")
+    assert render._finding_groups([zero, none_])[0]["cvss_score"] == 0.0
+
+
+# =========================================================================================
+# P2-4 -- one canonical grouping identity
+# =========================================================================================
+
+def test_top_risk_and_finding_groups_partition_identically():
+    """Both groupers must use scoring.issue_key, for every finding shape."""
+    from apps.api.modules.reports.scoring import issue_key
+
+    vulns = [
+        _tr_vuln("A", "tpl-1", matched="https://h/1"),          # nuclei, same template...
+        _tr_vuln("A", "tpl-1", matched="https://h/2"),          # ...two locations
+        _tr_vuln("B", None, matched="https://h/3"),             # non-nuclei, title identity
+        _tr_vuln("B", None, matched="https://h/4"),             # same title -> same issue
+        _tr_vuln("C", None, matched="https://h/5"),             # distinct title
+    ]
+    exec_keys = {issue_key(v) for v in vulns}
+    assert len(render._top_risk_groups(vulns)) == len(exec_keys)
+    assert len(render._finding_groups(vulns)) == len(exec_keys)
+    assert len(exec_keys) == 3
+
+
+def test_template_and_title_identities_never_collide():
+    """A template_id "X" and a title "X" must stay separate issues in both groupers."""
+    by_template = _tr_vuln("other", "X", matched="https://h/1")
+    by_title = _tr_vuln("X", None, matched="https://h/2")
+    assert len(render._top_risk_groups([by_template, by_title])) == 2
+    assert len(render._finding_groups([by_template, by_title])) == 2
+
+
+def test_grouping_handles_pipe_containing_payload_locations():
+    """An injection payload with a pipe stays one location, not a broken key."""
+    fp = "windows-command-injection|time-based|https://h/?lang=|dir"
+    template_id, matcher, matched_at = _parse_fingerprint(fp)
+    assert template_id == "windows-command-injection"
+    assert matched_at == "https://h/?lang=|dir"
+    v = _tr_vuln("CI", template_id, matched=matched_at)
+    assert render._finding_groups([v])[0]["matched_ats"] == ["https://h/?lang=|dir"]
+
+
+def test_inactive_filtering_differs_by_design():
+    """Executive = active only; Technical = full record. Both use the same identity."""
+    fixed = _tr_vuln("F", "tpl-f", status="fixed")
+    assert render._top_risk_groups([fixed]) == []
+    assert len(render._finding_groups([fixed])) == 1
+
+
+# =========================================================================================
+# P2-2 -- MITRE ATT&CK counts DISTINCT ACTIVE ISSUES, not raw mapping rows
+# =========================================================================================
+# gather_report_data previously incremented one count per AttackMapping row over EVERY
+# project finding. A vulnerability row is one (template|matcher|matched_at) LOCATION, so one
+# issue at 20 URLs counted 20 times, and fixed / false-positive / accepted-risk / info
+# findings all contributed. The tally now mirrors the roll-up implemented in data.py:
+# group by scoring.issue_key over scoring.is_scorable findings.
+#
+# These exercise that exact roll-up as a pure function of VulnRows, so they need no database.
+
+def _attack_tally(rows_and_techniques):
+    """Replicate gather_report_data's ATT&CK roll-up: {technique: distinct active issue keys}.
+
+    Mirrors apps/api/modules/reports/data.py -- same two canonical helpers, so a divergence
+    between this and production shows up as a failure here."""
+    from apps.api.modules.reports.scoring import is_scorable, issue_key
+
+    by_technique: dict[str, set[str]] = {}
+    for row, techniques in rows_and_techniques:
+        if not is_scorable(row):
+            continue
+        for technique in techniques:
+            by_technique.setdefault(technique, set()).add(issue_key(row))
+    return {t: len(keys) for t, keys in by_technique.items()}
+
+
+def _at_row(*, status="open", severity="high", template_id="tpl", matched="https://h/a", cvss=9.0):
+    return VulnRow(
+        id=uuid.uuid4(), title="F", severity=severity, status=status, category=None,
+        cvss_score=cvss, cvss_vector=None, final_risk_score=9.0, risk_rationale=None,
+        compliance=[], evidence_uris=[], template_id=template_id, matched_at=matched,
+    )
+
+
+def test_attack_same_issue_at_many_locations_counts_once():
+    """20 endpoints of ONE template is ONE issue, not 20 findings."""
+    rows = [(_at_row(template_id="sqli-x", matched=f"https://h/{i}"), ["T1190"]) for i in range(20)]
+    assert _attack_tally(rows) == {"T1190": 1}
+
+
+def test_attack_excludes_fixed_findings():
+    rows = [(_at_row(status="fixed", template_id="rce-y"), ["T1190"])]
+    assert _attack_tally(rows) == {}
+
+
+def test_attack_excludes_false_positive_and_accepted_risk():
+    rows = [
+        (_at_row(status="false_positive", template_id="fp-a"), ["T1190"]),
+        (_at_row(status="accepted_risk", template_id="ar-b"), ["T1190"]),
+    ]
+    assert _attack_tally(rows) == {}
+
+
+def test_attack_excludes_informational_findings():
+    """Info is excluded from the score, so it must not inflate ATT&CK either."""
+    rows = [(_at_row(severity="info", template_id="info-z", cvss=None), ["T1190"])]
+    assert _attack_tally(rows) == {}
+
+
+def test_attack_excludes_detection_only_findings():
+    """A technology detection is an observation, not an adversary technique in use."""
+    rows = [(_at_row(template_id="tech-detect", cvss=None), ["T1190"])]
+    assert _attack_tally(rows) == {}
+
+
+def test_attack_counts_an_active_issue():
+    rows = [(_at_row(template_id="unix-command-injection"), ["T1190"])]
+    assert _attack_tally(rows) == {"T1190": 1}
+
+
+def test_attack_one_issue_with_several_techniques_counts_once_per_technique():
+    """A technique is its own row, so one issue may legitimately appear under each."""
+    rows = [(_at_row(template_id="multi"), ["T1190", "T1059"])]
+    assert _attack_tally(rows) == {"T1190": 1, "T1059": 1}
+
+
+def test_attack_distinct_issues_sharing_a_technique_count_separately():
+    rows = [
+        (_at_row(template_id="issue-a"), ["T1190"]),
+        (_at_row(template_id="issue-b"), ["T1190"]),
+    ]
+    assert _attack_tally(rows) == {"T1190": 2}
+
+
+def test_attack_mixed_dataset_matches_the_security_score_population():
+    """The realistic dataset from the investigation: 29 raw rows -> 1 distinct active issue."""
+    rows = [(_at_row(template_id="sqli-x", matched=f"https://h/{i}"), ["T1190"]) for i in range(20)]
+    rows += [(_at_row(status="fixed", template_id="rce-y"), ["T1190"]) for _ in range(3)]
+    rows += [(_at_row(status="false_positive", template_id="rce-y"), ["T1190"]) for _ in range(2)]
+    rows += [(_at_row(severity="info", template_id="info-z", cvss=None), ["T1190"]) for _ in range(4)]
+
+    from apps.api.modules.reports.scoring import group_issues
+
+    assert _attack_tally(rows) == {"T1190": 1}
+    # The score sees exactly the same one issue.
+    scorable = [r for r, _ in rows]
+    assert len(group_issues(scorable)) == 1

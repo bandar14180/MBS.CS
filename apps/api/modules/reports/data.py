@@ -8,7 +8,7 @@ from apps.api.modules.assets.models import Asset
 from apps.api.modules.attack.models import AttackMapping
 from apps.api.modules.compliance.models import ComplianceMapping
 from apps.api.modules.projects.models import Project
-from apps.api.modules.reports.scoring import ACTIVE_STATUSES, compute_security_score
+from apps.api.modules.reports.scoring import ACTIVE_STATUSES, compute_security_score, is_scorable, issue_key
 from apps.api.modules.reports.classification import classify_row
 from apps.api.modules.risk.models import RiskScore
 from apps.api.modules.vulnerabilities.models import Vulnerability
@@ -127,19 +127,40 @@ class ReportData:
     # privilege escalation / lateral movement).
     attack_graph: dict = field(default_factory=dict)
 
+    def _currently_affecting(self):
+        """The findings that justify a PRESENT-TENSE "is affected" claim.
+
+        The Executive report says assets/endpoints "are affected", so the population must be
+        the one that is still true: ACTIVE status and an actual scorable weakness. Both
+        conditions come from scoring.is_scorable -- the SAME predicate the Security Score
+        uses -- so there is exactly one definition of "counts against posture" in the
+        codebase (it composes ACTIVE_STATUSES with the info-severity and DETECTION
+        exclusions). Deliberately not a second status list.
+
+        Previously every row counted regardless of status, so a fully remediated project
+        still reported "N asset(s) are affected" beside a 100/100 score and an empty Top
+        Risks table -- and a FALSE POSITIVE, which never affected anything, was counted too."""
+        from apps.api.modules.reports.scoring import is_scorable
+
+        return [v for v in self.vulns if is_scorable(v)]
+
     def affected_assets(self) -> list[str]:
-        """Distinct inventoried asset/host values (assets.value) across the findings, sorted.
-        Only non-null asset links -- a finding with no asset_id contributes nothing, so the
-        Executive report never implies an asset is affected when the linkage is absent. Pure
-        (derived from self.vulns), so it adds no query and is directly testable."""
-        return sorted({v.asset_value for v in self.vulns if v.asset_value})
+        """Distinct inventoried asset/host values (assets.value) that are CURRENTLY affected,
+        sorted. Only non-null asset links -- a finding with no asset_id contributes nothing, so
+        the Executive report never implies an asset is affected when the linkage is absent.
+        Only active, scorable findings count (see _currently_affecting): a fixed,
+        false-positive, accepted-risk, informational or detection-only row does not make a
+        host "affected". Pure (derived from self.vulns), so it adds no query and is directly
+        testable."""
+        return sorted({v.asset_value for v in self._currently_affecting() if v.asset_value})
 
     def affected_endpoint_count(self) -> int:
-        """How many DISTINCT endpoints (matched_at) the findings were observed at. Endpoint is
-        the exact URL/location -- distinct from an asset/host -- so this can exceed the asset
-        count when one host exposes many affected endpoints. Findings without a matched_at
-        (older/non-nuclei) don't count."""
-        return len({v.matched_at for v in self.vulns if v.matched_at})
+        """How many DISTINCT endpoints (matched_at) are CURRENTLY affected. Endpoint is the
+        exact URL/location -- distinct from an asset/host -- so this can exceed the asset count
+        when one host exposes many affected endpoints. Same active/scorable population as
+        affected_assets, so the two numbers always describe the same set of findings. Findings
+        without a matched_at (older/non-nuclei) don't count."""
+        return len({v.matched_at for v in self._currently_affecting() if v.matched_at})
 
 
 async def _gather_attack_graph(db: AsyncSession, project_id: uuid.UUID) -> dict:
@@ -204,6 +225,9 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     # vulnerability_id -> [(storage_uri, checksum)] for evidence_type='screenshot'.
     screenshot_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
     attack_counts: dict[tuple[str, str, str], int] = {}
+    # vulnerability_id -> {(tactic_name, technique_id, technique_name)}. Raw per-row mappings,
+    # rolled up into attack_counts below once issue identity is available.
+    techniques_by_vuln: dict[uuid.UUID, set[tuple[str, str, str]]] = {}
     # asset_id -> assets.value, for the vulns that ARE linked to an inventoried asset. Loaded
     # via the existing Vulnerability.asset_id FK (read-only; no schema change). A vuln whose
     # asset_id is NULL simply never appears here, so its VulnRow.asset_value stays None.
@@ -218,9 +242,13 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             compliance_by_vuln.setdefault(m.vulnerability_id, []).append(
                 (m.framework, m.control_id, m.control_description or "")
             )
+        # Collect the techniques PER VULNERABILITY here; the per-technique tally is computed
+        # further down, once the VulnRows (and therefore issue identity + classification)
+        # exist. Counting at this point could only ever count raw mapping ROWS.
         for a in await db.scalars(select(AttackMapping).where(AttackMapping.vulnerability_id.in_(vuln_ids))):
-            key = (a.tactic_name, a.technique_id, a.technique_name)
-            attack_counts[key] = attack_counts.get(key, 0) + 1
+            techniques_by_vuln.setdefault(a.vulnerability_id, set()).add(
+                (a.tactic_name, a.technique_id, a.technique_name)
+            )
         # vulnerability_evidence -> evidence.storage_uri
         from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
 
@@ -275,6 +303,9 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     severity_counts = {sev: 0 for sev in _SEVERITY_ORDER}
     active_counts = {sev: 0 for sev in _SEVERITY_ORDER}
     rows: list[VulnRow] = []
+    # vulnerability_id -> its VulnRow, so the ATT&CK tally below can reach each finding's
+    # issue identity and classification without rebuilding either.
+    row_by_vuln_id: dict[uuid.UUID, VulnRow] = {}
     for v in vulns:
         sev = v.severity if v.severity in severity_counts else "info"
         severity_counts[sev] += 1
@@ -302,7 +333,31 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         # Derived from the row's own template_id/cvss/category -- see classification.py.
         row.classification = classify_row(row)
         rows.append(row)
+        row_by_vuln_id[v.id] = row
 
+    # --- MITRE ATT&CK tally ---------------------------------------------------------------
+    # Counts DISTINCT LOGICAL ISSUES per technique, over the SAME population the Security
+    # Score uses (scoring.is_scorable -> active status, not info severity, not a detection).
+    #
+    # It previously counted raw AttackMapping ROWS over every project finding, which meant:
+    # one issue observed at 20 URLs counted 20 times, and fixed / false-positive /
+    # accepted-risk / informational findings all contributed. On a realistic dataset that
+    # reported 29 where the Security Score saw 1 distinct issue.
+    #
+    # Identity is scoring.issue_key -- the canonical function the score and both report
+    # groupings already use -- so "one issue" means the same thing on every surface. A single
+    # issue mapped to several techniques still counts once PER TECHNIQUE (each technique is a
+    # separate row), and two distinct issues sharing one technique count as two.
+    issue_keys_by_technique: dict[tuple[str, str, str], set[str]] = {}
+    for vuln_id, technique_set in techniques_by_vuln.items():
+        row = row_by_vuln_id.get(vuln_id)
+        if row is None or not is_scorable(row):
+            continue
+        key = issue_key(row)
+        for technique in technique_set:
+            issue_keys_by_technique.setdefault(technique, set()).add(key)
+
+    attack_counts = {t: len(keys) for t, keys in issue_keys_by_technique.items()}
     attack_techniques = sorted(
         [(tactic, tid, tname, count) for (tactic, tid, tname), count in attack_counts.items()],
         key=lambda x: (-x[3], x[0], x[1]),
