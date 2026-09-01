@@ -82,10 +82,19 @@ class VulnRow:
     # tool_run_id -- read-only join, no schema change). "N/A" when no linkage exists (older
     # rows). Shown in the Technical Report so an analyst can see e.g. nuclei-dast vs nuclei.
     tool_name: str = "N/A"
+    # Nuclei classification metadata, when the caller has it. NEITHER is a column on
+    # `vulnerabilities` (the runner's finding metadata is consumed by sync_attack_mappings and
+    # then discarded), so gather_report_data leaves both None and classify_row recovers the CVE
+    # from template_id/title instead. They exist so a caller that DOES hold the metadata can
+    # pass the strongest vulnerability signals straight through, rather than the classifier
+    # silently losing them -- see classification.classify_row.
+    cve: str | None = None
+    tags: list[str] | None = None
     # Reporting-layer classification: "vulnerability" or "detection" (see classification.py).
-    # Derived from template_id/cvss/category -- NOT from severity alone, and never changes
-    # identity, grouping, scoring, or the stored row. Detections are labelled as such so the
-    # report stops presenting a technology/WAF/version DETECTION as a vulnerability.
+    # Derived from template_id/cvss/category/cve/tags -- NOT from severity alone, and never
+    # changes identity, grouping, or the stored row. Detections are labelled as such so the
+    # report stops presenting a technology/WAF/version DETECTION as a vulnerability, and are
+    # excluded from the security score (scoring.is_scorable).
     classification: str = "vulnerability"
 
 
@@ -93,9 +102,20 @@ class VulnRow:
 class ReportData:
     project_name: str
     security_score: int
+    # Severity tally over ALL findings regardless of status -- the "Findings by severity"
+    # table is the full record. Do NOT use it to describe what reduces the score: a fixed or
+    # false-positive high still appears here. Use active_severity_counts for that.
     severity_counts: dict[str, int]
     total_vulns: int
     active_vulns: int
+    # Severity tally over ACTIVE findings only (status in _ACTIVE_STATUSES). The per-severity
+    # breakdown was already computed while building the rows but only its SUM (active_vulns)
+    # used to be exposed, which forced the executive summary to describe active findings using
+    # the all-status severity_counts above -- two different populations, and a fixed high was
+    # then reported as reducing a score it does not touch. Defaults to an empty dict so every
+    # existing ReportData(...) construction keeps working; _findings_summary treats a missing
+    # entry as 0.
+    active_severity_counts: dict[str, int] = field(default_factory=dict)
     vulns: list[VulnRow] = field(default_factory=list)
     # MITRE ATT&CK coverage across the project: (tactic_name, technique_id,
     # technique_name, finding_count), most-hit first.
@@ -296,6 +316,7 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         severity_counts=severity_counts,
         total_vulns=len(vulns),
         active_vulns=sum(active_counts.values()),
+        active_severity_counts=active_counts,
         vulns=rows,
         attack_techniques=attack_techniques,
         attack_graph=attack_graph,

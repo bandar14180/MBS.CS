@@ -22,8 +22,10 @@ def _top_risk_groups(vulns) -> list[dict]:
     rows for display). One row per issue-type rather than one per endpoint, so a single template
     hitting many URLs no longer floods the list or reads as many distinct vulnerabilities.
 
-    Considers only ACTIVE, SCORED findings (final_risk_score not None and status in
-    data._ACTIVE_STATUSES) -- identical to the pre-rollup filter. Findings are grouped by
+    Considers all ACTIVE findings (status in data._ACTIVE_STATUSES), whether or not they
+    carry a business-risk score: a finding with no CVSS has final_risk_score=None and must
+    still be shown, as unscored, rather than disappearing from the executive view while it
+    continues to reduce the security score. Findings are grouped by
     `template_id`; a finding with no template_id falls back to its own `title` as the key, so
     non-nuclei/legacy findings each stay a distinct row instead of collapsing into one bucket.
 
@@ -32,25 +34,34 @@ def _top_risk_groups(vulns) -> list[dict]:
                            (deterministic: max risk, then max CVSS, then severity, then title asc);
       * endpoint_count  -- how many endpoint-level findings the group aggregates (NOT distinct
                            vulnerabilities -- the renderer labels the column so);
-      * max_risk        -- the group's highest final_risk_score (drives ranking + display);
+      * max_risk        -- the group's highest final_risk_score, or None when no member is
+      scored (drives ranking + display; rendered as N/A, never 0.0);
       * max_cvss        -- the group's highest CVSS (None only if every member's CVSS is None);
       * severity        -- the highest severity among the group's members.
 
     Groups are returned in deterministic order: max_risk DESC, then max_cvss DESC, then severity
     DESC, then representative title ASC -- the same key discipline the per-finding list used."""
-    active_scored = [
-        v for v in vulns if v.final_risk_score is not None and v.status in _ACTIVE_STATUSES
-    ]
+    # ACTIVE findings, scored or not. The `final_risk_score is not None` filter used to live
+    # here and silently dropped every finding with no CVSS -- no CVSS means risk/service.py
+    # returns final_risk_score=None -- so a CRITICAL active finding with no CVSS vanished from
+    # Top Risks while STILL degrading the security score. An executive then read a reduced
+    # score above an empty table saying "No scored findings." The finding is now kept and
+    # presented as unscored (max_risk None -> the renderer prints "N/A"); no business-risk
+    # value is fabricated for it.
+    active = [v for v in vulns if v.status in _ACTIVE_STATUSES]
     buckets: dict[str, list] = {}
-    for v in active_scored:
+    for v in active:
         # `tid:`/`title:` prefixes keep a template_id and an identical-looking title from ever
         # colliding into one bucket.
         key = f"tid:{v.template_id}" if v.template_id else f"title:{v.title or ''}"
         buckets.setdefault(key, []).append(v)
 
     def _member_sort_key(v):
+        # A None risk/CVSS sorts BELOW any real value (including 0.0) rather than raising --
+        # unscored members are legitimate now, and a scored member is preferred as the
+        # group's representative when both exist.
         return (
-            -v.final_risk_score,
+            -(v.final_risk_score if v.final_risk_score is not None else -1.0),
             -(v.cvss_score if v.cvss_score is not None else -1.0),
             -_SEVERITY_RANK.get(v.severity, 0),
             v.title or "",
@@ -60,19 +71,27 @@ def _top_risk_groups(vulns) -> list[dict]:
     for members in buckets.values():
         rep = min(members, key=_member_sort_key)  # highest-risk member (min of negated keys)
         cvss_values = [m.cvss_score for m in members if m.cvss_score is not None]
+        # None only when EVERY member is unscored; a single scored member still yields a real
+        # max. Never coerced to 0.0 -- "not scored" and "scored zero" stay distinct, exactly as
+        # they do for CVSS everywhere else in the report.
+        risk_values = [m.final_risk_score for m in members if m.final_risk_score is not None]
         groups.append(
             {
                 "title": rep.title,
                 "endpoint_count": len(members),
-                "max_risk": max(m.final_risk_score for m in members),
+                "max_risk": max(risk_values) if risk_values else None,
                 "max_cvss": max(cvss_values) if cvss_values else None,
                 "severity": max(members, key=lambda m: _SEVERITY_RANK.get(m.severity, 0)).severity,
             }
         )
 
+    # Unscored groups (max_risk None) rank below every scored one but ABOVE nothing -- they
+    # still appear, ordered among themselves by CVSS then severity then title. Severity is
+    # already in the key, so a critical unscored finding sorts to the top of that tail rather
+    # than being buried.
     groups.sort(
         key=lambda g: (
-            -g["max_risk"],
+            -(g["max_risk"] if g["max_risk"] is not None else -1.0),
             -(g["max_cvss"] if g["max_cvss"] is not None else -1.0),
             -_SEVERITY_RANK.get(g["severity"], 0),
             g["title"] or "",
@@ -230,7 +249,7 @@ def _findings_summary(data) -> str:
     reads "100/100" as "zero findings" or "N active findings" as "N vulnerabilities".
 
     Pure and testable (like _score_band). Uses only ReportData fields that already exist
-    (active_vulns / total_vulns / severity_counts / security_score) -- it does NOT recompute
+    (active_vulns / active_severity_counts / severity_counts / security_score) -- it does NOT recompute
     the score or reweight anything. The wording is derived from the ACTUAL scoring model
     (scoring.py: info findings are filtered out before scoring, so they cost nothing),
     so it states plain fact:
@@ -244,12 +263,22 @@ def _findings_summary(data) -> str:
     active = data.active_vulns
     if active == 0:
         return "No active findings. The score is not reduced by any active finding."
-    # active_vulns counts active findings; severity_counts is over ALL findings, so the
-    # "all informational" case is asserted via the non-info active severities below rather
-    # than by comparing active to a total info count.
-    non_info_active = sum(
-        data.severity_counts.get(sev, 0) for sev in ("critical", "high", "medium", "low")
-    )
+    # ACTIVE severities only. severity_counts is over ALL findings regardless of status, so
+    # using it here described two different populations in one sentence: a FIXED high was
+    # reported as "of low severity or higher and reduce the security score" even though it is
+    # excluded from scoring and the score was 100 -- the report contradicting itself. It also
+    # suppressed the honest "all informational" branch below whenever a stale fixed finding
+    # existed. active_severity_counts is the matching population (data.gather_report_data).
+    #
+    # Fall back to severity_counts ONLY when active_severity_counts is absent (a ReportData
+    # built by older code that predates the field); when it is present it is authoritative,
+    # including when it is legitimately all-zero.
+    severities = ("critical", "high", "medium", "low")
+    active_by_severity = data.active_severity_counts or None
+    if active_by_severity is None:
+        non_info_active = sum(data.severity_counts.get(sev, 0) for sev in severities)
+    else:
+        non_info_active = sum(active_by_severity.get(sev, 0) for sev in severities)
     noun = "active finding" if active == 1 else "active findings"
     non_info_verb = "is" if non_info_active == 1 else "are"
     if non_info_active == 0:
@@ -377,7 +406,9 @@ def render_executive(data: ReportData) -> bytes:
             Paragraph(
                 "Grouped by issue type. “Endpoints” is how many affected "
                 "endpoints/findings each issue was observed at — not a count of distinct "
-                "vulnerabilities. Risk is the highest business risk score within the group.",
+                "vulnerabilities. Risk is the highest business risk score within the group; "
+                "“N/A” means the finding carries no CVSS, so no business-risk score could "
+                "be derived — it is unassessed, not low risk.",
                 styles["Body"],
             )
         )
@@ -388,14 +419,20 @@ def render_executive(data: ReportData) -> bytes:
                     Paragraph(_esc(g["title"]), styles["Cell"]),
                     g["severity"],
                     str(g["endpoint_count"]),
-                    f"{g['max_risk']:.1f}",
+                    # "N/A" -- NOT 0.0 -- when the group has no business-risk score at all
+                    # (no CVSS anywhere in it). Fabricating a number here would misreport an
+                    # unassessed finding as a zero-risk one.
+                    (f"{g['max_risk']:.1f}" if g["max_risk"] is not None else "N/A"),
                 ]
             )
         rtbl = Table(risk_rows, colWidths=[95 * mm, 28 * mm, 22 * mm, 20 * mm])
         rtbl.setStyle(_table_style(colors))
         story.append(rtbl)
     else:
-        story.append(Paragraph("No scored findings.", styles["Body"]))
+        # Reached only when there are NO ACTIVE findings at all. It can no longer be shown
+        # while an active finding exists, which is what previously let a degraded score sit
+        # above an empty table.
+        story.append(Paragraph("No active findings.", styles["Body"]))
 
     story.append(Spacer(1, 6 * mm))
     frameworks = sorted({fw for v in data.vulns for (fw, _, _) in v.compliance})

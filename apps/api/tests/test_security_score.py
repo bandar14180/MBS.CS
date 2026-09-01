@@ -53,11 +53,16 @@ def _one(severity, **kw):
     return [F(severity=severity, template_id=f"tpl-{severity}", **kw)]
 
 
-# --- 1. Info / detection-only findings never reduce the score -----------------------------
+# --- 1. Info findings AND detections never reduce the score -------------------------------
+# These are two DISTINCT exclusions, not synonyms: `info` is a SEVERITY, a detection is a
+# CLASSIFICATION (classification.py), and nuclei emits detections at low/medium/high severity
+# too. Both are excluded by scoring.is_scorable; the detection cases live at the end of file.
 
 def test_nineteen_info_findings_score_100():
-    """The real 'ss' project: 19 open info findings and nothing else. Info is
-    detection-only, so posture is untouched."""
+    """The real 'ss' project: 19 open info findings and nothing else.
+
+    Excluded by SEVERITY (`info`), independently of classification -- an info finding with a
+    genuine weakness CWE still classifies as a VULNERABILITY, and is still not scored."""
     findings = [F(severity="info", template_id=f"tech-{i}", matched_at=f"https://h/{i}") for i in range(19)]
     assert compute_security_score(findings) == 100
 
@@ -535,3 +540,66 @@ def test_real_saturated_project_gets_a_meaningful_score():
     assert len(group_issues(findings)) == 5
     score = compute_security_score(findings)
     assert 0 < score < 40, "a badly-broken project should score low but not be floored at 0"
+
+
+# --- DETECTIONS never reduce the score, at ANY severity (see section 1) --------------------
+# scoring.is_scorable used to filter on `severity != "info"` ALONE, so a genuine detection
+# rated low/medium/high/critical was scored as if it were a vulnerability. It now defers to
+# the single classifier in classification.py. `F` defaults to cvss_score=None, which is what
+# a bare detection actually looks like -- and None must stay distinct from 0.0 (section 4).
+
+def _detection(severity):
+    """A pure technology detection: detection-marked template, no CVSS, no CVE, no exploit tag."""
+    return F(severity=severity, template_id="tech-detect", title="Apache Detection")
+
+
+@pytest.mark.parametrize("severity", ["low", "medium", "high", "critical"])
+def test_detection_never_reduces_the_score(severity):
+    assert compute_security_score([_detection(severity)]) == 100
+
+
+@pytest.mark.parametrize("severity", ["low", "medium", "high", "critical"])
+def test_detection_is_not_scorable(severity):
+    from apps.api.modules.reports.scoring import is_scorable
+
+    assert is_scorable(_detection(severity)) is False
+
+
+@pytest.mark.parametrize("severity", ["low", "medium", "high", "critical"])
+def test_real_vulnerability_of_the_same_severity_still_reduces_the_score(severity):
+    """The control case: same severity, but a real weakness -- it MUST still cost score."""
+    vuln = F(severity=severity, template_id="unix-command-injection", title="Command Injection")
+    assert compute_security_score([vuln]) < 100
+
+
+def test_detection_does_not_dilute_a_real_finding():
+    """Detections are excluded before grouping, so they cannot shift the score at all."""
+    vuln = F(severity="high", template_id="unix-command-injection", title="Command Injection")
+    alone = compute_security_score([vuln])
+    with_detections = compute_security_score(
+        [vuln] + [F(severity="medium", template_id=f"tech-detect-{i}", title="d") for i in range(5)]
+    )
+    assert with_detections == alone
+
+
+def test_info_and_detection_are_independent_exclusions():
+    """Neither concept implies the other: an info-severity finding can be a VULNERABILITY,
+    and a detection can be high severity. Both are excluded, for different reasons."""
+    from apps.api.modules.reports.classification import VULNERABILITY, classify_row
+    from apps.api.modules.reports.scoring import is_scorable
+
+    info_weakness = F(severity="info", template_id="http-missing-security-headers", title="Headers")
+    assert classify_row(info_weakness) == VULNERABILITY   # a weakness...
+    assert is_scorable(info_weakness) is False            # ...excluded by SEVERITY
+
+    high_detection = _detection("high")
+    assert is_scorable(high_detection) is False           # excluded by CLASSIFICATION
+
+
+def test_cvss_none_is_not_zero_for_a_scored_vulnerability():
+    """P1-3 must not have changed CVSS semantics: None stays neutral, 0.0 stays a real zero."""
+    from apps.api.modules.reports.scoring import _cvss_factor
+
+    assert _cvss_factor(None) == 1.0
+    assert _cvss_factor(0.0) < 1.0
+    assert _cvss_factor(None) != _cvss_factor(0.0)

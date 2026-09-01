@@ -566,8 +566,14 @@ def test_top_risks_keeps_different_templates_separate():
     assert {g["title"] for g in groups} == {"Unix CI", "Windows CI", "SQLi"}
 
 
-def test_top_risks_excludes_inactive_and_unscored_findings():
-    """(5) fixed/accepted/false-positive and None-risk findings never appear."""
+def test_top_risks_excludes_inactive_findings():
+    """(5) fixed/accepted/false-positive findings never appear.
+
+    UPDATED for P1-1: this test previously also asserted that an UNSCORED (risk=None) active
+    finding is excluded. That was the defect -- a critical with no CVSS has no risk score, so
+    it vanished from the executive view while still degrading the security score. Unscored
+    ACTIVE findings are now expected to appear (as unscored); only non-active ones are
+    filtered. The status filter itself is unchanged and still asserted here."""
     vulns = [
         _tr_vuln("Active", "t-active", status="open", risk=10.0),
         _tr_vuln("Fixed", "t-fixed", status="fixed", risk=10.0),
@@ -576,7 +582,10 @@ def test_top_risks_excludes_inactive_and_unscored_findings():
         _tr_vuln("Unscored", "t-unscored", status="open", risk=None),
     ]
     titles = {g["title"] for g in _top_risk_groups(vulns)}
-    assert titles == {"Active"}
+    assert titles == {"Active", "Unscored"}
+    # The unscored one is present but carries no fabricated risk value.
+    unscored = next(g for g in _top_risk_groups(vulns) if g["title"] == "Unscored")
+    assert unscored["max_risk"] is None
 
 
 def test_top_risks_deterministic_ordering_by_risk_then_cvss_then_severity_then_title():
@@ -846,3 +855,159 @@ def test_piped_urls_stay_distinct_findings_and_group_correctly():
     assert len(groups) == 1                               # one vulnerability
     assert len(groups[0]["matched_ats"]) == 2             # two real locations
     assert all(u.startswith("https://") for u in groups[0]["matched_ats"])
+
+
+
+# --- P1-1: unscored findings must not vanish from Executive Top Risks ---------------------
+# A finding with no CVSS gets final_risk_score=None from risk/service.py. Top Risks used to
+# filter those out, so a CRITICAL active finding with no CVSS disappeared from the executive
+# view while still degrading the security score -- a reduced score above "No scored findings."
+# It must now appear, presented as UNSCORED, with no fabricated risk value.
+
+def _unscored_critical(**kw):
+    return _row("critical", template_id="rce-no-cvss", matched_at="https://h/a",
+                title="Critical RCE (no CVSS)", cvss_score=None, final_risk_score=None, **kw)
+
+
+def test_top_risks_includes_scored_critical():
+    """Baseline: a critical WITH CVSS/risk is listed and shows its real risk."""
+    v = _row("critical", template_id="rce-scored", matched_at="https://h/a",
+             title="Critical RCE", cvss_score=9.8, final_risk_score=10.0)
+    groups = render._top_risk_groups([v])
+    assert len(groups) == 1
+    assert groups[0]["max_risk"] == 10.0
+    assert groups[0]["severity"] == "critical"
+
+
+def test_top_risks_includes_unscored_critical():
+    """The regression: no CVSS -> no risk score, but the finding must STILL be listed."""
+    groups = render._top_risk_groups([_unscored_critical()])
+    assert len(groups) == 1, "an unscored active critical must not disappear from Top Risks"
+    assert groups[0]["severity"] == "critical"
+    assert groups[0]["title"] == "Critical RCE (no CVSS)"
+
+
+def test_top_risks_does_not_fabricate_a_risk_score():
+    """Unscored stays None -- never coerced to 0.0, which would read as 'zero risk'."""
+    groups = render._top_risk_groups([_unscored_critical()])
+    assert groups[0]["max_risk"] is None
+    assert groups[0]["max_risk"] != 0.0
+    assert groups[0]["max_cvss"] is None
+
+
+def test_unscored_finding_degrades_score_and_is_still_listed():
+    """The two views must agree: if it costs score, the executive must be able to see it."""
+    v = _unscored_critical()
+    assert compute_security_score([v]) < 100          # it really does degrade posture
+    assert len(render._top_risk_groups([v])) == 1     # ...and it really is shown
+
+
+def test_unscored_group_renders_risk_as_na_not_zero():
+    """The rendered executive text shows N/A for an unscored group, never 0.0."""
+    data = ReportData(
+        project_name="P", security_score=60,
+        severity_counts={"critical": 1, "high": 0, "medium": 0, "low": 0, "info": 0},
+        total_vulns=1, active_vulns=1,
+        active_severity_counts={"critical": 1, "high": 0, "medium": 0, "low": 0, "info": 0},
+        vulns=[_unscored_critical()],
+    )
+    # _exec_summary_text captures Paragraph flowables only; the Top Risks rows are Table
+    # cells. Assert the rendered cell value directly, and use the captured text for the
+    # paragraph-level guarantee that no "nothing to show" message accompanies the score.
+    group = render._top_risk_groups(data.vulns)[0]
+    rendered_risk = f"{group['max_risk']:.1f}" if group["max_risk"] is not None else "N/A"
+    assert rendered_risk == "N/A"
+    assert rendered_risk != "0.0"
+
+    text = _exec_summary_text(data)
+    assert "No active findings." not in text
+    assert "No scored findings." not in text
+    # The explanatory note must tell the reader that N/A means unassessed, not low risk.
+    assert "unassessed, not low risk" in text
+
+
+def test_scored_groups_rank_above_unscored():
+    """Ordering: real risk first, unscored in the tail -- but present."""
+    scored = _row("high", template_id="sqli", matched_at="https://h/b",
+                  title="Scored SQLi", cvss_score=9.0, final_risk_score=9.0)
+    titles = [g["title"] for g in render._top_risk_groups([_unscored_critical(), scored])]
+    assert titles == ["Scored SQLi", "Critical RCE (no CVSS)"]
+
+
+def test_top_risks_still_excludes_non_active_findings():
+    """Dropping the scored-only filter must NOT start showing fixed findings."""
+    fixed = _row("critical", status="fixed", template_id="old", matched_at="https://h/c",
+                 title="Fixed", cvss_score=9.0, final_risk_score=9.0)
+    assert render._top_risk_groups([fixed]) == []
+
+
+# --- P1-2: the executive summary must describe ACTIVE findings only -----------------------
+# _findings_summary used the all-status severity_counts to say what reduces the score, so a
+# FIXED high was reported as reducing a score of 100. It now uses active_severity_counts.
+
+def test_summary_ignores_a_fixed_high():
+    """1 fixed high + 2 active info, score 100: the fixed high must not be blamed."""
+    data = ReportData(
+        project_name="P", security_score=100,
+        severity_counts={"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 2},
+        total_vulns=3, active_vulns=2,
+        active_severity_counts={"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 2},
+        vulns=[],
+    )
+    text = _findings_summary(data)
+    assert "all informational" in text
+    assert "1 is of low severity or higher" not in text
+    assert "do not reduce the security score" in text
+
+
+def test_summary_reports_an_active_high():
+    """1 active high + 2 active info: the high IS named."""
+    data = ReportData(
+        project_name="P", security_score=75,
+        severity_counts={"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 2},
+        total_vulns=3, active_vulns=3,
+        active_severity_counts={"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 2},
+        vulns=[],
+    )
+    text = _findings_summary(data)
+    assert "1 is of low severity or higher" in text
+    assert "all informational" not in text
+
+
+def test_summary_all_active_are_informational():
+    """All active findings informational -> the 100/100 explanation."""
+    data = ReportData(
+        project_name="P", security_score=100,
+        severity_counts={"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 4},
+        total_vulns=4, active_vulns=4,
+        active_severity_counts={"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 4},
+        vulns=[],
+    )
+    text = _findings_summary(data)
+    assert "all informational" in text
+    assert "100/100 can coexist with informational findings" in text
+
+
+def test_summary_mixed_active_and_fixed_counts_active_only():
+    """2 active high + 3 fixed high: only the 2 active ones are described."""
+    data = ReportData(
+        project_name="P", security_score=50,
+        severity_counts={"critical": 0, "high": 5, "medium": 0, "low": 0, "info": 0},
+        total_vulns=5, active_vulns=2,
+        active_severity_counts={"critical": 0, "high": 2, "medium": 0, "low": 0, "info": 0},
+        vulns=[],
+    )
+    text = _findings_summary(data)
+    assert "2 are of low severity or higher" in text
+    assert "5 are of low severity or higher" not in text
+
+
+def test_summary_falls_back_to_all_status_counts_when_active_absent():
+    """A ReportData built by older code (no active_severity_counts) keeps its old behaviour."""
+    data = ReportData(
+        project_name="P", security_score=85,
+        severity_counts={"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 5},
+        total_vulns=6, active_vulns=6, vulns=[],
+    )
+    assert data.active_severity_counts == {}
+    assert "1 is of low severity or higher" in _findings_summary(data)

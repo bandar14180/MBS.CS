@@ -24,7 +24,7 @@ THE MODEL
 ---------
     active findings
       -> drop non-active statuses (fixed / false_positive / accepted_risk)
-      -> drop info/detection-only findings
+      -> drop info-severity findings AND detections (classification.py) -- see is_scorable
       -> group occurrences by underlying issue identity
       -> per-issue penalty = base(severity) x cvss_factor x risk_factor x location_factor
       -> combine issues with diminishing returns
@@ -152,10 +152,35 @@ def is_active(finding) -> bool:
 def is_scorable(finding) -> bool:
     """Active AND an actual vulnerability rather than a detection-only observation.
 
-    Info findings are excluded here (not merely given a zero weight) so they cannot affect
-    grouping, counts, or the diminishing-returns product in any way."""
+    THREE independent exclusions, all applied here (not as a zero weight) so an excluded
+    finding cannot affect grouping, counts, or the diminishing-returns product in any way:
+
+      1. non-active status  -- fixed / false_positive / accepted_risk (see ACTIVE_STATUSES);
+      2. `info` severity    -- reported for visibility, never a posture cost;
+      3. a DETECTION        -- a technology/WAF/version observation is not a weakness.
+
+    (2) and (3) are DISTINCT concepts and neither implies the other. `info` is a SEVERITY;
+    a detection is a CLASSIFICATION, and nuclei emits detections at low/medium severity too
+    (e.g. a `tech-detect` template rated low). Filtering on severity alone therefore let a
+    pure detection reduce the score, which is exactly what classification.py exists to
+    prevent -- so this defers to that SINGLE classifier rather than re-deriving a second,
+    divergent detection heuristic here.
+
+    The classifier fails toward VULNERABILITY (a positive CVSS/CVE/exploit-tag outranks every
+    detection marker), so this can only ever exclude a finding that carries no vulnerability
+    evidence at all -- it can never hide a real weakness from the score.
+
+    Note this reads CLASSIFICATION, not CVSS: a finding with cvss_score=None is still fully
+    scorable, and None stays distinct from 0.0 throughout (see _cvss_factor)."""
     severity = (getattr(finding, "severity", None) or "").lower()
-    return is_active(finding) and severity != "info"
+    if not is_active(finding) or severity == "info":
+        return False
+    # Imported here rather than at module import: classification.py is a leaf module, but a
+    # top-level import would make this pure scoring module depend on the reporting package at
+    # import time. Keeping it local also keeps `scoring` importable in isolation.
+    from apps.api.modules.reports.classification import DETECTION, classify_row
+
+    return classify_row(finding) != DETECTION
 
 
 def _cvss_factor(max_cvss: float | None) -> float:

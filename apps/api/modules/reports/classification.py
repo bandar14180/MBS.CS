@@ -35,6 +35,8 @@ a weakness):
 never forces the detection label.
 """
 
+import re
+
 VULNERABILITY = "vulnerability"
 DETECTION = "detection"
 
@@ -78,6 +80,32 @@ def _template_looks_like_detection(template_id: str | None) -> bool:
     return any(m in t for m in _DETECTION_TEMPLATE_MARKERS)
 
 
+# A CVE id anywhere in a template_id or title, e.g. "CVE-2021-41773" in
+# `apache-detect-cve-2021-41773`. Nuclei names CVE templates after the CVE, and the id also
+# survives into the finding title -- so the strongest vulnerability signal is recoverable
+# from what IS persisted, with no schema change. Bounded {4} year / {4,7} sequence per the
+# CVE id format, so it cannot match arbitrary hyphenated text.
+_CVE_RE = re.compile(r"cve[-_]\d{4}[-_]\d{4,7}", re.IGNORECASE)
+
+
+def _recover_cve(*candidates: str | None) -> str | None:
+    """First CVE id found in the given strings, or None.
+
+    WHY: `cve` is NOT a column on `vulnerabilities` -- the nuclei runner captures cve-id into
+    transient finding metadata that `sync_attack_mappings` consumes and discards, so by the
+    time the report layer reads a row the explicit cve is gone. Recovering it from the
+    template_id/title restores the classifier's strongest vulnerability signal without adding
+    a column or changing how findings are stored. Read-only and purely additive: it can only
+    ever turn a would-be DETECTION into a VULNERABILITY, never the reverse."""
+    for value in candidates:
+        if not value:
+            continue
+        match = _CVE_RE.search(str(value))
+        if match:
+            return match.group(0)
+    return None
+
+
 def classify(
     *,
     template_id: str | None,
@@ -113,9 +141,29 @@ def classify(
 
 
 def classify_row(row) -> str:
-    """Convenience for a report VulnRow-like object (template_id, cvss_score, category)."""
+    """Convenience for a report VulnRow-like object.
+
+    Forwards EVERY signal the row actually carries -- including `cve` and `tags`, which the
+    nuclei runner already captures (nuclei_runner.parse_vulnerabilities puts cve-id and the
+    template's tags into the finding metadata) and VulnRow now surfaces. They are read with
+    getattr defaults so any row-like object WITHOUT them (a legacy stub, a hand-built test
+    double) keeps classifying exactly as before.
+
+    Passing them matters because they are the classifier's strongest VULNERABILITY signals:
+    dropping them broke the module's own guarantee (see the header: positive vulnerability
+    signals outrank the detection markers, so a real weakness is never hidden). A CVE-backed
+    finding whose CVSS happens to be absent and whose template name contains "detect" -- e.g.
+    `apache-detect-cve-2021-41773` -- was classified DETECTION with the metadata dropped, and
+    is correctly classified VULNERABILITY once the cve is forwarded."""
+    template_id = getattr(row, "template_id", None)
+    title = getattr(row, "title", None)
+    # An explicit cve on the row wins; otherwise recover it from the template_id/title, which
+    # ARE persisted (see _recover_cve for why the explicit value is usually gone by now).
+    cve = getattr(row, "cve", None) or _recover_cve(template_id, title)
     return classify(
-        template_id=getattr(row, "template_id", None),
+        template_id=template_id,
         cvss_score=getattr(row, "cvss_score", None),
         category=getattr(row, "category", None),
+        tags=getattr(row, "tags", None),
+        cve=cve,
     )

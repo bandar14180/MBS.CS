@@ -160,3 +160,78 @@ def test_final_risk_independent_from_cvss():
     assert r.business_impact_score == 9.8         # CVSS preserved
     assert r.final_risk_score == 10.0             # min(10, 9.8*2.0), a distinct value
     assert r.final_risk_score != r.business_impact_score
+
+
+# --- P1-4: cve / tags must reach the classifier -------------------------------------------
+# classify_row used to pass only (template_id, cvss_score, category), dropping the two
+# STRONGEST vulnerability signals. That broke the module's own guarantee ("positive
+# vulnerability signals outrank the detection markers"): a CVE-backed finding whose CVSS was
+# absent and whose template name contained "detect" was classified DETECTION -- hiding a real
+# weakness. `cve` is not a column on `vulnerabilities` (the runner's metadata is consumed by
+# sync_attack_mappings and discarded), so classify_row also RECOVERS it from the persisted
+# template_id/title. Recovery is additive: it can only turn DETECTION into VULNERABILITY.
+
+def test_cve_with_no_cvss_is_a_vulnerability():
+    """Explicit cve, no CVSS -- the CVE alone must decide."""
+    assert classify(template_id="x", cvss_score=None, cve="CVE-2021-41773") == VULNERABILITY
+
+
+def test_cve_in_a_detection_named_template_is_a_vulnerability():
+    """THE regression: a 'detect'-marked template that is really a CVE finding."""
+    row = _row("apache-detect-cve-2021-41773", "high", None,
+               title="CVE-2021-41773 Path Traversal")
+    assert classify_row(row) == VULNERABILITY
+
+
+def test_cve_recovered_from_title_when_template_has_none():
+    row = _row("some-detect", "high", None, title="Apache CVE-2021-41773 Path Traversal")
+    assert classify_row(row) == VULNERABILITY
+
+
+def test_explicit_cve_on_the_row_is_honoured():
+    row = _row("some-detect", "high", None, title="No id here")
+    row.cve = "CVE-2021-41773"
+    assert classify_row(row) == VULNERABILITY
+
+
+def test_detection_template_without_a_cve_stays_a_detection():
+    """The guard must not be weakened: no CVE anywhere -> still a detection."""
+    assert classify_row(_row("tech-detect", "low", None, title="Apache Detection")) == DETECTION
+    assert classify_row(_row("nginx-version", "info", None, title="nginx version")) == DETECTION
+
+
+def test_waf_detection_with_generic_cwe_stays_a_detection():
+    """A generic CWE is NOT vulnerability evidence -- category alone must not flip it."""
+    row = _row("waf-detect", "low", None, category="cwe-200", title="WAF Detection")
+    assert classify_row(row) == DETECTION
+
+
+def test_tags_reach_the_classifier_through_the_row():
+    """An exploit tag on the row is vulnerability evidence; detection-only tags are not."""
+    exploit = _row("some-detect", "high", None, title="t")
+    exploit.tags = ["sqli"]
+    assert classify_row(exploit) == VULNERABILITY
+
+    detect_only = _row("some-detect", "high", None, title="t")
+    detect_only.tags = ["tech", "detect"]
+    assert classify_row(detect_only) == DETECTION
+
+
+def test_cve_recovery_does_not_match_arbitrary_hyphenated_text():
+    """`_recover_cve` must not fire on look-alike strings."""
+    from apps.api.modules.reports.classification import _recover_cve
+
+    assert _recover_cve("not-a-cve-12") is None
+    assert _recover_cve("tech-detect") is None
+    assert _recover_cve("apache-detect-cve-2021-41773") is not None
+
+
+def test_classify_row_tolerates_rows_without_cve_or_tags():
+    """A row-like stub lacking the new attributes must classify exactly as before."""
+    class Bare:
+        template_id = "tech-detect"
+        cvss_score = None
+        category = None
+        title = "Apache Detection"
+
+    assert classify_row(Bare()) == DETECTION
