@@ -169,10 +169,35 @@ def _normalize_tags(tags) -> list[str]:
     return [str(t).strip().lower() for t in tags if str(t).strip()]
 
 
-def techniques_for(category: str | None, tags=None) -> list[tuple[str, str, str, str]]:
+def techniques_for(
+    category: str | None,
+    tags=None,
+    *,
+    template_id: str | None = None,
+    cvss_score: float | None = None,
+    cve: str | None = None,
+) -> list[tuple[str, str, str, str]]:
     """De-duplicated technique tuples for a finding's CWE `category` and/or Nuclei
     `tags`. Each tuple is (tactic_id, technique_id, technique_name, kill_chain_phase).
-    Unknown keys contribute nothing (same policy as compliance/catalog)."""
+    Unknown keys contribute nothing (same policy as compliance/catalog).
+
+    DETECTION GUARD (P1.6): a technology/WAF/version DETECTION must NOT inherit ATT&CK
+    techniques just because it carries a generic CWE (e.g. waf-detect -> cwe-200). When the
+    optional finding metadata (template_id/cvss/cve) is supplied and the shared classifier
+    (reports.classification) rules the finding a DETECTION, this returns no techniques. The
+    parameters are keyword-only and default to None, so every existing caller that passes only
+    (category, tags) keeps mapping exactly as before -- a genuine vulnerability is never
+    stripped of its techniques."""
+    if template_id is not None or cve is not None:
+        # Only consult the classifier when we actually have identifying metadata; otherwise
+        # keep the historical (category/tags-only) behaviour untouched.
+        from apps.api.modules.reports.classification import DETECTION, classify
+
+        if classify(
+            template_id=template_id, cvss_score=cvss_score, category=category, tags=tags, cve=cve
+        ) == DETECTION:
+            return []
+
     out: list[tuple[str, str, str, str]] = []
     seen: set[str] = set()
 

@@ -22,8 +22,15 @@ async def sync_attack_mappings(
     do-nothing-on-conflict, so re-detection doesn't duplicate rows. Mirrors
     compliance.service.sync_mappings. Uses the finding's CWE `category` plus any
     Nuclei `tags` in its metadata."""
-    tags = (metadata or {}).get("tags")
-    techniques = techniques_for(category, tags)
+    md = metadata or {}
+    tags = md.get("tags")
+    # Pass identifying metadata so techniques_for can skip DETECTIONS (P1.6): a technology/WAF/
+    # version detection must not inherit ATT&CK techniques via a generic CWE. Genuine
+    # vulnerabilities are unaffected -- see attack/catalog.techniques_for. cvss_score isn't in
+    # this metadata; None is correct (the classifier then leans on template_id/cve/tags).
+    techniques = techniques_for(
+        category, tags, template_id=md.get("template_id"), cve=md.get("cve")
+    )
     if not techniques:
         return
     rows = [

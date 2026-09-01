@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from apps.api.modules.compliance.catalog import framework_name
 from apps.api.modules.reports.data import _ACTIVE_STATUSES, _SEVERITY_ORDER, ReportData, VulnRow
+from apps.api.modules.reports.classification import classify_row
 from apps.api.modules.reports.scoring import issue_key
 
 # Rank a severity for deterministic tie-breaking: critical=highest. Mirrors data._SEVERITY_ORDER
@@ -169,6 +170,19 @@ def _finding_groups(vulns) -> list[dict]:
                 "final_risk_score": rep.final_risk_score,
                 "risk_rationale": rep.risk_rationale,
                 "template_id": rep.template_id,
+                # Producing tool(s) across the grouped rows (e.g. nuclei-dast). Sorted+deduped;
+                # a group is usually one tool but this is robust if several produced it.
+                "tools": sorted({m.tool_name for m in members if getattr(m, "tool_name", None) and m.tool_name != "N/A"}),
+                # Detection vs vulnerability for the whole group. A group is a VULNERABILITY if
+                # ANY member is -- so a template that is a real weakness anywhere is never
+                # downgraded to a bare detection by a stray member. Classified from each row's
+                # own fields (classify_row) so grouping is correct even for rows built outside
+                # gather_report_data; see classification.py.
+                "classification": (
+                    "vulnerability"
+                    if any(classify_row(m) == "vulnerability" for m in members)
+                    else "detection"
+                ),
                 "matcher_names": sorted({m.matcher_name for m in members if m.matcher_name}),
                 "matched_ats": matched_ats,
                 "unlocated_count": unlocated,
@@ -507,8 +521,13 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
     from reportlab.platypus import KeepTogether
 
     color = _SEVERITY_COLORS.get(g["severity"], "#374151")
+    # Detection vs vulnerability, stated in the heading so a technology/WAF/version DETECTION
+    # is never read as a confirmed vulnerability. Presentation only -- identity, grouping and
+    # scoring are unchanged (see classification.py).
+    kind_label = "DETECTION" if g.get("classification") == "detection" else "VULNERABILITY"
     parts = [
         Paragraph(f"{idx}. {_esc(g['title'])}", styles["H2"]),
+        Paragraph(f"Type: {kind_label}", styles["Small"]),
         Paragraph(
             f'<font color="{color}"><b>{g["severity"].upper()}</b></font> · status: {_esc(g["status"])}'
             # `is not None`, never truthiness: a real CVSS of 0.0 must show as "CVSS 0.0",
@@ -520,6 +539,8 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
             styles["Body"],
         ),
     ]
+    # Producing scanner tool(s), e.g. nuclei-dast. "N/A" when no tool linkage exists.
+    parts.append(Paragraph(f"Tool: {_esc(', '.join(g.get('tools') or []) or 'N/A')}", styles["Small"]))
     parts.append(Paragraph(f"Template: {_esc(g['template_id'] or 'N/A')}", styles["Small"]))
     parts.append(
         Paragraph(f"Matcher: {_esc(', '.join(g['matcher_names']) or 'N/A')}", styles["Small"])

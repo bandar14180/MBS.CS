@@ -9,6 +9,7 @@ from apps.api.modules.attack.models import AttackMapping
 from apps.api.modules.compliance.models import ComplianceMapping
 from apps.api.modules.projects.models import Project
 from apps.api.modules.reports.scoring import ACTIVE_STATUSES, compute_security_score
+from apps.api.modules.reports.classification import classify_row
 from apps.api.modules.risk.models import RiskScore
 from apps.api.modules.vulnerabilities.models import Vulnerability
 from apps.api.scanner_engine.models import Evidence
@@ -77,6 +78,15 @@ class VulnRow:
     # is affected in that case. Distinct from matched_at: asset_value is the host/asset, matched_at
     # is the exact endpoint/URL observed.
     asset_value: str | None = None
+    # Which scanner tool produced this finding (tool_runs.tool_name via VulnerabilityEvidence.
+    # tool_run_id -- read-only join, no schema change). "N/A" when no linkage exists (older
+    # rows). Shown in the Technical Report so an analyst can see e.g. nuclei-dast vs nuclei.
+    tool_name: str = "N/A"
+    # Reporting-layer classification: "vulnerability" or "detection" (see classification.py).
+    # Derived from template_id/cvss/category -- NOT from severity alone, and never changes
+    # identity, grouping, scoring, or the stored row. Detections are labelled as such so the
+    # report stops presenting a technology/WAF/version DETECTION as a vulnerability.
+    classification: str = "vulnerability"
 
 
 @dataclass
@@ -178,6 +188,9 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     # via the existing Vulnerability.asset_id FK (read-only; no schema change). A vuln whose
     # asset_id is NULL simply never appears here, so its VulnRow.asset_value stays None.
     asset_value_by_id: dict[uuid.UUID, str] = {}
+    # vulnerability_id -> producing tool name (tool_runs.tool_name via the existing
+    # VulnerabilityEvidence.tool_run_id FK; read-only join, no schema change).
+    tool_name_by_vuln: dict[uuid.UUID, str] = {}
     if vuln_ids:
         for r in await db.scalars(select(RiskScore).where(RiskScore.vulnerability_id.in_(vuln_ids))):
             risk_by_vuln[r.vulnerability_id] = r
@@ -214,6 +227,23 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             if uri not in uris:
                 uris.append(uri)
 
+        # Producing tool per vulnerability. One vuln can link to several tool_runs across
+        # re-scans; take the most recent by tool_runs.started_at so the report shows the
+        # tool that last produced it. Read-only; no schema change.
+        from apps.api.scanner_engine.models import ToolRun
+
+        tool_rows = await db.execute(
+            select(VulnerabilityEvidence.vulnerability_id, ToolRun.tool_name, ToolRun.started_at)
+            .join(ToolRun, ToolRun.id == VulnerabilityEvidence.tool_run_id)
+            .where(VulnerabilityEvidence.vulnerability_id.in_(vuln_ids))
+        )
+        _tool_seen: dict[uuid.UUID, object] = {}
+        for vid, tname, started in tool_rows.all():
+            prev = _tool_seen.get(vid)
+            if tname and (prev is None or (started is not None and started >= prev)):
+                tool_name_by_vuln[vid] = tname
+                _tool_seen[vid] = started
+
         # Resolve asset_id -> assets.value for the linked findings only.
         asset_ids = [v.asset_id for v in vulns if v.asset_id is not None]
         if asset_ids:
@@ -231,25 +261,27 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         if v.status in _ACTIVE_STATUSES:
             active_counts[sev] += 1
         risk = risk_by_vuln.get(v.id)
-        rows.append(
-            VulnRow(
-                id=v.id,
-                title=v.title,
-                severity=v.severity,
-                status=v.status,
-                category=v.category,
-                cvss_score=v.cvss_score,
-                cvss_vector=v.cvss_vector,
-                final_risk_score=risk.final_risk_score if risk else None,
-                risk_rationale=risk.rationale if risk else None,
-                compliance=sorted(compliance_by_vuln.get(v.id, [])),
-                evidence_uris=evidence_by_vuln.get(v.id, []),
-                screenshots=screenshot_by_vuln.get(v.id, []),
-                asset_value=asset_value_by_id.get(v.asset_id) if v.asset_id else None,
-                **dict(zip(("template_id", "matcher_name", "matched_at"),
-                           _parse_fingerprint(v.fingerprint), strict=True)),
-            )
+        row = VulnRow(
+            id=v.id,
+            title=v.title,
+            severity=v.severity,
+            status=v.status,
+            category=v.category,
+            cvss_score=v.cvss_score,
+            cvss_vector=v.cvss_vector,
+            final_risk_score=risk.final_risk_score if risk else None,
+            risk_rationale=risk.rationale if risk else None,
+            compliance=sorted(compliance_by_vuln.get(v.id, [])),
+            evidence_uris=evidence_by_vuln.get(v.id, []),
+            screenshots=screenshot_by_vuln.get(v.id, []),
+            asset_value=asset_value_by_id.get(v.asset_id) if v.asset_id else None,
+            tool_name=tool_name_by_vuln.get(v.id, "N/A"),
+            **dict(zip(("template_id", "matcher_name", "matched_at"),
+                       _parse_fingerprint(v.fingerprint), strict=True)),
         )
+        # Derived from the row's own template_id/cvss/category -- see classification.py.
+        row.classification = classify_row(row)
+        rows.append(row)
 
     attack_techniques = sorted(
         [(tactic, tid, tname, count) for (tactic, tid, tname), count in attack_counts.items()],
