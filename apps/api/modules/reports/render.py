@@ -3,12 +3,114 @@ functions so importing this module (e.g. for the service/CRUD path) doesn't
 require reportlab to be installed."""
 
 import html
+import re
 from datetime import datetime, timezone
 
 from apps.api.modules.compliance.catalog import framework_name
-from apps.api.modules.reports.data import _ACTIVE_STATUSES, _SEVERITY_ORDER, ReportData, VulnRow
-from apps.api.modules.reports.classification import classify_row
+from apps.api.modules.reports.data import _ACTIVE_STATUSES, _SEVERITY_ORDER, ReportData
+from apps.api.modules.reports.classification import _recover_cve, classify_row
 from apps.api.modules.reports.scoring import issue_key
+from apps.api.modules.reports.verification import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_LOW,
+    CONFIDENCE_MEDIUM,
+    PARTIALLY_VERIFIED,
+    UNVERIFIED,
+    VERIFIED,
+    classify_verification_row,
+    confidence_label,
+    verification_label,
+    verification_note,
+)
+# CVSS band is derived from the BASE SCORE alone -- the single source of truth lives with the
+# risk engine so the report and the engine can never disagree about what "Medium" means.
+from apps.api.modules.risk.service import cvss_severity_band
+
+# P2-3: human labels for the evidence types the pipeline actually stores (see the `evidence`
+# table: `log_excerpt` and `screenshot` in the live dataset). An UNKNOWN type is passed through
+# rather than relabelled or hidden -- inventing a label for an artifact we cannot identify would
+# misrepresent it, and dropping it would lose evidence.
+_EVIDENCE_TYPE_LABELS = {
+    "log_excerpt": "Raw tool output",
+    "screenshot": "Screenshot",
+    "http_request": "HTTP request",
+    "http_response": "HTTP response",
+    "recording": "Session recording",
+}
+
+
+def _evidence_type_label(etype: str | None) -> str:
+    key = (etype or "").strip().lower()
+    if not key:
+        return "Evidence"
+    return _EVIDENCE_TYPE_LABELS.get(key, key.replace("_", " ").capitalize())
+
+
+def _technical_metadata_rows(g: dict) -> list[tuple[str, str]]:
+    """(label, value) rows for the Technical Report's metadata block, in a fixed order.
+
+    P2-4. Every value is taken VERBATIM from the group; missing values become "N/A" so the
+    block has a stable shape and a reader can tell "not recorded" from "not applicable".
+    Optional fields (Category, CVE) are omitted entirely when absent rather than padded with
+    N/A, so the block does not grow noise for findings that never had them.
+
+    Nothing here is derived, inferred or scored -- it is provenance, not assessment."""
+    rows: list[tuple[str, str]] = [
+        ("Tool", ", ".join(g.get("tools") or []) or "N/A"),
+        ("Template", g.get("template_id") or "N/A"),
+        ("Matcher", ", ".join(g.get("matcher_names") or []) or "N/A"),
+        ("Status", g.get("status") or "N/A"),
+    ]
+    if g.get("category"):
+        rows.append(("Category", g["category"]))
+    # CVE is not a column on `vulnerabilities` (see classification._recover_cve); it survives
+    # only inside the template_id/title. Shown ONLY when actually found -- never fabricated.
+    cve = _recover_cve(g.get("template_id"), g.get("title"))
+    if cve:
+        rows.append(("CVE", cve.upper()))
+    return rows
+
+
+def _location_host(location: str) -> str:
+    """Host[:port] of a URL-ish location, or "" when it has no recognisable authority.
+
+    Deliberately string-based and total: report locations are whatever the scanner recorded
+    (`matched_at`), which is usually a URL but may be a bare host, a host:port, or something
+    unparseable. Anything without a recognisable authority returns "" and is rendered ungrouped
+    -- never dropped, never guessed at. The PORT is kept as part of the host because
+    `example.com:8443` is a different service from `example.com:443`."""
+    text = (location or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    # Strip path/query/fragment; what remains is the authority.
+    for sep in ("/", "?", "#"):
+        text = text.split(sep, 1)[0]
+    # Drop any userinfo prefix.
+    if "@" in text:
+        text = text.rsplit("@", 1)[1]
+    return text
+
+
+def _group_locations_by_host(locations) -> list[tuple[str, list[str]]]:
+    """[(host, [location, ...])] preserving the caller's ordering within each host.
+
+    Presentation only: every input location appears exactly once in the output, so this can
+    neither hide nor merge a location. Hosts are ordered by first appearance, which -- because
+    `matched_ats` arrives already sorted -- is deterministic. Locations with no recognisable
+    host group under "" and render without a host heading."""
+    grouped: dict[str, list[str]] = {}
+    for loc in locations:
+        grouped.setdefault(_location_host(loc), []).append(loc)
+    return list(grouped.items())
+
+
+# Strength ordering for aggregating a GROUP's verification/confidence from its members.
+# Verification aggregates by max (any demonstrated location proves the issue); confidence
+# aggregates by min (the group is only as trustworthy as its weakest signal).
+_VERIFICATION_RANK = {UNVERIFIED: 1, PARTIALLY_VERIFIED: 2, VERIFIED: 3}
+_CONFIDENCE_RANK = {CONFIDENCE_LOW: 1, CONFIDENCE_MEDIUM: 2, CONFIDENCE_HIGH: 3}
 
 # Rank a severity for deterministic tie-breaking: critical=highest. Mirrors data._SEVERITY_ORDER
 # (critical..info) so "higher severity first" is a single source of truth. Unknown severities
@@ -70,7 +172,7 @@ def _top_risk_groups(vulns) -> list[dict]:
         )
 
     groups: list[dict] = []
-    for members in buckets.values():
+    for key, members in buckets.items():
         rep = min(members, key=_member_sort_key)  # highest-risk member (min of negated keys)
         cvss_values = [m.cvss_score for m in members if m.cvss_score is not None]
         # None only when EVERY member is unscored; a single scored member still yields a real
@@ -80,6 +182,15 @@ def _top_risk_groups(vulns) -> list[dict]:
         groups.append(
             {
                 "title": rep.title,
+                # P2-1: the group's canonical identity (scoring.issue_key), carried so the sort
+                # below has a UNIQUE terminal tie-breaker. Two DIFFERENT templates can share a
+                # title, and title was previously the last key -- so genuinely tied groups fell
+                # back on Python's list order, which follows dict insertion, i.e. the order rows
+                # arrived from the database. Re-running the same report could then emit a
+                # different Top Risks order. issue_key is unique per bucket by construction, so
+                # the full key is now a total order. Display is unchanged: this is a sort input,
+                # never rendered.
+                "issue_key": key,
                 "endpoint_count": len(members),
                 "max_risk": max(risk_values) if risk_values else None,
                 "max_cvss": max(cvss_values) if cvss_values else None,
@@ -91,12 +202,17 @@ def _top_risk_groups(vulns) -> list[dict]:
     # still appear, ordered among themselves by CVSS then severity then title. Severity is
     # already in the key, so a critical unscored finding sorts to the top of that tail rather
     # than being buried.
+    # P2-1: risk first, then CVSS, then severity, then title, then the UNIQUE issue_key. The
+    # first four express actual risk (unchanged semantics -- no new scoring model, no value is
+    # recomputed here); the fifth exists solely to make the order TOTAL, so equal-risk groups
+    # cannot be reordered by database row order between two renderings of the same data.
     groups.sort(
         key=lambda g: (
             -(g["max_risk"] if g["max_risk"] is not None else -1.0),
             -(g["max_cvss"] if g["max_cvss"] is not None else -1.0),
             -_SEVERITY_RANK.get(g["severity"], 0),
             g["title"] or "",
+            g["issue_key"],
         )
     )
     return groups
@@ -191,6 +307,16 @@ def _finding_groups(vulns) -> list[dict]:
                 if uri not in evidence_uris:
                     evidence_uris.append(uri)
 
+        # P2-3: the same artifacts WITH their evidence_type, deduped on the (type, uri) pair and
+        # order-stable, exactly as evidence_uris above. Rows that predate this field (or test
+        # doubles) simply contribute nothing and the renderer falls back to the untyped list --
+        # so evidence is never lost, only better labelled.
+        evidence_items: list[tuple[str, str]] = []
+        for m in members:
+            for item in getattr(m, "evidence_items", None) or []:
+                if item not in evidence_items:
+                    evidence_items.append(item)
+
         # Screenshots for this vulnerability, deduplicated BY CHECKSUM: two locations that
         # rendered byte-identical pages contribute one image, while genuinely different pages
         # each keep their own. Dedup is on content, never on "same finding" -- distinct
@@ -208,7 +334,26 @@ def _finding_groups(vulns) -> list[dict]:
             {
                 "key": key,
                 "title": rep.title,
-                "severity": rep.severity,
+                # ISSUE-LEVEL SEVERITY CONTRACT (shared with _top_risk_groups and
+                # scoring.group_issues). Severity is the MAX across the group's members, NOT
+                # the representative member's own severity.
+                #
+                # The representative is chosen by BUSINESS RISK first (see _rep_key), which is
+                # the right anchor for the risk/CVSS/rationale shown in the block -- those must
+                # all describe one real observation. But severity is a property of the ISSUE,
+                # and the other two surfaces already treat it that way: _top_risk_groups uses
+                # max(_SEVERITY_RANK) and scoring.group_issues uses max(_severity_rank) to pick
+                # the penalty band. Taking the representative's severity here made the Technical
+                # report disagree with both whenever the highest-severity member was not the
+                # highest-risk one -- e.g. a group holding an UNSCORED critical (risk None) and
+                # a scored medium printed "critical" in the Executive Top Risks table and
+                # "medium" on the Technical block for the SAME issue_key. That combination is
+                # not hypothetical: an active finding with no CVSS has final_risk_score=None by
+                # construction (see the comment at the top of _top_risk_groups).
+                #
+                # Using the max keeps all three surfaces on one definition and is the safe
+                # direction: a group containing a critical is reported as critical.
+                "severity": max(members, key=lambda m: _SEVERITY_RANK.get(m.severity, 0)).severity,
                 "status": rep.status,
                 "category": rep.category,
                 "cvss_score": rep.cvss_score,
@@ -229,12 +374,31 @@ def _finding_groups(vulns) -> list[dict]:
                     if any(classify_row(m) == "vulnerability" for m in members)
                     else "detection"
                 ),
+                # Verification/confidence for the whole group (see verification.py). Computed
+                # from each row's own fields so it is correct for rows built outside
+                # gather_report_data, exactly as `classification` above is.
+                #
+                # Verification takes the STRONGEST member: if the issue was demonstrated at any
+                # one location it IS demonstrated, and reporting it as unverified would
+                # understate proven risk. Confidence takes the WEAKEST: it grades how much the
+                # signal is worth, so a group containing an inference-based match must not
+                # inherit a neighbour's certainty. Neither reads nor alters severity, CVSS,
+                # final_risk_score or the security score.
+                "verification": max(
+                    (classify_verification_row(m)[0] for m in members),
+                    key=lambda s: _VERIFICATION_RANK.get(s, 0),
+                ),
+                "confidence": min(
+                    (classify_verification_row(m)[1] for m in members),
+                    key=lambda c: _CONFIDENCE_RANK.get(c, 0),
+                ),
                 "matcher_names": sorted({m.matcher_name for m in members if m.matcher_name}),
                 "matched_ats": matched_ats,
                 "unlocated_count": unlocated,
                 "occurrence_count": len(members),
                 "compliance": sorted(compliance),
                 "evidence_uris": evidence_uris,
+                "evidence_items": evidence_items,
                 "screenshots": screenshots,
             }
         )
@@ -269,6 +433,38 @@ def _score_band(score: int) -> str:
     if score >= 40:
         return "Weak"
     return "Critical"
+
+
+def _verification_summary(data) -> dict[str, int]:
+    """Tally of ACTIVE findings by verification state: {verified, partially_verified, unverified}.
+
+    STEP 4 (Executive clarity). Pure, and derived from the SAME classifier the Technical Report
+    uses (verification.classify_verification_row), so the two reports can never disagree about
+    how many findings are evidence-backed. It counts findings; it never re-derives, re-weights,
+    or influences severity, CVSS, risk or the security score.
+
+    ACTIVE findings only -- the same population the score describes -- so an executive is not
+    told about the evidence backing of findings that are already fixed or dismissed."""
+    counts = {VERIFIED: 0, PARTIALLY_VERIFIED: 0, UNVERIFIED: 0}
+    for v in getattr(data, "vulns", None) or []:
+        if getattr(v, "status", None) not in _ACTIVE_STATUSES:
+            continue
+        state, _ = classify_verification_row(v)
+        if state in counts:
+            counts[state] += 1
+    return counts
+
+
+def _score_impacting_count(data) -> int:
+    """How many ACTIVE findings actually move the security score.
+
+    Delegates to scoring.is_scorable -- the score's OWN predicate -- rather than re-deriving the
+    rule, so this number cannot drift from the score it explains. It is the honest answer to
+    "you reported N findings but the score only reflects some of them": informational findings
+    and detections are reported for visibility and carry no penalty (scoring.py)."""
+    from apps.api.modules.reports.scoring import is_scorable
+
+    return sum(1 for v in getattr(data, "vulns", None) or [] if is_scorable(v))
 
 
 def _findings_summary(data) -> str:
@@ -357,6 +553,41 @@ def render_executive(data: ReportData) -> bytes:
             + " The score reflects open, confirmed, and reopened findings weighted by "
             "severity; resolved, accepted-risk, and false-positive findings do not reduce it.",
             styles["Body"],
+        )
+    )
+    # STEP 4 -- how many of those findings actually move the score. Without this an executive
+    # reads "157 findings, score 25" and cannot tell that 152 of them are informational and
+    # cost nothing. States the count only; it does not reinterpret or reweight anything.
+    story.append(
+        Paragraph(
+            f"Of these, <b>{_score_impacting_count(data)}</b> finding(s) affect the security "
+            "score. Informational findings and technology detections are reported for "
+            "visibility and carry no score penalty.",
+            styles["Body"],
+        )
+    )
+    story.append(Spacer(1, 6 * mm))
+
+    # STEP 4 -- VERIFICATION summary. Severity says how bad a finding would be; verification says
+    # how much evidence supports it. Executives were shown only severity, so 157 detections read
+    # as 157 confirmed vulnerabilities. Both axes are now stated, and the sentence below names
+    # the distinction explicitly rather than leaving it to be inferred.
+    story.append(Paragraph("Findings by verification status", styles["H2"]))
+    ver_counts = _verification_summary(data)
+    ver_rows = [["Verification", "Count"]]
+    for state in (VERIFIED, PARTIALLY_VERIFIED, UNVERIFIED):
+        ver_rows.append([verification_label(state), str(ver_counts[state])])
+    vtbl = Table(ver_rows, colWidths=[80 * mm, 40 * mm])
+    vtbl.setStyle(_table_style(colors))
+    story.append(vtbl)
+    story.append(
+        Paragraph(
+            "Findings are detections produced by the security pipeline; verification status "
+            "indicates the level of evidence supporting each finding. Severity describes "
+            "potential impact and is independent of verification: an unverified finding is not "
+            "necessarily a false positive, and a high-severity finding is not confirmed "
+            "exploitation unless its verification status says so.",
+            styles["Small"],
         )
     )
     story.append(Spacer(1, 6 * mm))
@@ -606,19 +837,74 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
             styles["Body"],
         ),
     ]
-    # Producing scanner tool(s), e.g. nuclei-dast. "N/A" when no tool linkage exists.
-    parts.append(Paragraph(f"Tool: {_esc(', '.join(g.get('tools') or []) or 'N/A')}", styles["Small"]))
-    parts.append(Paragraph(f"Template: {_esc(g['template_id'] or 'N/A')}", styles["Small"]))
+    # Verification + confidence, stated immediately under the severity line so a scanner MATCH
+    # is never read as a demonstrated exploit. This is evidence provenance ONLY: it does not
+    # modify severity, CVSS, final_risk_score or the security score, and an unverified CVSS 9.8
+    # is still reported as a CVSS 9.8 (see verification.py).
+    _ver = g.get("verification") or UNVERIFIED
+    _conf = g.get("confidence") or CONFIDENCE_MEDIUM
     parts.append(
-        Paragraph(f"Matcher: {_esc(', '.join(g['matcher_names']) or 'N/A')}", styles["Small"])
+        Paragraph(
+            f"Verification: {verification_label(_ver)} · Confidence: {confidence_label(_conf)}",
+            styles["Small"],
+        )
     )
-    parts.append(Paragraph(f"Status: {_esc(g['status'] or 'N/A')}", styles["Small"]))
-    if g["category"]:
-        parts.append(Paragraph(f"Category: {_esc(g['category'])}", styles["Small"]))
+    parts.append(Paragraph(_esc(verification_note(_ver)), styles["Small"]))
+    # P2-4: TECHNICAL-report metadata, emitted as one labelled block in a fixed order instead
+    # of a run of loose lines. This is the detail an analyst needs to trace a finding back to
+    # the exact scanner artifact and reproduce it, so every field is kept and nothing is
+    # abbreviated away. Values are printed EXACTLY as stored -- no inference, no derived
+    # meaning, and none of it feeds severity, risk, classification or verification.
+    # A missing value renders "N/A"; it never crashes and is never invented.
+    for label, value in _technical_metadata_rows(g):
+        parts.append(Paragraph(f"{label}: {_esc(value)}", styles["Small"]))
     if g["cvss_vector"]:
         parts.append(Paragraph(f"CVSS vector: {_esc(g['cvss_vector'])}", styles["Small"]))
+
+    # --- Risk breakdown: keep TECHNICAL severity and BUSINESS risk visibly separate ---------
+    # A single "risk 10.0" line let a MEDIUM CVSS 5.5 on a critical asset read as a Critical
+    # vulnerability: 5.5 x 2.0 = 11.0, capped to 10.0, printed as a bare 10.0 that is
+    # indistinguishable from a genuine CVSS 9.8 x 2.0 = 19.6 -> 10.0. Both the CVSS band and
+    # the pre-cap product are therefore stated explicitly.
+    #
+    # PRESENTATION ONLY. Nothing here recomputes or writes risk: cvss_severity_band is a pure
+    # function of the CVSS base score the row already carries, and the uncapped product is
+    # re-derived read-only from that score and the weight recorded in the stored rationale.
+    # final_risk_score is printed exactly as persisted.
+    cvss_val = g["cvss_score"]
+    band = cvss_severity_band(cvss_val)
+    parts.append(
+        Paragraph(
+            f"CVSS base score: {cvss_val if cvss_val is not None else 'N/A'}"
+            f" · CVSS severity: {band or 'N/A'}",
+            styles["Small"],
+        )
+    )
+    if g["final_risk_score"] is not None:
+        # Recover the criticality/weight from the stored rationale rather than re-deriving it:
+        # the report layer has no asset-criticality column, and the rationale is the value the
+        # risk engine itself recorded at compute time.
+        weight_match = re.search(r"weight ([0-9.]+)", g["risk_rationale"] or "")
+        crit_match = re.search(r"criticality '([^']+)'", g["risk_rationale"] or "")
+        risk_line = f"Adjusted risk score: {g['final_risk_score']:.1f}/10"
+        if crit_match:
+            risk_line += f" · Asset criticality: {crit_match.group(1)}"
+        if weight_match and cvss_val is not None:
+            uncapped = round(cvss_val * float(weight_match.group(1)), 1)
+            if uncapped > g["final_risk_score"]:
+                risk_line += f" · Uncapped: {uncapped} (CAPPED at 10.0)"
+        parts.append(Paragraph(risk_line, styles["Small"]))
+        # Stated in words so the distinction survives even if a reader skims the numbers.
+        if band and band not in ("None",):
+            parts.append(
+                Paragraph(
+                    f"Asset criticality adjusts business risk only; this finding's technical "
+                    f"severity remains CVSS {band}.",
+                    styles["Small"],
+                )
+            )
     if g["risk_rationale"]:
-        parts.append(Paragraph(f"Risk: {_esc(g['risk_rationale'])}", styles["Small"]))
+        parts.append(Paragraph(f"Risk rationale: {_esc(g['risk_rationale'])}", styles["Small"]))
     if g["compliance"]:
         controls = "; ".join(f"{framework_name(fw)} {cid}" for (fw, cid, _) in g["compliance"])
         parts.append(Paragraph(f"Compliance: {_esc(controls)}", styles["Small"]))
@@ -628,9 +914,20 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
     # count -- not as many separate vulnerabilities. Long URLs word-wrap in the mono style.
     locations = g["matched_ats"]
     if locations:
-        parts.append(Paragraph(f"Affected locations ({len(locations)}):", styles["Small"]))
-        for loc in locations:
-            parts.append(Paragraph(f"• {_esc(loc)}", styles["Mono"]))
+        # P2-2: group the (already deduplicated, already sorted) locations BY HOST so a finding
+        # spanning many paths on one host reads as one host with N paths, instead of a flat wall
+        # of near-identical URLs. Nothing is hidden or merged away: every distinct location is
+        # still printed exactly once, and the total count is stated up front.
+        by_host = _group_locations_by_host(locations)
+        host_note = f" across {len(by_host)} host(s)" if len(by_host) > 1 else ""
+        parts.append(
+            Paragraph(f"Affected locations ({len(locations)}{host_note}):", styles["Small"])
+        )
+        for host, paths in by_host:
+            if host:
+                parts.append(Paragraph(f"{_esc(host)} ({len(paths)}):", styles["Small"]))
+            for loc in paths:
+                parts.append(Paragraph(f"• {_esc(loc)}", styles["Mono"]))
         # Occurrences with no matched_at are still real findings; say so rather than drop them.
         if g["unlocated_count"]:
             parts.append(
@@ -642,8 +939,18 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
     else:
         parts.append(Paragraph("Affected locations: N/A", styles["Small"]))
 
-    if g["evidence_uris"]:
-        parts.append(Paragraph("Evidence:", styles["Small"]))
+    # P2-3: label each artifact with its evidence TYPE so a tool log is not mistaken for proof
+    # of exploitation. The URI is preserved verbatim -- it is the reference an analyst uses to
+    # retrieve the artifact from object storage. Falls back to the untyped list when a row
+    # carries no typed items (legacy rows / test doubles), so evidence is never dropped.
+    typed_evidence = g.get("evidence_items") or []
+    if typed_evidence:
+        parts.append(Paragraph(f"Evidence ({len(typed_evidence)}):", styles["Small"]))
+        for etype, uri in typed_evidence:
+            parts.append(Paragraph(f"[{_esc(_evidence_type_label(etype))}]", styles["Small"]))
+            parts.append(Paragraph(f"• {_esc(uri)}", styles["Mono"]))
+    elif g["evidence_uris"]:
+        parts.append(Paragraph(f"Evidence ({len(g['evidence_uris'])}):", styles["Small"]))
         for uri in g["evidence_uris"]:
             parts.append(Paragraph(f"• {_esc(uri)}", styles["Mono"]))
     else:
@@ -729,9 +1036,141 @@ def _table_style(colors):
     )
 
 
-def render(report_type: str, data: ReportData) -> bytes:
+def render_risk_assessment(data: ReportData, assessment) -> bytes:
+    """Client Risk Assessment PDF, rendered from an ISSUED assessment's FROZEN snapshot.
+
+    Deliberately NOT a second report pipeline: it uses the same reportlab setup, the same
+    `_styles`/`_table_style` helpers, the same `_score_band` and the same document conventions
+    as the executive report. The ONE difference that matters is the data source -- every number
+    below is read out of `assessment.summary`, the snapshot frozen at issue time, NOT
+    recomputed from today's findings. That is what makes a re-render of a March assessment in
+    June still say what it said in March.
+
+    `data` is still passed so the project name and the shared chrome match the other reports;
+    its live figures are deliberately not printed as the assessment's numbers.
+    """
+    from io import BytesIO
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table
+
+    summary = assessment.summary or {}
+    styles = _styles(getSampleStyleSheet, ParagraphStyle, colors)
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, title=f"Risk Assessment — {data.project_name}")
+    story = []
+
+    story.append(Paragraph("MBS.SC — Client Risk Assessment", styles["H1"]))
+    story.append(Paragraph(f"Project: {_esc(data.project_name)}", styles["Meta"]))
+    story.append(Paragraph(f"Assessment: {_esc(assessment.title)}", styles["Meta"]))
+    if assessment.period_start and assessment.period_end:
+        story.append(
+            Paragraph(
+                f"Period: {assessment.period_start:%Y-%m-%d} to {assessment.period_end:%Y-%m-%d}",
+                styles["Meta"],
+            )
+        )
+    if assessment.issued_at:
+        # ISSUE date, not render date: the document describes a fixed point in time, so
+        # stamping "now" would misrepresent a re-download as a fresh assessment.
+        story.append(Paragraph(f"Issued: {assessment.issued_at:%Y-%m-%d %H:%M UTC}", styles["Meta"]))
+    story.append(Spacer(1, 8 * mm))
+
+    score = summary.get("security_score")
+    band = summary.get("score_band") or (_score_band(score) if score is not None else "N/A")
+    story.append(
+        Paragraph(
+            f"Security Score: <b>{score if score is not None else 'N/A'}/100</b> ({band})",
+            styles["Score"],
+        )
+    )
+    story.append(
+        Paragraph(
+            f"{summary.get('active_findings', 0)} active finding(s) across "
+            f"{summary.get('unresolved_issue_count', 0)} distinct issue(s), affecting "
+            f"{len(summary.get('affected_assets') or [])} asset(s) and "
+            f"{summary.get('affected_endpoint_count', 0)} endpoint(s). These figures are frozen "
+            "as of the issue date above and do not change as new scans run.",
+            styles["Body"],
+        )
+    )
+    story.append(Spacer(1, 6 * mm))
+
+    story.append(Paragraph("Active findings by severity", styles["H2"]))
+    active_by_sev = summary.get("active_severity_counts") or {}
+    sev_rows = [["Severity", "Active"]]
+    for sev in _SEVERITY_ORDER:
+        sev_rows.append([sev.capitalize(), str(active_by_sev.get(sev, 0))])
+    tbl = Table(sev_rows, colWidths=[80 * mm, 40 * mm])
+    tbl.setStyle(_table_style(colors))
+    story.append(tbl)
+    story.append(Spacer(1, 6 * mm))
+
+    top_risks = summary.get("top_risks") or []
+    story.append(Paragraph("Top risks", styles["H2"]))
+    if top_risks:
+        rows = [["Issue", "Severity", "Risk", "CVSS", "Locations"]]
+        for g in top_risks:
+            rows.append([
+                Paragraph(_esc(g.get("title")), styles["Small"]),
+                _esc(g.get("severity")),
+                # N/A, never 0.0 -- "not scored" and "scored zero" stay distinct exactly as
+                # they do everywhere else in the reporting layer.
+                "N/A" if g.get("max_risk") is None else str(g["max_risk"]),
+                "N/A" if g.get("max_cvss") is None else str(g["max_cvss"]),
+                str(g.get("endpoint_count", 0)),
+            ])
+        tbl = Table(rows, colWidths=[70 * mm, 22 * mm, 20 * mm, 20 * mm, 24 * mm])
+        tbl.setStyle(_table_style(colors))
+        story.append(tbl)
+    else:
+        story.append(Paragraph("No active risks were outstanding at issue time.", styles["Body"]))
+    story.append(Spacer(1, 6 * mm))
+
+    progress = summary.get("remediation_progress") or {}
+    story.append(Paragraph("Remediation progress", styles["H2"]))
+    prog_rows = [["Metric", "Count"]]
+    for label, key in (
+        ("Total items", "total"), ("Proposed", "proposed"), ("Accepted", "accepted"),
+        ("In progress", "in_progress"), ("Awaiting verification", "awaiting_verification"),
+        ("Verified", "verified"), ("Closed", "closed"), ("Risk accepted", "risk_accepted"),
+        ("Overdue", "overdue"),
+    ):
+        prog_rows.append([label, str(progress.get(key, 0))])
+    tbl = Table(prog_rows, colWidths=[80 * mm, 40 * mm])
+    tbl.setStyle(_table_style(colors))
+    story.append(tbl)
+    story.append(
+        Paragraph(
+            f"Remediation completion: {progress.get('completion_percent', 0)}% "
+            f"({progress.get('resolved', 0)} of {progress.get('total', 0)} item(s) resolved).",
+            styles["Body"],
+        )
+    )
+    story.append(Spacer(1, 6 * mm))
+
+    if assessment.narrative:
+        story.append(Paragraph("Management summary and recommendations", styles["H2"]))
+        for line in str(assessment.narrative).split("\n"):
+            if line.strip():
+                story.append(Paragraph(_esc(line), styles["Body"]))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def render(report_type: str, data: ReportData, assessment=None) -> bytes:
     if report_type == "executive":
         return render_executive(data)
     if report_type == "technical":
         return render_technical(data)
+    if report_type == "risk_assessment":
+        # An assessment PDF is meaningless without the frozen snapshot it renders -- refuse
+        # rather than silently falling back to live data, which would defeat the freeze.
+        if assessment is None:
+            raise ValueError("risk_assessment reports require the issued assessment to render")
+        return render_risk_assessment(data, assessment)
     raise ValueError(f"Unknown report type: {report_type}")

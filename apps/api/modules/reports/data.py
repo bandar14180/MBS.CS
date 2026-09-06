@@ -10,6 +10,7 @@ from apps.api.modules.compliance.models import ComplianceMapping
 from apps.api.modules.projects.models import Project
 from apps.api.modules.reports.scoring import ACTIVE_STATUSES, compute_security_score, is_scorable, issue_key
 from apps.api.modules.reports.classification import classify_row
+from apps.api.modules.reports.verification import classify_verification_row
 from apps.api.modules.risk.models import RiskScore
 from apps.api.modules.vulnerabilities.models import Vulnerability
 from apps.api.scanner_engine.models import Evidence
@@ -65,6 +66,13 @@ class VulnRow:
     # simply shows no image. Defaults to an empty list so every existing VulnRow
     # construction site keeps working unchanged.
     screenshots: list[tuple[str, str]] = field(default_factory=list)
+    # P2-3: [(evidence_type, storage_uri)] for the NON-screenshot artifacts, e.g.
+    # ("log_excerpt", "s3://mbs-evidence/tool-runs/<id>/raw-output.txt"). Parallel to
+    # `evidence_uris`, which keeps its list[str] shape so no existing caller changes. Defaults
+    # to empty, so a row built without it (legacy call site, test double) renders exactly as
+    # before -- the renderer falls back to the untyped list. Presentation metadata only: it is
+    # never read by scoring, classification or verification.
+    evidence_items: list[tuple[str, str]] = field(default_factory=list)
     # Where the finding was observed, recovered from the fingerprint (Phase 1: report clarity
     # only -- no new column, no schema change). Lets the report distinguish many findings that
     # share a title/severity/evidence but hit different URLs/params. Any may be None (older or
@@ -96,6 +104,14 @@ class VulnRow:
     # report stops presenting a technology/WAF/version DETECTION as a vulnerability, and are
     # excluded from the security score (scoring.is_scorable).
     classification: str = "vulnerability"
+    # Reporting-layer verification state + confidence (see verification.py). Derived from the
+    # row's own evidence/template/matcher metadata -- NEVER from severity, CVSS or risk, and
+    # they never modify any of those. A scanner match is not a proof, so a generic detection
+    # defaults to unverified/medium and VERIFIED is reachable only from explicit evidence.
+    # Deliberately NOT `vulnerabilities.ai_confidence`, which is the AI triage model's rating
+    # of its own output and answers a different question entirely.
+    verification: str = "unverified"
+    confidence: str = "medium"
 
 
 @dataclass
@@ -222,6 +238,9 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     risk_by_vuln: dict[uuid.UUID, RiskScore] = {}
     compliance_by_vuln: dict[uuid.UUID, list[tuple[str, str, str]]] = {}
     evidence_by_vuln: dict[uuid.UUID, list[str]] = {}
+    # P2-3: vulnerability_id -> [(evidence_type, storage_uri)] for NON-screenshot evidence.
+    # Parallel to evidence_by_vuln so that list keeps its list[str] contract untouched.
+    evidence_items_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
     # vulnerability_id -> [(storage_uri, checksum)] for evidence_type='screenshot'.
     screenshot_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
     attack_counts: dict[tuple[str, str, str], int] = {}
@@ -274,10 +293,26 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             uris = evidence_by_vuln.setdefault(vid, [])
             if uri not in uris:
                 uris.append(uri)
+            # P2-3: keep the TYPE alongside the URI. `evidence_type` was already selected above
+            # and then discarded for everything except screenshots, so the report could only
+            # print a bare `s3://.../raw-output.txt` and the reader had no way to tell a tool
+            # log from any other artifact. Recorded in a PARALLEL list so `evidence_uris` keeps
+            # its exact list[str] shape for every existing consumer and test.
+            items = evidence_items_by_vuln.setdefault(vid, [])
+            if (etype, uri) not in items:
+                items.append((etype or "unknown", uri))
 
         # Producing tool per vulnerability. One vuln can link to several tool_runs across
         # re-scans; take the most recent by tool_runs.started_at so the report shows the
         # tool that last produced it. Read-only; no schema change.
+        #
+        # NULLABLE-tool_run AUDIT: `evidence.tool_run_id` became nullable for human-uploaded
+        # remediation proof, but this join is on VULNERABILITY_EVIDENCE.tool_run_id, which is
+        # still NOT NULL (a scanner finding is always produced by a tool run) -- and
+        # remediation proof is never linked into vulnerability_evidence at all. So this inner
+        # join cannot drop a row it used to return, and no LEFT JOIN is needed here. The
+        # evidence_uris/screenshot query above joins on evidence.ID, not on tool_run_id, so it
+        # is likewise unaffected.
         from apps.api.scanner_engine.models import ToolRun
 
         tool_rows = await db.execute(
@@ -324,6 +359,7 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             risk_rationale=risk.rationale if risk else None,
             compliance=sorted(compliance_by_vuln.get(v.id, [])),
             evidence_uris=evidence_by_vuln.get(v.id, []),
+            evidence_items=evidence_items_by_vuln.get(v.id, []),
             screenshots=screenshot_by_vuln.get(v.id, []),
             asset_value=asset_value_by_id.get(v.asset_id) if v.asset_id else None,
             tool_name=tool_name_by_vuln.get(v.id, "N/A"),
@@ -332,6 +368,9 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         )
         # Derived from the row's own template_id/cvss/category -- see classification.py.
         row.classification = classify_row(row)
+        # Set AFTER classification: verification reads it (a detection is never "verified
+        # exploitation"). Purely derived; touches no stored value -- see verification.py.
+        row.verification, row.confidence = classify_verification_row(row)
         rows.append(row)
         row_by_vuln_id[v.id] = row
 
@@ -348,6 +387,14 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     # groupings already use -- so "one issue" means the same thing on every surface. A single
     # issue mapped to several techniques still counts once PER TECHNIQUE (each technique is a
     # separate row), and two distinct issues sharing one technique count as two.
+    #
+    # The identical rule is applied to the ATT&CK API endpoints via attack.aggregation, which
+    # is the shared source of truth for "how many issues hit a technique". The loop below
+    # stays here (rather than calling that module) only because this path already holds fully
+    # built VulnRows -- richer objects than the ORM rows the API adapts -- so it can reuse
+    # them directly instead of re-deriving identity. Both paths call the SAME
+    # scoring.is_scorable / scoring.issue_key, which is what makes the numbers agree; the
+    # parity is pinned by test_attack_api_matches_pdf_* in test_reports.py.
     issue_keys_by_technique: dict[tuple[str, str, str], set[str]] = {}
     for vuln_id, technique_set in techniques_by_vuln.items():
         row = row_by_vuln_id.get(vuln_id)
