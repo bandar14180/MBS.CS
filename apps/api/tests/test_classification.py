@@ -1,5 +1,6 @@
 """Detection vs Vulnerability classification (P1.5) and its ATT&CK boundary (P1.6)."""
 
+import datetime
 import uuid
 
 from apps.api.modules.attack.catalog import techniques_for
@@ -98,11 +99,38 @@ def _tech_block_text(row):
     block = render._finding_block(1, g, styles, colors, Paragraph, Table, TableStyle, mm)
     texts = []
 
+    def _plain(node) -> str:
+        """Text of one flowable, recursing into nested cards."""
+        c = getattr(node, "_content", None)
+        if c is not None:
+            return " ".join(x for x in (_plain(ch) for ch in c) if x)
+        cells = getattr(node, "_cellvalues", None)
+        if cells is not None:
+            return " ".join(
+                x for x in (_plain(cell) for row in cells for cell in row) if x
+            )
+        t = getattr(node, "text", None)
+        if t is not None:
+            return str(t)
+        return str(node) if isinstance(node, str) else ""
+
     def _walk(f):
         c = getattr(f, "_content", None)
         if c is not None:
             for ch in c:
                 _walk(ch)
+            return
+        # Finding metadata now lives in label/value CARDS (Tables). Re-joined as
+        # "Label: value" so this helper reports what the block actually renders; without
+        # this it silently loses the whole metadata card.
+        cells = getattr(f, "_cellvalues", None)
+        if cells is not None:
+            for row in cells:
+                parts = [p for p in (_plain(cell) for cell in row) if p]
+                if len(parts) == 2:
+                    texts.append(f"{parts[0]}: {parts[1]}")
+                elif parts:
+                    texts.append(" ".join(parts))
             return
         t = getattr(f, "text", None)
         if t is not None:
@@ -245,8 +273,6 @@ def test_classify_row_tolerates_rows_without_cve_or_tags():
 # tell why -- the PDF said DETECTION, the API did not. The field is DERIVED on read (not a
 # column): it is a pure function of data already stored, so persisting it would go stale
 # whenever the classifier changes and would need a migration plus a backfill.
-
-import datetime
 
 
 def _orm_vuln(fingerprint, title, cvss, category=None, severity="medium", status="open"):

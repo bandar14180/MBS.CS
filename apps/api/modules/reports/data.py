@@ -112,6 +112,29 @@ class VulnRow:
     # of its own output and answers a different question entirely.
     verification: str = "unverified"
     confidence: str = "medium"
+    # The scanner's own description text (vulnerabilities.description). Rendered VERBATIM in
+    # Detailed Findings and never rewritten, summarised or generated -- if it is None the
+    # report says so rather than inventing prose. Defaults to None so any row built without
+    # it (legacy call site, test double) behaves exactly as before.
+    description: str | None = None
+    # Remediation guidance produced by the pipeline (vulnerabilities remediations table), when
+    # it exists. All three are rendered VERBATIM and are never generated, inferred or
+    # summarised by the report -- a finding without them shows "Not available in scan
+    # evidence." rather than invented advice.
+    remediation_summary: str | None = None
+    remediation_steps: str | None = None
+    remediation_references: list[str] = field(default_factory=list)
+
+    @property
+    def finding_id(self) -> str:
+        """Stable, human-quotable identifier for one finding, e.g. "MBS-4A2F9C1B".
+
+        Derived from the row's DATABASE identity (`vulnerabilities.id`), NOT from a loop index:
+        the same finding therefore carries the same id across re-renders, re-orderings and
+        separate reports, so a client can quote "MBS-4A2F9C1B" back and it still resolves.
+        Presentation only -- nothing is persisted and no schema changes."""
+        raw = str(getattr(self, "id", "") or "").replace("-", "").upper()
+        return f"MBS-{raw[:8]}" if raw else "MBS-UNKNOWN"
 
 
 @dataclass
@@ -243,6 +266,10 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     evidence_items_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
     # vulnerability_id -> [(storage_uri, checksum)] for evidence_type='screenshot'.
     screenshot_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
+    # Remediation guidance, when the pipeline has generated any. Read-only: the report never
+    # writes, derives or invents this text -- a vulnerability with no remediation row simply
+    # renders "Not available in scan evidence." (the table is empty on the current dataset).
+    remediation_by_vuln: dict[uuid.UUID, tuple[str | None, str | None, list[str]]] = {}
     attack_counts: dict[tuple[str, str, str], int] = {}
     # vulnerability_id -> {(tactic_name, technique_id, technique_name)}. Raw per-row mappings,
     # rolled up into attack_counts below once issue identity is available.
@@ -268,6 +295,28 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             techniques_by_vuln.setdefault(a.vulnerability_id, set()).add(
                 (a.tactic_name, a.technique_id, a.technique_name)
             )
+        # Remediation guidance for these vulnerabilities, when any exists. READ-ONLY join --
+        # the report presents this text verbatim and never generates it. On a dataset where
+        # the pipeline has produced none, every finding simply reports it as unavailable.
+        try:
+            from apps.api.modules.vulnerabilities.remediation_models import Remediation
+
+            for rem in await db.scalars(
+                select(Remediation).where(Remediation.vulnerability_id.in_(vuln_ids))
+            ):
+                links = rem.reference_links
+                if isinstance(links, str):
+                    links = [links] if links.strip() else []
+                remediation_by_vuln[rem.vulnerability_id] = (
+                    rem.summary,
+                    rem.steps,
+                    list(links or []),
+                )
+        except Exception:
+            # Remediation content is optional enrichment; its absence must never cost the
+            # report the findings themselves.
+            pass
+
         # vulnerability_evidence -> evidence.storage_uri
         from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
 
@@ -355,6 +404,16 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             category=v.category,
             cvss_score=v.cvss_score,
             cvss_vector=v.cvss_vector,
+            # The scanner's own description of the finding. The column has always existed and
+            # is populated for the large majority of rows, but the report never loaded it --
+            # so Detailed Findings could show only a bare title. Passed through VERBATIM; the
+            # report never rewrites, summarises or generates this text.
+            description=v.description,
+            **dict(zip(
+                ("remediation_summary", "remediation_steps", "remediation_references"),
+                remediation_by_vuln.get(v.id, (None, None, [])),
+                strict=True,
+            )),
             final_risk_score=risk.final_risk_score if risk else None,
             risk_rationale=risk.rationale if risk else None,
             compliance=sorted(compliance_by_vuln.get(v.id, [])),

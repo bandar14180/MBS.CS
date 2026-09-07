@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from apps.api.modules.compliance.catalog import framework_name
 from apps.api.modules.reports.data import _ACTIVE_STATUSES, _SEVERITY_ORDER, ReportData
+from apps.api.modules.reports import _branding as B
 from apps.api.modules.reports.classification import _recover_cve, classify_row
 from apps.api.modules.reports.scoring import issue_key
 from apps.api.modules.reports.verification import (
@@ -24,7 +25,7 @@ from apps.api.modules.reports.verification import (
 )
 # CVSS band is derived from the BASE SCORE alone -- the single source of truth lives with the
 # risk engine so the report and the engine can never disagree about what "Medium" means.
-from apps.api.modules.risk.service import cvss_severity_band
+from apps.api.modules.risk.service import _MAX_RISK, cvss_severity_band
 
 # P2-3: human labels for the evidence types the pipeline actually stores (see the `evidence`
 # table: `log_excerpt` and `screenshot` in the live dataset). An UNKNOWN type is passed through
@@ -44,6 +45,260 @@ def _evidence_type_label(etype: str | None) -> str:
     if not key:
         return "Evidence"
     return _EVIDENCE_TYPE_LABELS.get(key, key.replace("_", " ").capitalize())
+
+
+def _sanitise_risk_rationale(rationale: str | None, final_risk_score: float | None) -> str:
+    """Drop a cap claim from a STORED rationale when the risk was not actually capped.
+
+    WHY THIS IS NEEDED AT RENDER TIME. `risk_scores.rationale` is written once, at scan time,
+    and read back verbatim by the report. An earlier version of risk/service.py appended
+    "(capped at 10.0)" UNCONDITIONALLY, so rows written before that fix carry the claim even
+    when nothing was capped -- 604 of 692 rows in the live dataset say "capped" while
+    final_risk_score < 10, e.g.
+
+        CVSS 0.0 x asset criticality 'critical' (weight 2.0) = 0.0 (capped at 10.0).
+
+    The engine is already correct for every new computation (see risk/service.py: the cap note
+    is emitted only when `uncapped > final`). This function fixes the DISPLAY of the historical
+    rows, so the report stops asserting a cap that never happened.
+
+    Presentation only, and deliberately narrow:
+      * the cap phrase is removed ONLY when `final_risk_score < _MAX_RISK`, i.e. the arithmetic
+        proves no cap could have applied. A genuinely capped row (score == 10.0) keeps its text
+        untouched, so a real cap is never hidden;
+      * nothing else in the sentence is rewritten -- the CVSS value, the criticality, the weight
+        and the product are all left exactly as the engine recorded them;
+      * no stored value is modified. This does not write to the database, and it does not touch
+        final_risk_score, cvss_score, severity or the security score.
+    """
+    text = rationale or ""
+    if not text or final_risk_score is None:
+        return text
+    # `< _MAX_RISK` (not `!=`) so only a value the cap could not have produced is treated as
+    # uncapped. At exactly 10.0 the claim may be true, so it is left alone.
+    if final_risk_score >= _MAX_RISK:
+        return text
+    # Matches the historical " (capped at 10.0)" and the current
+    # " (capped at 10.0 from 19.6)" shapes; tolerant of spacing and the trailing period.
+    cleaned = re.sub(r"\s*\(capped at [0-9.]+(?: from [0-9.]+)?\)", "", text, flags=re.IGNORECASE)
+    # Restore the sentence-ending period the phrase may have carried away.
+    if text.rstrip().endswith(".") and not cleaned.rstrip().endswith("."):
+        cleaned = cleaned.rstrip() + "."
+    return cleaned
+
+
+def _card(rows, styles, colors, mm, width=170, accent: str | None = None, label_w=42):
+    """A two-column label/value card: the report's standard block for structured facts.
+
+    Replaces long dotted "Label: value" runs and bare grid tables with something a client can
+    scan. `accent` paints a left edge (severity or brand colour) so priority reads at a glance.
+    Values are Paragraphs, so long URLs wrap inside the cell instead of overflowing the frame.
+
+    Presentation only -- it formats whatever it is given and never derives a value."""
+    from reportlab.platypus import Paragraph, Table, TableStyle
+
+    body = []
+    for label, value in rows:
+        if isinstance(value, str):
+            value = Paragraph(_esc(value), styles["Cell"])
+        body.append([Paragraph(_esc(label), styles["Label"]), value])
+
+    tbl = Table(body, colWidths=[label_w * mm, (width - label_w) * mm], hAlign="LEFT")
+    style = [
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(B.PAPER_TINT)),
+        ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor(B.RULE)),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor(B.RULE)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+    ]
+    if accent:
+        style.append(("LINEBEFORE", (0, 0), (0, -1), 2.4, colors.HexColor(accent)))
+    tbl.setStyle(TableStyle(style))
+    return tbl
+
+
+# Remediation buckets. Ordering ONLY -- this maps a finding's EXISTING severity and business
+# risk onto a delivery sequence for the client. It does not change, re-derive or reweight
+# severity, CVSS, risk or the security score; two findings of equal severity always land in
+# the same bucket regardless of anything else in the report.
+_REMEDIATION_BUCKETS = (
+    ("Immediate", "critical", "Address without delay."),
+    ("High Priority", "high", "Address in the current remediation cycle."),
+    ("Medium Priority", "medium", "Schedule into the next planned cycle."),
+    ("Long Term", "low", "Track and resolve as part of routine hardening."),
+)
+
+
+def _remediation_plan_story(data, styles, colors, mm):
+    """Remediation Plan: existing findings, bucketed by their existing severity.
+
+    Contains no invented guidance. Each row states the finding id, title, severity, business
+    risk and how many locations it affects -- all values already computed elsewhere. Where the
+    pipeline HAS produced remediation text it is surfaced in the finding's own block, verbatim;
+    it is never synthesised here."""
+    from reportlab.platypus import KeepTogether, Paragraph, Spacer
+
+    groups = _finding_groups([v for v in data.vulns if v.status in _ACTIVE_STATUSES])
+    by_sev: dict[str, list[dict]] = {}
+    for g in groups:
+        by_sev.setdefault((g["severity"] or "").lower(), []).append(g)
+
+    out = [
+        Paragraph(
+            "Findings are grouped into delivery priorities by their assessed severity. "
+            "Priorities describe suggested sequencing only; they do not alter any finding's "
+            "severity, CVSS, business risk or the security score.",
+            styles["Small"],
+        ),
+        Spacer(1, 3 * mm),
+    ]
+
+    any_rows = False
+    for label, severity, guidance in _REMEDIATION_BUCKETS:
+        bucket = by_sev.get(severity, [])
+        if not bucket:
+            continue
+        any_rows = True
+        rows = []
+        for g in sorted(bucket, key=lambda x: -(x["final_risk_score"] or -1.0)):
+            risk = f"{g['final_risk_score']:.1f}" if g["final_risk_score"] is not None else "N/A"
+            locs = len(g["matched_ats"]) or g["occurrence_count"]
+            rows.append((
+                g.get("finding_id") or "N/A",
+                Paragraph(
+                    f"{_esc(g['title'])}<br/><font size=7.5 color='{B.MUTED}'>"
+                    f"risk {risk} · {locs} location(s)</font>",
+                    styles["Cell"],
+                ),
+            ))
+        block = [
+            Paragraph(f"{label} — {len(bucket)} finding(s)", styles["SubSection"]),
+            Paragraph(guidance, styles["Small"]),
+            Spacer(1, 1.5 * mm),
+            _card(rows, styles, colors, mm, accent=B.severity_color(severity), label_w=34),
+            Spacer(1, 4 * mm),
+        ]
+        # Keep a bucket heading with at least the start of its table, so a priority label is
+        # never stranded alone at the foot of a page.
+        out.append(KeepTogether(block[:4]))
+        out.append(block[4])
+
+    if not any_rows:
+        out.append(Paragraph("No active findings require remediation.", styles["Body"]))
+    return out
+
+
+def _evidence_story(data, styles, colors, mm):
+    """Evidence & Screenshots: the artifacts actually stored for these findings.
+
+    Lists only what the evidence store holds -- nothing is fabricated, and a finding with no
+    artifacts is simply not listed. Screenshots are embedded where they can be fetched and
+    decoded; a screenshot that cannot be retrieved is skipped rather than shown as a broken
+    placeholder."""
+    from reportlab.platypus import KeepTogether, Paragraph, Spacer
+
+    out: list = []
+    listed = 0
+    for g in _finding_groups(data.vulns):
+        items = g.get("evidence_items") or []
+        shots = g.get("screenshots") or []
+        if not items and not shots:
+            continue
+        listed += 1
+        rows = [
+            ("Finding ID", g.get("finding_id") or "N/A"),
+            ("Title", g["title"]),
+            ("Asset", (g.get("asset_values") or ["N/A"])[0] if g.get("asset_values") else "N/A"),
+        ]
+        loc = (g["matched_ats"] or ["N/A"])[0]
+        rows.append(("Endpoint", Paragraph(_esc(loc), styles["Endpoint"])))
+        for etype, uri in items:
+            rows.append((_evidence_type_label(etype), Paragraph(_esc(uri), styles["Endpoint"])))
+        # Screenshots are INDEXED here, not re-embedded: the image itself is already shown in
+        # the finding's own block, and fetching it a second time would double the object-store
+        # reads for every screenshot in the report. This section states that visual evidence
+        # exists, its checksum, and which finding it belongs to.
+        for _uri, checksum in shots:
+            rows.append(
+                ("Screenshot", f"captured · sha {str(checksum)[:12]} (shown with the finding)")
+            )
+        out.append(
+            KeepTogether([
+                _card(rows, styles, colors, mm, accent=B.severity_color(g["severity"])),
+                Spacer(1, 2 * mm),
+            ])
+        )
+
+    if not listed:
+        out.append(
+            Paragraph(
+                "No stored evidence artifacts are associated with the findings in this report.",
+                styles["Body"],
+            )
+        )
+    return out
+
+
+def _compliance_cards(data, styles, colors, mm):
+    """Compliance coverage as one card per framework, listing its mapped controls.
+
+    Same mappings, same counts -- only the layout changes. Nothing is added to or removed from
+    the compliance catalogue."""
+    from reportlab.platypus import KeepTogether, Paragraph, Spacer
+
+    per_fw: dict[str, dict[str, str]] = {}
+    for v in data.vulns:
+        for framework, control_id, desc in v.compliance or []:
+            per_fw.setdefault(framework, {})[control_id] = desc
+
+    if not per_fw:
+        return [Paragraph("No findings mapped to compliance controls.", styles["Body"])]
+
+    out = []
+    for framework in sorted(per_fw):
+        controls = per_fw[framework]
+        rows = [(cid, controls[cid] or "—") for cid in sorted(controls)]
+        out.append(
+            KeepTogether([
+                Paragraph(f"{framework_name(framework)} — {len(controls)} control(s)",
+                          styles["SubSection"]),
+                Spacer(1, 1.5 * mm),
+                _card(rows, styles, colors, mm, accent=B.CYAN, label_w=34),
+                Spacer(1, 4 * mm),
+            ])
+        )
+    return out
+
+
+def _attack_cards(data, styles, colors, mm):
+    """MITRE ATT&CK coverage grouped by tactic. Counts and mappings are unchanged."""
+    from reportlab.platypus import KeepTogether, Paragraph, Spacer
+
+    if not data.attack_techniques:
+        return [Paragraph("No active issues mapped to ATT&amp;CK techniques.", styles["Body"])]
+
+    by_tactic: dict[str, list[tuple[str, str, int]]] = {}
+    for tactic, tech_id, tech_name, count in data.attack_techniques:
+        by_tactic.setdefault(tactic, []).append((tech_id, tech_name, count))
+
+    out = []
+    for tactic in sorted(by_tactic):
+        rows = [
+            (tech_id, f"{tech_name} — {count} issue(s)")
+            for tech_id, tech_name, count in sorted(by_tactic[tactic])
+        ]
+        out.append(
+            KeepTogether([
+                Paragraph(f"{_esc(tactic)} — {len(rows)} technique(s)", styles["SubSection"]),
+                Spacer(1, 1.5 * mm),
+                _card(rows, styles, colors, mm, accent=B.VIOLET, label_w=30),
+                Spacer(1, 4 * mm),
+            ])
+        )
+    return out
 
 
 def _technical_metadata_rows(g: dict) -> list[tuple[str, str]]:
@@ -334,6 +589,12 @@ def _finding_groups(vulns) -> list[dict]:
             {
                 "key": key,
                 "title": rep.title,
+                # Stable, quotable id from the representative row's DATABASE identity -- not a
+                # loop index, so it survives re-ordering and regeneration (see VulnRow.finding_id).
+                "finding_id": getattr(rep, "finding_id", None),
+                # The scanner's OWN description text, passed through verbatim. None when the
+                # row has none; the block then says so rather than inventing prose.
+                "description": getattr(rep, "description", None),
                 # ISSUE-LEVEL SEVERITY CONTRACT (shared with _top_risk_groups and
                 # scoring.group_issues). Severity is the MAX across the group's members, NOT
                 # the representative member's own severity.
@@ -396,6 +657,15 @@ def _finding_groups(vulns) -> list[dict]:
                 "matched_ats": matched_ats,
                 "unlocated_count": unlocated,
                 "occurrence_count": len(members),
+                # Inventoried asset(s) the group's findings are anchored to, deduped and
+                # sorted. Empty when no member carries an asset linkage -- the report then
+                # says N/A rather than implying an asset is affected.
+                "asset_values": sorted({m.asset_value for m in members if getattr(m, "asset_value", None)}),
+                # Remediation guidance from the representative row, VERBATIM. None/empty when
+                # the pipeline produced none; never synthesised here.
+                "remediation_summary": getattr(rep, "remediation_summary", None),
+                "remediation_steps": getattr(rep, "remediation_steps", None),
+                "remediation_references": list(getattr(rep, "remediation_references", None) or []),
                 "compliance": sorted(compliance),
                 "evidence_uris": evidence_uris,
                 "evidence_items": evidence_items,
@@ -518,30 +788,262 @@ def _findings_summary(data) -> str:
     )
 
 
+class _SectionHeading:
+    """A section heading that also registers itself with the TOC and the PDF outline.
+
+    ReportLab builds a Table of Contents from `notify('TOCEntry', ...)` calls made by
+    flowables as they are laid out -- that is the only way the printed page numbers can be
+    the REAL ones. The same hook adds a PDF bookmark, so the document is navigable in a
+    viewer's sidebar.
+
+    Implemented as a thin Paragraph subclass created lazily (reportlab is imported inside the
+    render functions, so it cannot be subclassed at module import time)."""
+
+    def __new__(cls, text: str, style, level: int = 0, raw_text: str | None = None):
+        from reportlab.platypus import Paragraph
+
+        # `text` is markup-escaped for rendering; `raw_text` is the literal human string used
+        # for the TOC entry and the PDF bookmark, so neither shows "&amp;".
+        raw = raw_text if raw_text is not None else text
+        key = f"sec-{abs(hash(raw)) & 0xFFFFFFFF:08x}"
+
+        class _Heading(Paragraph):
+            def draw(self):
+                super().draw()
+                try:
+                    self.canv.bookmarkPage(key)
+                    self.canv.addOutlineEntry(raw, key, level=level, closed=False)
+                except Exception:
+                    pass  # navigation is a nicety; never fail a report over it
+
+            def afterFlowable(self):  # pragma: no cover - reportlab calls notify via doc
+                pass
+
+        para = _Heading(text, style)
+        para._toc_text = raw
+        para._toc_level = level
+        para._toc_key = key
+        return para
+
+
 def _esc(text) -> str:
     return html.escape(str(text)) if text is not None else ""
+
+
+def _cover_story(report_title: str, data: ReportData, styles, colors, mm):
+    """Cover page flowables for any MBS.PT report.
+
+    Deliberately not "text stacked at the top of page 1": a cyan->violet accent rule, the
+    vector mark, the brand lockup, the document title, the project/date block and a contact
+    card. Ends with a PageBreak, so section 1 always begins on a fresh page.
+
+    Pure presentation -- reads only the project name and the generation date."""
+    from reportlab.graphics.shapes import Drawing, Rect
+    from reportlab.platypus import (
+        NextPageTemplate,
+        PageBreak,
+        Paragraph,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    story = [Spacer(1, 14 * mm)]
+
+    logo = B.logo_drawing(26 * mm)
+    if logo is not None:
+        story.append(logo)
+        story.append(Spacer(1, 6 * mm))
+
+    # Two abutting bars reproduce the identity gradient without needing a gradient fill.
+    bar = Drawing(170 * mm, 3.2 * mm)
+    bar.add(Rect(0, 0, 85 * mm, 3.2 * mm, fillColor=colors.HexColor(B.CYAN), strokeColor=None))
+    bar.add(Rect(85 * mm, 0, 85 * mm, 3.2 * mm, fillColor=colors.HexColor(B.VIOLET), strokeColor=None))
+    story.append(bar)
+    story.append(Spacer(1, 8 * mm))
+
+    story.append(Paragraph(B.BRAND_NAME, styles["CoverBrand"]))
+    story.append(Paragraph(B.REPORT_SUITE, styles["CoverTitle"]))
+    story.append(Paragraph(report_title, styles["CoverSub"]))
+    story.append(Spacer(1, 14 * mm))
+
+    meta = Table(
+        [
+            ["Project", _esc(data.project_name)],
+            ["Generated", f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"],
+            ["Classification", "Confidential — for the named recipient only"],
+        ],
+        colWidths=[38 * mm, 122 * mm],
+    )
+    meta.setStyle(
+        TableStyle(
+            [
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor(B.MUTED)),
+                ("TEXTCOLOR", (1, 0), (1, -1), colors.HexColor(B.INK)),
+                ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LINEBELOW", (0, 0), (-1, -2), 0.3, colors.HexColor(B.RULE)),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    story.append(meta)
+    story.append(Spacer(1, 18 * mm))
+
+    contact = Table(
+        [[Paragraph(f"<b>{B.BRAND_NAME}</b>", styles["Small"])],
+         [Paragraph(_esc(B.CONTACT_EMAIL), styles["Small"])],
+         [Paragraph(_esc(B.CONTACT_PHONE), styles["Small"])]],
+        colWidths=[160 * mm],
+    )
+    contact.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(B.PAPER_TINT)),
+                ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor(B.RULE)),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]
+        )
+    )
+    story.append(contact)
+    # Switch to the "content" page template BEFORE the break, so every page after the cover
+    # gets the header/footer. Without this ReportLab keeps using the first registered
+    # template ("cover", which paints no chrome) for the whole document -- i.e. no page
+    # numbers anywhere, which is exactly the defect this redesign exists to fix.
+    story.append(NextPageTemplate("content"))
+    story.append(PageBreak())
+    return story
+
+
+class _TocDoc:
+    """Marker mixin documenting why multiBuild is used; see _build_document."""
+
+
+def _section(number: int, title: str, styles, colors, mm, toc_level: int = 0):
+    """A numbered section heading with a brand accent rule, registered for the TOC.
+
+    `_SectionHeading` notifies the TableOfContents of its page at build time, which is what
+    makes the printed page numbers real rather than guessed."""
+    from reportlab.graphics.shapes import Drawing, Rect
+    from reportlab.platypus import Spacer
+
+    # `title` goes through a Paragraph, which parses a bare "&" as the start of an entity --
+    # "MITRE ATT&CK" rendered as "ATT&CK;". Escaping here keeps section titles literal, while
+    # the TOC entry keeps the human text.
+    out = [
+        Spacer(1, 2 * mm),
+        _SectionHeading(f"{number}. {_esc(title)}", styles["Section"], toc_level, raw_text=f"{number}. {title}"),
+    ]
+    rule = Drawing(170 * mm, 1.6 * mm)
+    rule.add(Rect(0, 0, 26 * mm, 1.6 * mm, fillColor=colors.HexColor(B.CYAN), strokeColor=None))
+    rule.add(Rect(26 * mm, 0, 14 * mm, 1.6 * mm, fillColor=colors.HexColor(B.VIOLET), strokeColor=None))
+    out.append(rule)
+    out.append(Spacer(1, 4 * mm))
+    return out
+
+
+def _toc_story(styles, mm):
+    """Table of Contents. Entries are contributed by _SectionHeading during the build, so the
+    printed page numbers are the REAL ones and no entry can be listed that does not exist."""
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import PageBreak, Paragraph, Spacer
+    from reportlab.platypus.tableofcontents import TableOfContents
+
+    toc = TableOfContents()
+    toc.levelStyles = [
+        ParagraphStyle("TOC0", fontName="Helvetica", fontSize=10, leading=17, leftIndent=0,
+                       firstLineIndent=0),
+        ParagraphStyle("TOC1", fontName="Helvetica", fontSize=9, leading=14, leftIndent=10),
+    ]
+    return [Paragraph("Table of Contents", styles["H1"]), Spacer(1, 6 * mm), toc,
+            PageBreak()]
+
+
+def _build_document(buf, title: str, report_title: str, project_name: str, story) -> None:
+    """Build a report with page furniture and a two-pass TOC.
+
+    multiBuild (not build) is required: the first pass discovers which page each section
+    heading lands on, the second prints those numbers into the TOC. Falls back to a single
+    build if multiBuild is unavailable, so a report is never lost to TOC machinery."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate
+    from reportlab.lib.units import mm
+
+    from apps.api.modules.reports._page_furniture import (
+        MARGIN_B,
+        MARGIN_L,
+        MARGIN_R,
+        MARGIN_T,
+        PageFurniture,
+    )
+
+    generated = f"{datetime.now(timezone.utc):%Y-%m-%d}"
+    furniture = PageFurniture(report_title, project_name, generated)
+
+    class _Doc(BaseDocTemplate):
+        """Feeds TOC entries as headings are laid out.
+
+        ReportLab calls afterFlowable() for every flowable it places; a heading tagged by
+        _SectionHeading notifies the TableOfContents of its text AND the page it actually
+        landed on. Without this hook the TOC renders empty."""
+
+        def afterFlowable(self, flowable):
+            text = getattr(flowable, "_toc_text", None)
+            if text:
+                # The TOC renders entries as Paragraphs, so a bare "&" would become
+                # "&CK;" there too -- escape for the TOC while the bookmark keeps raw text.
+                self.notify(
+                    "TOCEntry",
+                    (getattr(flowable, "_toc_level", 0), _esc(text), self.page,
+                     getattr(flowable, "_toc_key", None)),
+                )
+
+    doc = _Doc(
+        buf,
+        pagesize=A4,
+        title=title,
+        author=B.BRAND_NAME,
+        subject=f"{B.REPORT_SUITE} — {project_name}",
+        leftMargin=MARGIN_L * mm,
+        rightMargin=MARGIN_R * mm,
+        topMargin=MARGIN_T * mm,
+        bottomMargin=MARGIN_B * mm,
+    )
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="body")
+    doc.addPageTemplates(
+        [
+            PageTemplate(id="cover", frames=[frame], onPage=furniture.cover),
+            PageTemplate(id="content", frames=[frame], onPage=furniture.content),
+        ]
+    )
+    try:
+        doc.multiBuild(story)
+    except Exception:
+        # A TOC that cannot resolve must not cost the reader the whole report.
+        doc.build(story)
 
 
 def render_executive(data: ReportData) -> bytes:
     from io import BytesIO
 
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table
+    from reportlab.platypus import Paragraph, Spacer, Table
 
     styles = _styles(getSampleStyleSheet, ParagraphStyle, colors)
     buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, title=f"Executive Report — {data.project_name}")
     story = []
 
-    story.append(Paragraph("MBS.SC — Executive Security Report", styles["H1"]))
-    story.append(Paragraph(f"Project: {_esc(data.project_name)}", styles["Meta"]))
-    story.append(
-        Paragraph(f"Generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}", styles["Meta"])
-    )
-    story.append(Spacer(1, 8 * mm))
+    # Cover + Table of Contents. Section 1 begins on a fresh page (the cover ends with a
+    # PageBreak), so no section ever starts mid-page after front matter.
+    story += _cover_story("Executive Report", data, styles, colors, mm)
+    story += _toc_story(styles, mm)
+
+    story += _section(1, "Executive Summary", styles, colors, mm)
 
     # Security score panel
     band = _score_band(data.security_score)
@@ -572,7 +1074,8 @@ def render_executive(data: ReportData) -> bytes:
     # how much evidence supports it. Executives were shown only severity, so 157 detections read
     # as 157 confirmed vulnerabilities. Both axes are now stated, and the sentence below names
     # the distinction explicitly rather than leaving it to be inferred.
-    story.append(Paragraph("Findings by verification status", styles["H2"]))
+    story += _section(2, "Findings Summary", styles, colors, mm)
+    story.append(Paragraph("Findings by verification status", styles["SubSection"]))
     ver_counts = _verification_summary(data)
     ver_rows = [["Verification", "Count"]]
     for state in (VERIFIED, PARTIALLY_VERIFIED, UNVERIFIED):
@@ -593,7 +1096,7 @@ def render_executive(data: ReportData) -> bytes:
     story.append(Spacer(1, 6 * mm))
 
     # Severity summary table
-    story.append(Paragraph("Findings by severity", styles["H2"]))
+    story.append(Paragraph("Findings by severity", styles["SubSection"]))
     sev_rows = [["Severity", "Count"]]
     for sev in ("critical", "high", "medium", "low", "info"):
         sev_rows.append([sev.capitalize(), str(data.severity_counts.get(sev, 0))])
@@ -608,7 +1111,7 @@ def render_executive(data: ReportData) -> bytes:
     # appear ONLY when the finding is linked to an inventoried asset -- an empty list means the
     # findings carry no asset linkage, never that nothing is affected. Full per-finding endpoints
     # remain in the technical report.
-    story.append(Paragraph("Affected assets / endpoints", styles["H2"]))
+    story += _section(3, "Affected Assets & Endpoints", styles, colors, mm)
     assets = data.affected_assets()
     endpoints = data.affected_endpoint_count()
     endpoint_phrase = (
@@ -657,7 +1160,8 @@ def render_executive(data: ReportData) -> bytes:
     # only: vulnerability identity, fingerprints, and DB deduplication are unchanged (see
     # _top_risk_groups). Deterministic ordering: max business risk DESC -> max CVSS DESC ->
     # severity DESC -> representative title ASC.
-    story.append(Paragraph("Top risks (by business risk score)", styles["H2"]))
+    story += _section(4, "Key Risks", styles, colors, mm)
+    story.append(Paragraph("Ranked by business risk score", styles["SubSection"]))
     groups = _top_risk_groups(data.vulns)[:10]
     if groups:
         story.append(
@@ -694,7 +1198,7 @@ def render_executive(data: ReportData) -> bytes:
 
     story.append(Spacer(1, 6 * mm))
     frameworks = sorted({fw for v in data.vulns for (fw, _, _) in v.compliance})
-    story.append(Paragraph("Compliance coverage", styles["H2"]))
+    story += _section(5, "Compliance Coverage", styles, colors, mm)
     story.append(
         Paragraph(
             "Findings mapped to controls in: " + (", ".join(framework_name(fw) for fw in frameworks) or "none")
@@ -706,7 +1210,7 @@ def render_executive(data: ReportData) -> bytes:
     # MITRE ATT&CK coverage: which adversary techniques the findings map to, most
     # frequently observed first. The per-scan kill-chain view sequences these.
     story.append(Spacer(1, 6 * mm))
-    story.append(Paragraph("MITRE ATT&CK coverage", styles["H2"]))
+    story += _section(6, "MITRE ATT&CK Coverage", styles, colors, mm)
     if data.attack_techniques:
         att_rows = [["Tactic", "Technique", "ID", "Issues"]]
         for tactic, tid, tname, count in data.attack_techniques[:15]:
@@ -725,14 +1229,14 @@ def render_executive(data: ReportData) -> bytes:
             )
         )
     else:
-        story.append(Paragraph("No active issues mapped to ATT&CK techniques.", styles["Body"]))
+        story.append(Paragraph("No active issues mapped to ATT&amp;CK techniques.", styles["Body"]))
 
     # Autonomous-engagement attack graph (M4.4.6): evidence-backed asset -> service ->
     # finding -> technique -> access relationships, plus any confirmed access. Present
     # only for agent-driven scans; fail-soft otherwise. Never reports unsupported
     # privilege escalation / lateral movement.
     story.append(Spacer(1, 6 * mm))
-    story.append(Paragraph("Autonomous engagement: attack graph", styles["H2"]))
+    story.append(Paragraph("Autonomous engagement: attack graph", styles["SubSection"]))
     ag = data.attack_graph or {}
     if ag.get("has_data"):
         counts = ag.get("node_counts", {})
@@ -770,7 +1274,22 @@ def render_executive(data: ReportData) -> bytes:
             Paragraph("No autonomous engagement graph for this project (non-agent scans).", styles["Body"])
         )
 
-    doc.build(story)
+    story += _section(7, "Conclusion", styles, colors, mm)
+    story.append(
+        Paragraph(
+            f"This assessment recorded {data.active_vulns} active finding(s) across "
+            f"{data.total_vulns} total, producing a security score of "
+            f"{data.security_score}/100 ({band}). Findings are detections produced by the "
+            "security pipeline; verification status indicates the level of evidence "
+            "supporting each one. Remediation should follow the priority order in Key Risks, "
+            "highest business risk first. Full technical detail, evidence and reproduction "
+            "metadata are provided in the accompanying Technical Report.",
+            styles["Body"],
+        )
+    )
+
+    _build_document(buf, f"Executive Report — {data.project_name}", "Executive Report",
+                    data.project_name, story)
     return buf.getvalue()
 
 
@@ -778,45 +1297,132 @@ def render_technical(data: ReportData) -> bytes:
     from io import BytesIO
 
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
 
     styles = _styles(getSampleStyleSheet, ParagraphStyle, colors)
     buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, title=f"Technical Report — {data.project_name}")
     story = []
 
-    story.append(Paragraph("MBS.SC — Technical Security Report", styles["H1"]))
-    story.append(Paragraph(f"Project: {_esc(data.project_name)}", styles["Meta"]))
-    story.append(Paragraph(f"Generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}", styles["Meta"]))
+    story += _cover_story("Technical Report", data, styles, colors, mm)
+    story += _toc_story(styles, mm)
+
+    # --- 1. Assessment Overview ----------------------------------------------------------
+    story += _section(1, "Assessment Overview", styles, colors, mm)
     story.append(
-        Paragraph(f"Security score {data.security_score}/100 · {data.total_vulns} finding(s).", styles["Meta"])
+        Paragraph(
+            f"Security score {data.security_score}/100 · {data.total_vulns} finding(s) "
+            f"({data.active_vulns} active).",
+            styles["Body"],
+        )
     )
     story.append(Paragraph(_findings_summary(data), styles["Small"]))
-    story.append(Spacer(1, 6 * mm))
+    story.append(Spacer(1, 3 * mm))
+    ver = _verification_summary(data)
+    story.append(
+        Paragraph(
+            f"Verification of active findings — Verified: {ver[VERIFIED]} · "
+            f"Partially Verified: {ver[PARTIALLY_VERIFIED]} · Unverified: {ver[UNVERIFIED]}. "
+            f"{_score_impacting_count(data)} finding(s) affect the security score.",
+            styles["Small"],
+        )
+    )
+
+    # --- 2. Scope & Methodology ----------------------------------------------------------
+    # Describes ONLY what the pipeline actually does; no methodology is claimed that the
+    # system does not perform.
+    story += _section(2, "Scope & Methodology", styles, colors, mm)
+    tools = sorted({v.tool_name for v in data.vulns if getattr(v, "tool_name", None) and v.tool_name != "N/A"})
+    story.append(
+        Paragraph(
+            "Findings in this report were produced by automated security scanning of the "
+            "in-scope targets recorded for this project. Each finding is deduplicated to an "
+            "issue identity and reported with the locations at which it was observed. "
+            "Severity is the scanner's rating; CVSS is the technical base score where one is "
+            "available; business risk additionally weights CVSS by asset criticality. "
+            "Verification status states the evidence supporting each finding and never alters "
+            "its severity or score.",
+            styles["Body"],
+        )
+    )
+    story.append(
+        Paragraph(f"Producing tool(s): {_esc(', '.join(tools) or 'N/A')}", styles["Small"])
+    )
+
+    # --- 3. Findings Summary -------------------------------------------------------------
+    story += _section(3, "Findings Summary", styles, colors, mm)
+    sev_rows = [["Severity", "All findings", "Active"]]
+    for sev in ("critical", "high", "medium", "low", "info"):
+        sev_rows.append([
+            sev.capitalize(),
+            str(data.severity_counts.get(sev, 0)),
+            str(data.active_severity_counts.get(sev, 0)),
+        ])
+    stbl = Table(sev_rows, colWidths=[60 * mm, 45 * mm, 45 * mm])
+    stbl.setStyle(_table_style(colors))
+    story.append(stbl)
 
     if not data.vulns:
+        story.append(Spacer(1, 4 * mm))
         story.append(Paragraph("No findings recorded for this project.", styles["Body"]))
-        doc.build(story)
+        _build_document(buf, f"Technical Report — {data.project_name}", "Technical Report",
+                        data.project_name, story)
         return buf.getvalue()
 
+    # --- 4. Detailed Findings ------------------------------------------------------------
     # One block per VULNERABILITY, not per row: a template observed at many URLs is a single
     # finding with its affected locations listed, instead of the same severity/CVSS/risk text
     # repeated once per location. Presentation only -- see _finding_groups.
+    story += _section(4, "Detailed Findings", styles, colors, mm)
     for i, g in enumerate(_finding_groups(data.vulns), 1):
         story.append(_finding_block(i, g, styles, colors, Paragraph, Table, TableStyle, mm))
         story.append(Spacer(1, 4 * mm))
 
-    doc.build(story)
+    # --- 5. Evidence & Screenshots -------------------------------------------------------
+    story += _section(5, "Evidence & Screenshots", styles, colors, mm)
+    story += _evidence_story(data, styles, colors, mm)
+
+    # --- 6. Compliance Coverage ----------------------------------------------------------
+    story += _section(6, "Compliance Coverage", styles, colors, mm)
+    story += _compliance_cards(data, styles, colors, mm)
+
+    # --- 7. MITRE ATT&CK -----------------------------------------------------------------
+    story += _section(7, "MITRE ATT&CK Coverage", styles, colors, mm)
+    story += _attack_cards(data, styles, colors, mm)
+
+    # --- 8. Remediation Plan -------------------------------------------------------------
+    story += _section(8, "Remediation Plan", styles, colors, mm)
+    story += _remediation_plan_story(data, styles, colors, mm)
+
+    # --- 9. Appendix ---------------------------------------------------------------------
+    story += _section(9, "Appendix", styles, colors, mm)
+    story.append(
+        Paragraph(
+            "Finding identifiers (MBS-XXXXXXXX) are derived from each finding's stored "
+            "identity and remain stable across report regenerations, so they can be quoted "
+            "in correspondence. Fields shown as N/A were not present in the scan evidence "
+            "and have not been inferred.",
+            styles["Small"],
+        )
+    )
+    story.append(Spacer(1, 3 * mm))
+    story.append(
+        Paragraph(
+            f"Report produced by {B.BRAND_NAME} · {B.CONTACT_EMAIL} · {B.CONTACT_PHONE}",
+            styles["Small"],
+        )
+    )
+
+    _build_document(buf, f"Technical Report — {data.project_name}", "Technical Report",
+                    data.project_name, story)
     return buf.getvalue()
 
 
 def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, mm):
     """Render ONE vulnerability (a group from _finding_groups), with its affected locations
     listed once at the end instead of the whole block repeating per location."""
-    from reportlab.platypus import KeepTogether
+    from reportlab.platypus import KeepTogether, Spacer
 
     color = _SEVERITY_COLORS.get(g["severity"], "#374151")
     # Detection vs vulnerability, stated in the heading so a technology/WAF/version DETECTION
@@ -824,8 +1430,11 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
     # scoring are unchanged (see classification.py).
     kind_label = "DETECTION" if g.get("classification") == "detection" else "VULNERABILITY"
     parts = [
-        Paragraph(f"{idx}. {_esc(g['title'])}", styles["H2"]),
-        Paragraph(f"Type: {kind_label}", styles["Small"]),
+        Paragraph(f"{idx}. {_esc(g['title'])}", styles["FindingTitle"]),
+        # Stable identifier first: it is what a client quotes back, so it must be visible
+        # before any of the technical detail.
+        Paragraph(f"Finding ID: {_esc(g.get('finding_id') or 'N/A')}  ·  Type: {kind_label}",
+                  styles["Small"]),
         Paragraph(
             f'<font color="{color}"><b>{g["severity"].upper()}</b></font> · status: {_esc(g["status"])}'
             # `is not None`, never truthiness: a real CVSS of 0.0 must show as "CVSS 0.0",
@@ -850,16 +1459,70 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
         )
     )
     parts.append(Paragraph(_esc(verification_note(_ver)), styles["Small"]))
-    # P2-4: TECHNICAL-report metadata, emitted as one labelled block in a fixed order instead
-    # of a run of loose lines. This is the detail an analyst needs to trace a finding back to
-    # the exact scanner artifact and reproduce it, so every field is kept and nothing is
-    # abbreviated away. Values are printed EXACTLY as stored -- no inference, no derived
-    # meaning, and none of it feeds severity, risk, classification or verification.
-    # A missing value renders "N/A"; it never crashes and is never invented.
+    parts.append(Spacer(1, 2 * mm))
+
+    # FACT CARD. The same fields as before (identity, severity, risk, verification, status,
+    # asset, endpoint, tool/template/matcher/CVE), presented as one scannable label/value block
+    # with a severity-coloured edge instead of a run of loose lines. Values are printed EXACTLY
+    # as stored; a missing one renders "N/A" and is never inferred.
+    endpoints = g["matched_ats"]
+    assets = g.get("asset_values") or []
+    card_rows: list[tuple[str, object]] = [
+        ("Finding ID", g.get("finding_id") or "N/A"),
+        ("Severity", (g["severity"] or "N/A").upper()),
+        ("CVSS", f"{g['cvss_score']}" if g["cvss_score"] is not None else "N/A"),
+        (
+            "Risk",
+            f"{g['final_risk_score']:.1f}/10" if g["final_risk_score"] is not None else "N/A",
+        ),
+        ("Verification", f"{verification_label(_ver)} · {confidence_label(_conf)} confidence"),
+        ("Status", g.get("status") or "N/A"),
+        ("Asset", ", ".join(assets) if assets else "N/A"),
+        (
+            "Endpoint",
+            Paragraph(_esc(endpoints[0]) if endpoints else "N/A", styles["Endpoint"]),
+        ),
+    ]
+    if len(endpoints) > 1:
+        card_rows.append(("Other endpoints", f"{len(endpoints) - 1} more (listed below)"))
     for label, value in _technical_metadata_rows(g):
-        parts.append(Paragraph(f"{label}: {_esc(value)}", styles["Small"]))
+        if label in ("Status",):  # already stated above; do not repeat
+            continue
+        card_rows.append((label, value))
     if g["cvss_vector"]:
-        parts.append(Paragraph(f"CVSS vector: {_esc(g['cvss_vector'])}", styles["Small"]))
+        card_rows.append(("CVSS vector", g["cvss_vector"]))
+    parts.append(_card(card_rows, styles, colors, mm, accent=color))
+    parts.append(Spacer(1, 2.5 * mm))
+
+    # DESCRIPTION -- the scanner's own account of the finding, rendered VERBATIM.
+    # The `vulnerabilities.description` column has always been populated for most findings but
+    # was never loaded into the report, so Detailed Findings could show only a bare title.
+    # Nothing here is generated, summarised or inferred: when the column is empty the block
+    # says the text was not present in the scan evidence rather than inventing one.
+    description = (g.get("description") or "").strip()
+    parts.append(Paragraph("Description", styles["Label"]))
+    parts.append(
+        Paragraph(
+            _esc(description) if description else "Not available in scan evidence.",
+            styles["Body"] if description else styles["Small"],
+        )
+    )
+
+    # REMEDIATION -- shown ONLY when the pipeline actually produced guidance for this finding.
+    # Rendered verbatim; never generated, paraphrased or inferred. When absent the block says
+    # so plainly, which is the honest answer for a dataset where no remediation text exists.
+    rem_summary = (g.get("remediation_summary") or "").strip()
+    rem_steps = (g.get("remediation_steps") or "").strip()
+    rem_refs = g.get("remediation_references") or []
+    if rem_summary or rem_steps or rem_refs:
+        parts.append(Paragraph("Recommendation", styles["Label"]))
+        if rem_summary:
+            parts.append(Paragraph(_esc(rem_summary), styles["Body"]))
+        if rem_steps:
+            parts.append(Paragraph(_esc(rem_steps), styles["Small"]))
+        for ref in rem_refs:
+            parts.append(Paragraph(f"• {_esc(str(ref))}", styles["Endpoint"]))
+        parts.append(Spacer(1, 2 * mm))
 
     # --- Risk breakdown: keep TECHNICAL severity and BUSINESS risk visibly separate ---------
     # A single "risk 10.0" line let a MEDIUM CVSS 5.5 on a critical asset read as a Critical
@@ -904,7 +1567,12 @@ def _finding_block(idx, g: dict, styles, colors, Paragraph, Table, TableStyle, m
                 )
             )
     if g["risk_rationale"]:
-        parts.append(Paragraph(f"Risk rationale: {_esc(g['risk_rationale'])}", styles["Small"]))
+        parts.append(
+            Paragraph(
+                f"Risk rationale: {_esc(_sanitise_risk_rationale(g['risk_rationale'], g['final_risk_score']))}",
+                styles["Small"],
+            )
+        )
     if g["compliance"]:
         controls = "; ".join(f"{framework_name(fw)} {cid}" for (fw, cid, _) in g["compliance"])
         parts.append(Paragraph(f"Compliance: {_esc(controls)}", styles["Small"]))
@@ -1016,6 +1684,43 @@ def _styles(getSampleStyleSheet, ParagraphStyle, colors):
         "Small": ParagraphStyle("Small", parent=base["Normal"], fontSize=9, leading=12),
         "Mono": ParagraphStyle("Mono", parent=base["Normal"], fontName="Courier", fontSize=8, leading=11),
         "Cell": ParagraphStyle("Cell", parent=base["Normal"], fontSize=9, leading=12),
+        # --- MBS.PT report typography -----------------------------------------------------
+        # Widened from the single _BRAND colour to a named set, so cover / section / finding
+        # / footer text are styled consistently instead of ad hoc at each call site.
+        "CoverBrand": ParagraphStyle(
+            "CoverBrand", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=30,
+            textColor=colors.HexColor(B.DARK), leading=34, spaceAfter=2,
+        ),
+        "CoverTitle": ParagraphStyle(
+            "CoverTitle", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=17,
+            textColor=colors.HexColor(B.DARK), leading=21,
+        ),
+        "CoverSub": ParagraphStyle(
+            "CoverSub", parent=base["Normal"], fontSize=11.5,
+            textColor=colors.HexColor(B.MUTED), leading=15, spaceBefore=2,
+        ),
+        "Section": ParagraphStyle(
+            "Section", parent=base["Heading1"], fontSize=14.5,
+            textColor=colors.HexColor(B.DARK), spaceBefore=0, spaceAfter=3,
+        ),
+        "SubSection": ParagraphStyle(
+            "SubSection", parent=base["Heading2"], fontSize=11,
+            textColor=colors.HexColor(B.DARK), spaceBefore=5, spaceAfter=2,
+        ),
+        "FindingTitle": ParagraphStyle(
+            "FindingTitle", parent=base["Heading2"], fontSize=11.5,
+            textColor=colors.HexColor(B.INK), spaceBefore=3, spaceAfter=1,
+        ),
+        "Label": ParagraphStyle(
+            "Label", parent=base["Normal"], fontSize=8.5, fontName="Helvetica-Bold",
+            textColor=colors.HexColor(B.MUTED), leading=11,
+        ),
+        # Long URLs/endpoints: 7.5pt Courier with a small leading, and CJK-style wrapping so a
+        # single unbroken URL wraps mid-token instead of overflowing the frame.
+        "Endpoint": ParagraphStyle(
+            "Endpoint", parent=base["Normal"], fontName="Courier", fontSize=7.5, leading=10,
+            wordWrap="CJK", textColor=colors.HexColor(B.INK),
+        ),
     }
 
 

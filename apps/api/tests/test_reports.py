@@ -197,12 +197,58 @@ def _finding_block_text(v: VulnRow) -> str:
 
     texts: list[str] = []
 
+    def _collect(node, sink: list[str]):
+        """Append a flowable's plain text (recursing into nested cards) into `sink`."""
+        if node is None:
+            return
+        content = getattr(node, "_content", None)
+        if content is not None:
+            for child in content:
+                _collect(child, sink)
+            return
+        cells = getattr(node, "_cellvalues", None)
+        if cells is not None:
+            for row in cells:
+                for cell in row:
+                    _collect(cell, sink)
+            return
+        if hasattr(node, "getPlainText"):
+            sink.append(node.getPlainText())
+        elif isinstance(node, str):
+            sink.append(node)
+
     def _walk(flowable):
         content = getattr(flowable, "_content", None)
         if content is not None:
             for child in content:
                 _walk(child)
-        elif hasattr(flowable, "getPlainText"):
+            return
+        # Finding metadata is now laid out in label/value CARDS (Tables) rather than a run of
+        # loose Paragraphs, so the walk must descend into table cells too -- otherwise this
+        # helper silently returns less text than the block actually renders and every
+        # assertion built on it becomes vacuous.
+        cellvalues = getattr(flowable, "_cellvalues", None)
+        if cellvalues is not None:
+            for row in cellvalues:
+                # A card row is (label, value). Re-joined as "Label: value" so the text reads
+                # the way it did when these facts were loose Paragraphs -- the layout changed,
+                # the content did not, and existing assertions stay meaningful.
+                cells = []
+                for cell in row:
+                    sub: list[str] = []
+                    if isinstance(cell, (list, tuple)):
+                        for item in cell:
+                            _collect(item, sub)
+                    else:
+                        _collect(cell, sub)
+                    cells.append(" ".join(x for x in sub if x))
+                cells = [c for c in cells if c]
+                if len(cells) == 2:
+                    texts.append(f"{cells[0]}: {cells[1]}")
+                elif cells:
+                    texts.append(" ".join(cells))
+            return
+        if hasattr(flowable, "getPlainText"):
             texts.append(flowable.getPlainText())
 
     _walk(block)
@@ -221,11 +267,47 @@ def _group_block_text(group: dict) -> str:
 
     texts: list[str] = []
 
+    def _collect(node, sink: list[str]):
+        """Append a flowable's plain text (recursing into nested cards) into `sink`."""
+        if node is None:
+            return
+        content = getattr(node, "_content", None)
+        if content is not None:
+            for child in content:
+                _collect(child, sink)
+            return
+        cells = getattr(node, "_cellvalues", None)
+        if cells is not None:
+            for row in cells:
+                for cell in row:
+                    _collect(cell, sink)
+            return
+        if hasattr(node, "getPlainText"):
+            sink.append(node.getPlainText())
+        elif isinstance(node, str):
+            sink.append(node)
+
     def _walk(flowable):
         content = getattr(flowable, "_content", None)
         if content is not None:
             for child in content:
                 _walk(child)
+            return
+        # Metadata is laid out in label/value CARDS (Tables); re-joined as "Label: value" so
+        # this helper reports what the block renders rather than silently dropping the card.
+        cellvalues = getattr(flowable, "_cellvalues", None)
+        if cellvalues is not None:
+            for row in cellvalues:
+                cells = []
+                for cell in row:
+                    sub: list[str] = []
+                    _collect(cell, sub)
+                    cells.append(" ".join(x for x in sub if x))
+                cells = [c for c in cells if c]
+                if len(cells) == 2:
+                    texts.append(f"{cells[0]}: {cells[1]}")
+                elif cells:
+                    texts.append(" ".join(cells))
             return
         text = getattr(flowable, "text", None)
         if text is not None:
@@ -416,19 +498,35 @@ def _exec_summary_text(data: ReportData) -> str:
     import reportlab.platypus as platypus
 
     captured: list[str] = []
-    orig_build = platypus.SimpleDocTemplate.build
 
-    def _capture_build(self, flowables, *a, **k):
-        for f in flowables:
+    def _grab(flowables):
+        for f in flowables or ():
             if hasattr(f, "getPlainText"):
                 captured.append(f.getPlainText())
+
+    # The Executive report is built through BaseDocTemplate.multiBuild (a two-pass build is
+    # required for real Table-of-Contents page numbers), while other reports still use
+    # SimpleDocTemplate.build. BOTH are hooked so this helper captures the story regardless of
+    # which build path a report uses -- hooking only one silently returned "" and made every
+    # assertion below vacuous.
+    orig_build = platypus.BaseDocTemplate.build
+    orig_multi = platypus.BaseDocTemplate.multiBuild
+
+    def _capture_build(self, flowables, *a, **k):
+        _grab(flowables)
         return orig_build(self, flowables, *a, **k)
 
-    platypus.SimpleDocTemplate.build = _capture_build
+    def _capture_multi(self, flowables, *a, **k):
+        _grab(flowables)
+        return orig_multi(self, flowables, *a, **k)
+
+    platypus.BaseDocTemplate.build = _capture_build
+    platypus.BaseDocTemplate.multiBuild = _capture_multi
     try:
         render.render("executive", data)
     finally:
-        platypus.SimpleDocTemplate.build = orig_build
+        platypus.BaseDocTemplate.build = orig_build
+        platypus.BaseDocTemplate.multiBuild = orig_multi
     return "\n".join(captured)
 
 
@@ -1326,3 +1424,297 @@ def test_attack_mixed_dataset_matches_the_security_score_population():
     # The score sees exactly the same one issue.
     scorable = [r for r, _ in rows]
     assert len(group_issues(scorable)) == 1
+
+
+# ==========================================================================================
+# ATT&CK API / PDF PARITY (P1 closure)
+#
+# The PDF tally (data.gather_report_data) already counted DISTINCT LOGICAL ISSUES over the
+# scorable population. The API surfaces did not: attack_matrix_for_scan counted raw
+# `attack_mappings` ROWS with no status/classification filter, and kill_chain_steps
+# de-duplicated by TITLE. So one vulnerability observed at five URLs -- five
+# `vulnerabilities` rows, because the dedup identity is (project_id, fingerprint) and a
+# fingerprint is `template_id|matcher|matched_at` -- read as 5 in the API and 1 in the PDF,
+# and a remediated finding still counted as live coverage in the API.
+#
+# attack.aggregation is now the single source of truth. These tests pin BOTH the canonical
+# semantics and the API==PDF equality, so the two surfaces cannot drift apart again.
+# ==========================================================================================
+
+import uuid as _uuid  # noqa: E402
+
+from apps.api.modules.attack.aggregation import (  # noqa: E402
+    count_issues_by_technique,
+    scorable_issue_key,
+    scorable_vuln_ids,
+)
+
+
+class _AtkVuln:
+    """Minimal stand-in for a `Vulnerability` ORM row (id + the columns the canonical
+    predicates read). The fingerprint is built exactly as nuclei_runner does --
+    `template_id|matcher|matched_at` -- so identity is recovered the same way in production."""
+
+    def __init__(self, template_id="unix-command-injection", matched_at="https://h/1",
+                 severity="high", status="open", cvss_score=8.0, category="cwe-78",
+                 title="Command Injection"):
+        self.id = _uuid.uuid4()
+        self.fingerprint = f"{template_id}|matcher|{matched_at}"
+        self.title = title
+        self.severity = severity
+        self.status = status
+        self.cvss_score = cvss_score
+        self.category = category
+
+
+class _AtkMapping:
+    def __init__(self, vuln, technique_id="T1190", technique_name="Exploit Public-Facing Application"):
+        self.vulnerability_id = vuln.id
+        self.tactic_id = "TA0001"
+        self.tactic_name = "Initial Access"
+        self.technique_id = technique_id
+        self.technique_name = technique_name
+        self.kill_chain_phase = "exploitation"
+
+
+def _counts(vulns, mappings):
+    """technique_id -> issue count, via the canonical aggregator."""
+    by_id = {v.id: v for v in vulns}
+    return {k[2]: n for k, n in count_issues_by_technique(mappings, by_id).items()}
+
+
+def _pdf_counts(vulns, mappings):
+    """The PDF's own rule, computed independently here from report VulnRows rather than by
+    calling the aggregator -- so the parity assertions below compare two separate
+    implementations of "one issue", not one implementation against itself."""
+    from apps.api.modules.reports.data import VulnRow, _parse_fingerprint
+    from apps.api.modules.reports.scoring import is_scorable, issue_key
+
+    rows = {}
+    for v in vulns:
+        template_id, matcher, matched_at = _parse_fingerprint(v.fingerprint)
+        rows[v.id] = VulnRow(
+            id=v.id, title=v.title, severity=v.severity, status=v.status, category=v.category,
+            cvss_score=v.cvss_score, cvss_vector=None, final_risk_score=None, risk_rationale=None,
+            compliance=[], evidence_uris=[], template_id=template_id,
+            matcher_name=matcher, matched_at=matched_at,
+        )
+    keys_by_tech = {}
+    for m in mappings:
+        row = rows.get(m.vulnerability_id)
+        if row is None or not is_scorable(row):
+            continue
+        keys_by_tech.setdefault(m.technique_id, set()).add(issue_key(row))
+    return {t: len(k) for t, k in keys_by_tech.items()}
+
+
+def test_attack_one_issue_at_many_locations_counts_once():
+    """The headline over-count: five locations of ONE template are one issue, not five."""
+    vulns = [_AtkVuln(matched_at=f"https://h/{i}") for i in range(5)]
+    assert _counts(vulns, [_AtkMapping(v) for v in vulns]) == {"T1190": 1}
+
+
+def test_attack_duplicate_mappings_for_one_finding_count_once():
+    v = _AtkVuln()
+    assert _counts([v], [_AtkMapping(v), _AtkMapping(v)]) == {"T1190": 1}
+
+
+def test_attack_excludes_fixed_false_positive_and_accepted_risk():
+    """A remediated or dismissed finding is not current ATT&CK coverage."""
+    for status in ("fixed", "false_positive", "accepted_risk"):
+        v = _AtkVuln(status=status)
+        assert _counts([v], [_AtkMapping(v)]) == {}, f"status={status} still counted"
+
+
+def test_attack_api_excludes_informational_findings():
+    v = _AtkVuln(severity="info", cvss_score=None)
+    assert _counts([v], [_AtkMapping(v)]) == {}
+
+
+def test_attack_excludes_detections_including_stale_mappings():
+    """A technology/WAF DETECTION contributes nothing -- and because the filter is applied at
+    READ time, a stale mapping row written before the detection guard existed is excluded
+    without needing a backfill migration."""
+    v = _AtkVuln(template_id="tech-detect", cvss_score=None, category="cwe-200", severity="low")
+    assert _counts([v], [_AtkMapping(v)]) == {}
+
+
+def test_attack_api_distinct_issues_sharing_a_technique_count_separately():
+    a = _AtkVuln(template_id="tmpl-a")
+    b = _AtkVuln(template_id="tmpl-b")
+    assert _counts([a, b], [_AtkMapping(a), _AtkMapping(b)]) == {"T1190": 2}
+
+
+def test_attack_api_one_issue_with_several_techniques_counts_once_per_technique():
+    v = _AtkVuln()
+    counts = _counts([v], [_AtkMapping(v, "T1190"), _AtkMapping(v, "T1059", "Command Interpreter")])
+    assert counts == {"T1190": 1, "T1059": 1}
+
+
+def test_attack_legacy_row_without_template_id_falls_back_to_title():
+    """A non-nuclei / legacy finding has no parseable template_id; it must still be ONE issue
+    keyed by its title rather than collapsing into a shared bucket with everything else."""
+    a = _AtkVuln()
+    a.fingerprint = "bare-hash-no-pipes"
+    a.title = "Legacy Finding A"
+    b = _AtkVuln()
+    b.fingerprint = "another-bare-hash"
+    b.title = "Legacy Finding B"
+    assert _counts([a, b], [_AtkMapping(a), _AtkMapping(b)]) == {"T1190": 2}
+
+
+def test_attack_api_matches_pdf_on_a_mixed_dataset():
+    """THE PARITY GUARANTEE. One dataset exercising every rule at once; the API aggregator and
+    an independent re-implementation of the PDF's rule must agree exactly."""
+    active = [_AtkVuln(matched_at=f"https://h/{i}") for i in range(4)]          # 1 issue
+    other = [_AtkVuln(template_id="ssrf-basic", matched_at="https://h/x")]      # 1 issue
+    fixed = [_AtkVuln(matched_at="https://h/f", status="fixed")]
+    info = [_AtkVuln(matched_at="https://h/i", severity="info", cvss_score=None)]
+    detection = [_AtkVuln(template_id="waf-detect", cvss_score=None, category="cwe-200")]
+    vulns = active + other + fixed + info + detection
+    mappings = [_AtkMapping(v) for v in vulns]
+
+    api = _counts(vulns, mappings)
+    pdf = _pdf_counts(vulns, mappings)
+    assert api == pdf, f"API {api} != PDF {pdf}"
+    assert api == {"T1190": 2}
+
+
+def test_attack_api_matches_pdf_when_nothing_is_scorable():
+    """A fully remediated project reports no ATT&CK coverage on either surface."""
+    vulns = [_AtkVuln(status="fixed"), _AtkVuln(template_id="tech-detect", cvss_score=None,
+                                                category="cwe-200", severity="low")]
+    mappings = [_AtkMapping(v) for v in vulns]
+    assert _counts(vulns, mappings) == _pdf_counts(vulns, mappings) == {}
+
+
+def test_scorable_issue_key_is_none_for_excluded_findings():
+    assert scorable_issue_key(_AtkVuln(status="fixed")) is None
+    assert scorable_issue_key(_AtkVuln(severity="info", cvss_score=None)) is None
+    assert scorable_issue_key(_AtkVuln()) == "template:unix-command-injection"
+
+
+def test_kill_chain_population_excludes_non_scorable_findings():
+    """The kill chain must describe the same population as the matrix -- it previously
+    de-duplicated by title and included every finding regardless of status."""
+    live = _AtkVuln()
+    dead = _AtkVuln(matched_at="https://h/2", status="fixed")
+    by_id = {v.id: v for v in (live, dead)}
+    countable = scorable_vuln_ids([_AtkMapping(live), _AtkMapping(dead)], by_id)
+    assert countable == {live.id}
+
+
+# ==========================================================================================
+# EXECUTIVE / TECHNICAL SEVERITY ALIGNMENT (P1 closure)
+#
+# P2-1 aligned the two reports on business RISK but left SEVERITY divergent: _top_risk_groups
+# (Executive) and scoring.group_issues (the Security Score) both take the MAX severity across
+# a group's members, while _finding_groups (Technical) took the REPRESENTATIVE member's
+# severity -- and the representative is chosen by business risk first, so it is not
+# necessarily the most severe member.
+#
+# The divergence is reachable with an ordinary dataset: an active finding with no CVSS has
+# final_risk_score=None by construction, so a group holding an UNSCORED CRITICAL and a SCORED
+# MEDIUM picked the medium as representative. The Executive table then printed "critical" and
+# the Technical block printed "[MEDIUM]" for the same issue_key.
+# ==========================================================================================
+
+
+def _sev_row(**kw):
+    """A VulnRow sharing one template_id (so every row lands in ONE group), with the fields
+    the two groupers read."""
+    import uuid as _u
+
+    from apps.api.modules.reports.data import VulnRow
+
+    base = dict(
+        id=_u.uuid4(), title="Shared Issue", severity="high", status="open", category=None,
+        cvss_score=None, cvss_vector=None, final_risk_score=None, risk_rationale=None,
+        compliance=[], evidence_uris=[], template_id="shared-template", matched_at="https://h/1",
+    )
+    base.update(kw)
+    return VulnRow(**base)
+
+
+def test_executive_and_technical_agree_on_group_severity():
+    """THE REGRESSION. Unscored critical + scored medium in one group: both surfaces must say
+    critical. Before the fix Technical said medium."""
+    from apps.api.modules.reports.render import _finding_groups, _top_risk_groups
+
+    members = [
+        _sev_row(severity="critical", cvss_score=None, final_risk_score=None,
+                 matched_at="https://h/1", title="Unscored Critical"),
+        _sev_row(severity="medium", cvss_score=5.0, final_risk_score=5.0,
+                 matched_at="https://h/2", title="Scored Medium"),
+    ]
+    exec_group = _top_risk_groups(members)[0]
+    tech_group = _finding_groups(members)[0]
+    assert exec_group["severity"] == tech_group["severity"] == "critical"
+
+
+def test_group_severity_matches_the_security_score_band():
+    """All THREE surfaces -- Executive, Technical, and the scoring model that actually sets
+    the penalty -- must agree on a group's severity."""
+    from apps.api.modules.reports.render import _finding_groups, _top_risk_groups
+    from apps.api.modules.reports.scoring import group_issues
+
+    members = [
+        _sev_row(severity="critical", cvss_score=None, final_risk_score=None, matched_at="https://h/1"),
+        _sev_row(severity="low", cvss_score=9.9, final_risk_score=9.9, matched_at="https://h/2"),
+    ]
+    assert (
+        _top_risk_groups(members)[0]["severity"]
+        == _finding_groups(members)[0]["severity"]
+        == group_issues(members)[0].severity
+        == "critical"
+    )
+
+
+def test_group_severity_is_independent_of_member_order():
+    """Severity must be a property of the group, not of whichever row happened to sort first."""
+    from apps.api.modules.reports.render import _finding_groups
+
+    a = _sev_row(severity="critical", matched_at="https://h/1", title="A")
+    b = _sev_row(severity="medium", cvss_score=9.0, final_risk_score=9.0,
+                 matched_at="https://h/2", title="B")
+    assert _finding_groups([a, b])[0]["severity"] == _finding_groups([b, a])[0]["severity"] == "critical"
+
+
+def test_representative_still_anchors_risk_cvss_and_rationale():
+    """The severity change must NOT disturb the P2-1 risk contract: risk/CVSS/rationale still
+    come from ONE real member (the highest-risk one), so the block stays internally coherent
+    rather than mixing per-field maxima from different observations."""
+    from apps.api.modules.reports.render import _finding_groups, _top_risk_groups
+
+    members = [
+        _sev_row(severity="critical", cvss_score=None, final_risk_score=None, matched_at="https://h/1"),
+        _sev_row(severity="medium", cvss_score=5.0, final_risk_score=9.5,
+                 risk_rationale="high-criticality asset", matched_at="https://h/2"),
+    ]
+    tech = _finding_groups(members)[0]
+    assert tech["severity"] == "critical"                       # issue-level
+    assert tech["final_risk_score"] == 9.5                      # representative member
+    assert tech["cvss_score"] == 5.0                            # same member
+    assert tech["risk_rationale"] == "high-criticality asset"   # same member
+    # and the Executive table reports the same issue-level risk
+    assert _top_risk_groups(members)[0]["max_risk"] == 9.5
+
+
+def test_single_member_group_severity_is_unchanged():
+    """Backward compatibility: with one member, max == that member."""
+    from apps.api.modules.reports.render import _finding_groups
+
+    assert _finding_groups([_sev_row(severity="medium")])[0]["severity"] == "medium"
+
+
+def test_group_severity_prefers_max_even_when_highest_is_inactive():
+    """_finding_groups is the FULL record and keeps inactive members, so a group whose only
+    critical is fixed still reports critical -- the Technical report must not understate what
+    the issue is, and the Executive table simply omits the group (no active member)."""
+    from apps.api.modules.reports.render import _finding_groups
+
+    members = [
+        _sev_row(severity="critical", status="fixed", matched_at="https://h/1"),
+        _sev_row(severity="low", matched_at="https://h/2"),
+    ]
+    assert _finding_groups(members)[0]["severity"] == "critical"
