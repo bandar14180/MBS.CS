@@ -32,9 +32,40 @@ def test_web_targets_falls_back_to_discovered_ports() -> None:
     assert web_targets("10.0.0.1", prior) == ["http://10.0.0.1:3300", "https://10.0.0.1:3300"]
 
 
-def test_web_targets_bare_host_fallback() -> None:
-    # 10.0.0.1 isn't allowlisted -> resolve raises -> falls back to the literal value.
-    assert web_targets("10.0.0.1", []) == ["http://10.0.0.1", "https://10.0.0.1"]
+def test_web_targets_rejects_an_ssrf_blocked_bare_host() -> None:
+    """AUDIT-011 -- CORRECTED EXPECTATION.
+
+    This test previously asserted that an SSRF-BLOCKED address still fell through to a
+    scannable URL list:
+        # 10.0.0.1 isn't allowlisted -> resolve raises -> falls back to the literal value.
+        assert web_targets("10.0.0.1", []) == ["http://10.0.0.1", "https://10.0.0.1"]
+    That fallback WAS the vulnerability. `web_targets` wrapped the scan-time SSRF
+    revalidation in `except Exception: pass`, which swallowed TargetNotAllowed and handed
+    nuclei/katana an RFC1918 target the policy had just denied. A security denial must
+    propagate, so the correct expectation is that it raises.
+    """
+    import pytest
+
+    from apps.api.scanner_engine.net_guard import TargetNotAllowed
+
+    with pytest.raises(TargetNotAllowed):
+        web_targets("10.0.0.1", [])
+
+
+def test_web_targets_bare_host_fallback_for_an_unresolvable_host(monkeypatch) -> None:
+    """The fallback itself is still correct for the case it was meant for: a host that does
+    not RESOLVE (a recoverable resolver failure), as opposed to one that is FORBIDDEN."""
+    import socket
+
+    from apps.api.scanner_engine.tool_runners import _web
+
+    monkeypatch.setattr(
+        _web, "resolve_scan_host",
+        lambda v: (_ for _ in ()).throw(socket.gaierror("no such host")),
+    )
+    assert _web.web_targets("nonexistent.invalid", []) == [
+        "http://nonexistent.invalid", "https://nonexistent.invalid",
+    ]
 
 
 def test_discovered_port_urls_bound() -> None:
@@ -163,3 +194,67 @@ def test_arjun_feeds_nuclei_dast() -> None:
     # arjun's parameterised url findings become nuclei-dast targets (params-first).
     prior = [CommonFinding("url", "http://a/api/products?q=1&sort=1", {"source": "arjun", "has_params": True})]
     assert NucleiDastRunner()._target_urls("a", prior)[0] == "http://a/api/products?q=1&sort=1"
+
+
+# --- Coverage state: crawled vs root-only fallback ----------------------------------------
+# Observed on a real scan: katana timed out and returned zero URLs, so DAST silently fell back
+# to fuzzing the bare entry point and still reported an ordinary success in 12.3s. The run was
+# not wrong -- fuzzing the root beats fuzzing nothing -- but it was INDISTINGUISHABLE from a
+# full-coverage run. These pin the label that makes the difference legible. No vulnerability
+# semantics change: the same URLs are fuzzed and the same findings produced.
+
+def test_coverage_is_crawled_when_the_crawler_produced_urls():
+    from apps.api.scanner_engine.tool_runners.nuclei_dast_runner import NucleiDastRunner
+
+    prior = [
+        CommonFinding("http_service", "https://t.example", {"host": "t.example"}),
+        CommonFinding("url", "https://t.example/a?id=1", {"source": "katana", "has_params": True}),
+    ]
+    assert NucleiDastRunner().coverage_state("t.example", prior) == "crawled"
+
+
+def test_coverage_is_fallback_root_only_when_the_crawl_produced_nothing():
+    """THE misleading-success case: katana timed out, so only the entry point can be fuzzed."""
+    from apps.api.scanner_engine.tool_runners.nuclei_dast_runner import NucleiDastRunner
+
+    prior = [CommonFinding("http_service", "https://t.example", {"host": "t.example"})]
+    assert NucleiDastRunner().coverage_state("t.example", prior) == "fallback_root_only"
+
+
+def test_coverage_is_none_only_when_there_is_no_target_at_all():
+    """`web_targets` synthesizes http(s)://<target> from the target name, so a named target
+    always has at least the entry point to fuzz -- "none" is reachable only with no target."""
+    from apps.api.scanner_engine.tool_runners.nuclei_dast_runner import NucleiDastRunner
+
+    assert NucleiDastRunner().coverage_state("", []) == "none"
+    # A named target with no crawl data is degraded, NOT empty.
+    assert NucleiDastRunner().coverage_state("t.example", []) == "fallback_root_only"
+
+
+def test_fallback_still_fuzzes_the_entry_point():
+    """Coverage reporting must NOT reduce what gets tested -- the fallback is retained."""
+    from apps.api.scanner_engine.tool_runners.nuclei_dast_runner import NucleiDastRunner
+
+    prior = [CommonFinding("http_service", "https://t.example", {"host": "t.example"})]
+    urls = NucleiDastRunner()._target_urls("t.example", prior)
+    assert urls, "fallback must still provide a target to fuzz"
+
+
+def test_no_targets_run_reports_coverage_none_and_does_not_claim_success(monkeypatch):
+    """A run with nothing to fuzz must report failure AND state coverage=none.
+
+    `_target_urls` is stubbed to return nothing because reaching that state for real requires
+    an unresolvable target, which the SSRF guard rejects by RAISING before run() is entered --
+    a pre-existing behaviour this test is not trying to change."""
+    import asyncio
+
+    from apps.api.scanner_engine.tool_runners import nuclei_dast_runner as mod
+    from apps.api.scanner_engine.tool_runners.nuclei_dast_runner import NucleiDastRunner
+
+    runner = NucleiDastRunner()
+    monkeypatch.setattr(NucleiDastRunner, "_target_urls", lambda self, t, p: [])
+    monkeypatch.setattr(NucleiDastRunner, "coverage_state", lambda self, t, p: "none")
+    raw = asyncio.run(runner.run("t.example", {}, []))
+    assert raw.exit_code != 0, "a run with nothing to fuzz must not report success"
+    assert "coverage=none" in raw.stderr
+    assert mod  # module imported for clarity about what is being exercised
