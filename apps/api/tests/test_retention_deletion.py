@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from apps.api.ai_agent.models import AIUsageRow
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.audit.models import AuditEvent
 from apps.api.modules.notifications.models import Notification
@@ -35,9 +36,9 @@ def _engine():
 
 
 async def _set_ws(session, wid):
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": str(wid)}
-    )
+    # Phase 0 MySQL cutover: was a Postgres `set_config` GUC call; tenancy.bind_workspace is
+    # the app-layer replacement (a plain ContextVar set) -- see apps.api.core.tenancy.
+    tenancy.bind_workspace(wid)
 
 
 async def _seed(session, *, ts, n_scans=1, n_reports=1, with_evidence=False,

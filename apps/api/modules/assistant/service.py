@@ -36,7 +36,7 @@ async def ask(
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "project_id is required when vulnerability_id is provided"
             )
-        # 404s (via RLS + explicit check) if the finding isn't in this workspace/project.
+        # 404s (via tenancy.py's filter + explicit check) if the finding isn't in this workspace/project.
         vuln = await get_vulnerability(db, workspace_id, project_id, vulnerability_id)
         context = _vuln_context(vuln)
         grounded = True

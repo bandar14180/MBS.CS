@@ -54,3 +54,59 @@ def capability_map() -> dict[str, dict]:
         t: {"supported": is_supported(t), "scanners": scanners_for(t)}
         for t in all_types
     }
+
+
+def tool_pipeline() -> list[dict]:
+    """The FULL registered tool pipeline, in execution (phase) order, with the
+    metadata a client needs to render it.
+
+    This exists because the frontend used to carry its own hardcoded copy of the
+    pipeline (a `MODULES` list in the scan form, a `PHASE_ORDER` list in the
+    progress widget). Both had drifted: `amass`, `dnsx`, `whatweb` and `ffuf`
+    were registered and runnable on the backend but absent from BOTH lists, so
+    they could never be selected for a scan and -- even when a scan requested
+    them another way (API, schedule, AI planner) -- their ToolRun rows were
+    filtered out of the progress widget entirely, hiding successes AND failures.
+    Serving the list from the registry makes that drift impossible: a new runner
+    in TOOL_REGISTRY appears in the UI with no frontend change.
+
+    `produces_vulnerabilities` is derived, not declared: a runner that does not
+    override `parse_vulnerabilities` can only ever write `assets`, never a
+    `Vulnerability` row -- which is why a recon tool can run perfectly and still
+    contribute nothing to the executive report. Clients surface that difference
+    so "no vulnerabilities" is never mistaken for "nothing ran".
+    """
+    from apps.api.scanner_engine.capability_registry import category_for_capability
+    from apps.api.scanner_engine.tool_preflight import effective_preflight
+    from apps.api.scanner_engine.tool_runners.base import BaseToolRunner
+
+    # The scanner binaries live only in the WORKER image, so this must not be resolved
+    # against the calling process's own PATH -- served from the API container that would
+    # mark every tool unavailable. effective_preflight() returns the worker's published
+    # view, or None for "unknown", which clients render as neither available nor missing.
+    status_by_tool = effective_preflight()
+    out: list[dict] = []
+    for name, cls in sorted(TOOL_REGISTRY.items(), key=lambda kv: (kv[1].phase, kv[0])):
+        status = (status_by_tool or {}).get(name)
+        out.append(
+            {
+                "name": name,
+                "phase": cls.phase,
+                "capability": cls.capability,
+                "category": category_for_capability(cls.capability),
+                "kill_chain_phase": cls.kill_chain_phase,
+                "safety_tier": cls.safety_tier,
+                "requires_active_testing": cls.requires_active_testing,
+                "applicable_target_types": (
+                    sorted(cls.applicable_target_types) if cls.applicable_target_types else None
+                ),
+                "produces_vulnerabilities": (
+                    cls.parse_vulnerabilities is not BaseToolRunner.parse_vulnerabilities
+                ),
+                "binary": cls.binary or name,
+                # True/False from the worker; None = no worker has reported yet.
+                "binary_available": (None if status_by_tool is None else bool(status and status["available"])),
+                "missing_requirements": list(status["missing_requirements"]) if status else [],
+            }
+        )
+    return out

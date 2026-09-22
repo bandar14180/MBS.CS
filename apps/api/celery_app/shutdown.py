@@ -99,27 +99,29 @@ async def requeue_scan(scan_id: str) -> bool:
     ``status='queued' AND celery_task_id IS NULL``), giving the fix a second safety net.
 
     Own short-lived engine (StaticPool), like the other worker-side entry points; `scans`
-    is RLS-exempt so no workspace GUC is needed.
+    is in tenancy.EXEMPT_TABLES, so no workspace binding is needed.
     """
     from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from apps.api.core.config import get_settings
+    from apps.api.core.db import make_worker_engine
 
-    engine = create_async_engine(get_settings().database_url, poolclass=StaticPool)
+    engine = make_worker_engine(get_settings().database_url)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_maker() as session:
+            # Phase 0 MySQL cutover: RETURNING replaced with rowcount (MySQL has none);
+            # exact here because of CLIENT_FOUND_ROWS (core/db.py's _mysql_connect_args).
             result = await session.execute(
                 text(
                     "UPDATE scans SET status = 'queued', started_at = NULL, "
                     "celery_task_id = NULL, execution_token = NULL, queued_at = now() "
-                    "WHERE id = :id AND status = 'running' RETURNING id"
+                    "WHERE id = :id AND status = 'running'"
                 ),
                 {"id": str(scan_id)},
             )
-            requeued = result.first() is not None
+            requeued = result.rowcount == 1
             await session.commit()
         return requeued
     finally:

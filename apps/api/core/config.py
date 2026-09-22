@@ -1,8 +1,75 @@
 import os
 from functools import lru_cache
+from urllib.parse import quote_plus
 
+from dotenv import dotenv_values
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Flexible DATABASE_URL discovery (Phase 0 MySQL cutover). Some hosting platforms (Railway,
+# various PaaS MySQL add-ons) inject connection details as discrete MYSQLHOST/MYSQL_USER/...
+# -style vars instead of a single DATABASE_URL; a developer pointing the app at a database
+# they created themselves (e.g. by hand in MySQL Workbench) is usually in the same position --
+# they think in host/port/user/password/db name, not a URL. First-match-wins per field,
+# checking the most platform-specific name first and falling back to the generic
+# DB_* / DATABASE_* convention.
+_DB_HOST_VARS = ("MYSQLHOST", "MYSQL_HOST", "DB_HOST", "DATABASE_HOST")
+_DB_PORT_VARS = ("MYSQLPORT", "MYSQL_PORT", "DB_PORT", "DATABASE_PORT")
+_DB_NAME_VARS = ("MYSQLDATABASE", "MYSQL_DATABASE", "DB_NAME", "DATABASE_NAME")
+_DB_USER_VARS = ("MYSQLUSER", "MYSQL_USER", "DB_USER", "DATABASE_USER")
+_DB_PASSWORD_VARS = ("MYSQLPASSWORD", "MYSQL_PASSWORD", "DB_PASSWORD", "DATABASE_PASSWORD")
+
+
+def _dotenv_snapshot() -> dict[str, str]:
+    """Parse the local .env file -- same relative path Settings() itself reads via
+    `env_file=".env"` -- WITHOUT exporting it into os.environ. Needed because
+    _resolve_database_url_from_parts() runs before Settings() exists, so (unlike Settings'
+    own fields) it can only see values that were actually exported as shell/compose env vars
+    -- not ones that only live in .env. That silently broke the discrete DB_HOST/DB_USER/...
+    vars for anyone who, reasonably, just edited .env by hand and never `export`ed anything.
+    dotenv_values() never raises for a missing file (returns {}); re-parsed per call rather
+    than cached since this only runs a handful of times at process startup."""
+    return {k: v for k, v in dotenv_values(".env").items() if v}
+
+
+def _first_env(names: tuple[str, ...]) -> str | None:
+    """Real environment variables win over .env file values for each name -- matches
+    pydantic-settings' own precedence for env_file=".env", so DB_HOST/DB_USER/... behave
+    identically whether they're exported by the shell/docker-compose or only ever written
+    into .env."""
+    dotenv = None
+    for name in names:
+        val = os.environ.get(name)
+        if val:
+            return val
+        if dotenv is None:
+            dotenv = _dotenv_snapshot()
+        val = dotenv.get(name)
+        if val:
+            return val
+    return None
+
+
+def _resolve_database_url_from_parts() -> None:
+    """Populate DATABASE_URL from discrete host/port/user/password/name env vars -- real env
+    vars OR .env file entries, see _first_env() -- when it isn't already set that way. Never
+    overwrites an explicit DATABASE_URL or a declared DATABASE_URL_FILE (that still wins via
+    _resolve_file_secrets(), called after this one -- see the precedence note on
+    get_settings()). If no host var is present at all there's nothing to compose, and
+    Settings() falls through to its class default (local dev). Safe to call repeatedly
+    (idempotent once DATABASE_URL is set)."""
+    if _first_env(("DATABASE_URL",)) or _first_env(("DATABASE_URL_FILE",)):
+        return
+    host = _first_env(_DB_HOST_VARS)
+    if not host:
+        return
+    port = _first_env(_DB_PORT_VARS) or "3306"
+    name = _first_env(_DB_NAME_VARS) or "mbs"
+    user = _first_env(_DB_USER_VARS) or "mbs"
+    password = _first_env(_DB_PASSWORD_VARS) or ""
+    auth = quote_plus(user) + (f":{quote_plus(password)}" if password else "")
+    os.environ["DATABASE_URL"] = f"mysql+aiomysql://{auth}@{host}:{port}/{name}"
+
 
 # Secrets that may be delivered via a `<NAME>_FILE` env var pointing at a file
 # (Docker Secrets mount secrets at /run/secrets/*, Vault Agent can template to a
@@ -23,6 +90,11 @@ _FILE_BACKED_SECRETS = (
     "DEEPSEEK_API_KEY",
     "METRICS_TOKEN",
     "MFA_ENCRYPTION_KEY",
+    # MBS.SC: the scanner execution plane's ONE credential. File-backed like every other
+    # secret so production can deliver it as a Docker secret
+    # (SCANNER_WORKER_TOKEN_FILE=/run/secrets/scanner_worker_token) rather than as an
+    # inline env value that would sit in `docker inspect` output.
+    "SCANNER_WORKER_TOKEN",
     # DR-2 / DR-3: backup encryption key + off-site replication secret (same Vault/Docker
     # Secrets seam). Empty by default; only required when the matching feature is enabled.
     "BACKUP_ENCRYPTION_KEY",
@@ -40,6 +112,19 @@ _INSECURE_JWT_SECRETS = {"", "change-me-in-.env", "change-me-generate-a-real-sec
 # turns them into a startup failure so a mounted-but-unreadable secret can never be silently
 # replaced by an inherited default. Rebuilt on every resolve() call (idempotent).
 _UNREADABLE_FILE_SECRETS: list[str] = []
+
+# F-05: environment names that count as a developer machine. Only here may
+# DEV_AUTO_AUTHORIZE_TARGETS -- which disables the target-ownership authorization guardrail --
+# be enabled. Anything not on this list (staging, prod, qa, a typo, a name nobody anticipated)
+# is treated as a real deployment and refuses to start with the flag on. Keep this list SHORT:
+# every entry added here is another environment allowed to scan without proof of authorization.
+_LOCAL_ENVIRONMENTS: frozenset[str] = frozenset({"development", "dev", "local", "test", "testing"})
+
+# F-06: AI providers that bill per token. Production must carry a spend cap when one of these
+# is live. `local` (self-hosted Ollama) is absent deliberately -- it has no per-token cost, so
+# requiring a dollar budget there would be noise. Adding a provider here without adding it to
+# the pricing table would make its spend uncountable, so keep the two in step.
+_METERED_AI_PROVIDERS: frozenset[str] = frozenset({"openrouter", "anthropic", "deepseek"})
 
 
 def _resolve_file_secrets() -> None:
@@ -81,7 +166,13 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
     environment: str = "development"
 
-    database_url: str = "postgresql+asyncpg://mbs:mbs@postgres:5432/mbs"
+    database_url: str = "mysql+aiomysql://mbs:mbs@mysql:3306/mbs"
+    # Phase 0 MySQL cutover pool tuning (see core/db.py for why pool_recycle matters on
+    # MySQL specifically). 1800s (30min) is comfortably under the lowest wait_timeout
+    # commonly seen on managed/shared MySQL tiers; override per-environment if needed.
+    db_pool_recycle_seconds: int = 1800
+    db_pool_size: int = 10
+    db_pool_max_overflow: int = 5
     redis_url: str = "redis://redis:6379/0"
 
     s3_endpoint_url: str = "http://minio:9000"
@@ -96,6 +187,26 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "change-me-in-.env"
     jwt_access_token_ttl_minutes: int = 15
     jwt_refresh_token_ttl_days: int = 7
+
+    # --- F-08: refresh token delivered as an HttpOnly cookie ---------------------------------
+    # The refresh token used to be returned in the JSON body and parked in localStorage, where
+    # any XSS could read it and mint access tokens for the full 7-day refresh lifetime. It is
+    # now set as an HttpOnly cookie that JavaScript cannot read at all.
+    #
+    # SameSite=strict is the CSRF control: /auth/refresh and /auth/logout are cookie-
+    # authenticated, and a strict cookie is simply not attached to any cross-site request, so a
+    # third-party page cannot drive them. This works because the browser reaches the API
+    # SAME-ORIGIN through nginx (/api/v1/... -> api:8000), which is also why the frontend now
+    # uses a relative API base instead of http://localhost:8000.
+    #
+    # `secure` defaults to False so plain-http local development keeps working (a Secure cookie
+    # is dropped over http). validate_production() FORCES it true in production -- see there.
+    refresh_cookie_name: str = "mbs_refresh"
+    refresh_cookie_secure: bool = False
+    refresh_cookie_samesite: str = "strict"
+    # Scoped to the auth routes only: the cookie is never attached to ordinary API calls, so it
+    # cannot leak through unrelated endpoints or be logged by them.
+    refresh_cookie_path: str = "/api/v1/auth"
 
     # MFA (Sprint 1 foundation). mfa_encryption_key is the master secret used to derive a Fernet
     # key that encrypts each user's TOTP secret at rest (mfa_secret_encrypted); it supports the
@@ -196,6 +307,10 @@ class Settings(BaseSettings):
     # never depends on the ambient $HOME at scan time. Empty = nuclei's own default.
     nuclei_templates_dir: str = ""
 
+    # Wordlist the ffuf runner uses for directory/file content discovery (set in
+    # Dockerfile.worker). Empty = ffuf's own bundled default.
+    ffuf_wordlist_path: str = ""
+
     # Target types the scanner can actually assess today. Scans on any other type
     # are rejected at creation -- never a "completed" scan that assessed nothing.
     # domain/ip_range are covered by the recon + nuclei toolchain; api /
@@ -210,8 +325,140 @@ class Settings(BaseSettings):
     # and then only the exact CIDRs in scan_allowed_cidrs may be scanned. Cloud
     # metadata IPs stay blocked unless listed as an explicit host (/32 or /128) in
     # scan_allowed_cidrs. There is deliberately no blanket "disable SSRF" switch.
+    # MBS.SC: these two remain the OUTER SAFETY BOUNDARY and nothing more. Since the
+    # per-scan policy landed (scanner_engine/net_policy.py), turning this on grants NOTHING
+    # by itself -- it only stops forbidding, and a scan still needs its own persisted
+    # workspace -> site -> CIDR authorization. Leaving it False keeps private scanning off
+    # entirely, whatever any tenant has configured.
     scan_allow_private_targets: bool = False
     scan_allowed_cidrs: list[str] = []
+    # MBS.SC Phase 13 -- EMERGENCY CONTROL. Set true to stop ALL private scanning platform
+    # wide, immediately, without touching any site or worker row. Enforced by the
+    # scanner-manager (control-plane side), so it takes effect even for a scanner host that
+    # is compromised, unreachable, or ignoring its own configuration -- an emergency
+    # control that depended on reaching the thing you are trying to cut off would be
+    # useless exactly when it is needed.
+    private_scanning_emergency_disable: bool = False
+    # MBS.SC: marks this process as the scanner EXECUTION plane. It changes which
+    # production invariants are enforced (see validate_production) and switches on the
+    # credential guard in celery_app/startup_security.py. Never set it on the API or on a
+    # control-plane worker -- those legitimately hold the credentials it forbids.
+    scanner_execution_plane: bool = False
+    # The one control-plane endpoint the execution plane may talk to.
+    scanner_manager_url: str = ""
+    scanner_worker_id: str = ""
+    # The worker's own bootstrap credential. Authorizes nothing beyond this ONE worker's
+    # authorized pool/site -- the manager re-derives every permission from the worker's
+    # persisted row, so holding this is not equivalent to holding a control-plane secret.
+    scanner_worker_token: str = ""
+    scanner_pool_id: str = "public-default"
+    scanner_site_id: str = ""
+    # The WireGuard interface a PRIVATE worker probes for tunnel health. Configuration, not
+    # a secret: the interface name says nothing about the customer, and the probe is
+    # read-only.
+    scanner_wireguard_interface: str = "wg0"
+    # Path to the worker's OWN WireGuard private key, mounted as a Docker/Vault secret.
+    # A FILE, not a value: an env var appears in `docker inspect`, in crash dumps, and in
+    # every child process's environment. The key is generated INSIDE the private worker
+    # (`wg genkey`) and never leaves it -- the control plane stores only the public half.
+    scanner_wireguard_private_key_file: str = ""
+    # The worker's address on the tunnel (e.g. 10.99.0.2/32). Assigned by the operator when
+    # the site is provisioned; not secret.
+    scanner_wireguard_address: str = ""
+    # PHASE 8 -- how old a WireGuard handshake may be before the tunnel counts as dead and
+    # private scanning is refused. WireGuard rekeys roughly every 120s while a session is
+    # carrying traffic, so 180s is ~1.5 rekey intervals: long enough that a momentarily idle
+    # tunnel is not falsely condemned, short enough that a genuinely dead peer is caught in
+    # minutes rather than hours. Raise it only for a link with known long idle gaps, and
+    # understand the trade: every extra second is a second a dead tunnel still looks alive.
+    scanner_wireguard_max_handshake_age_s: int = 180
+    # PHASE 8 -- tunnel MTU. 1420 is WireGuard's own default for IPv4-over-IPv4 on a 1500-byte
+    # path (1500 - 20 IPv4 - 8 UDP - 32 WireGuard + Poly1305 overhead = 1440; wg uses 1420 to
+    # leave headroom for IPv6 and common encapsulation). It is set EXPLICITLY rather than
+    # inherited so the value is visible and auditable, and so a site behind PPPoE/a nested
+    # tunnel (typically 1412 or lower) can be corrected without a code change.
+    #
+    # NOT a security control by itself: a wrong MTU costs reachability (black-holed large
+    # packets), never isolation -- routes and AllowedIPs are what confine traffic, and a
+    # fragmented or dropped packet cannot leave the authorized CIDR.
+    scanner_wireguard_mtu: int = 1420
+
+    # --- DEDICATED VPN EGRESS (public scanner traffic) -----------------------
+    # A SEPARATE tunnel from the per-site WireGuard above, on a separate worker, with its
+    # own interface, its own routing table and its own firewall. See
+    # scanner_engine/vpn_egress.py for why the two are deliberately disjoint code paths.
+    #
+    # EXPLICIT MODE, never inferred. The private/public distinction is already carried by
+    # `scanner_site_id`, and it would have been possible to infer "public + a key file
+    # present => VPN". That inference is exactly the wrong failure mode: a worker whose
+    # secret failed to mount would silently become a DIRECT worker and scan from the
+    # platform's own address while looking correct. Declaring the mode means a
+    # misconfigured VPN worker fails to start instead.
+    #   direct -- ordinary public worker, egress via the host's own path (the default,
+    #             unchanged behaviour for every existing deployment)
+    #   vpn    -- all public target traffic leaves via the dedicated VPN tunnel
+    scanner_egress_mode: str = "direct"
+    # The dedicated egress interface. NOT `wg0`: a site worker's interface is wg0, and
+    # identical names would make logs and operator commands ambiguous.
+    scanner_vpn_egress_interface: str = "wg-egress"
+    # PLATFORM secret, delivered as a FILE. Never an env value and never in .env.scanner --
+    # that file is shared with tenant site workers, and this is a platform credential.
+    scanner_vpn_egress_private_key_file: str = ""
+    # Provider peer + this peer's assigned address. Not secrets.
+    scanner_vpn_egress_peer_public_key: str = ""
+    scanner_vpn_egress_endpoint_host: str = ""
+    scanner_vpn_egress_endpoint_port: int = 51820
+    scanner_vpn_egress_address: str = ""
+    # Dedicated routing table + fwmark. Defaults match vpn_egress.py; configurable only so
+    # a deployment with a conflicting table can move it.
+    scanner_vpn_egress_table: int = 51820
+    scanner_vpn_egress_fwmark: int = 0x51820
+    scanner_vpn_egress_mtu: int = 1420
+    scanner_vpn_egress_max_handshake_age_s: int = 180
+    # EXIT-IP VERIFICATION. Tunnel-up plus a handshake proves the tunnel lives; it does not
+    # prove traffic USES it. This URL is fetched over the worker's real egress path, so the
+    # answer is evidence of where traffic actually leaves from.
+    scanner_vpn_egress_exit_ip_url: str = "https://api.ipify.org"
+    # Pin the provider's exit IP when it is stable. Empty still catches the common failure
+    # (traffic never entered the tunnel) via `forbidden_exit_ips` below.
+    scanner_vpn_egress_expected_exit_ip: str = ""
+    # The platform's OWN direct egress address(es), comma-separated. Observing one of these
+    # as the exit IP is positive proof the VPN was bypassed.
+    scanner_vpn_egress_forbidden_exit_ips: str = ""
+    # The dispatch-plane CIDR(s) the kill-switch permits directly, so the manager stays
+    # reachable. Narrow by design: a blanket RFC1918 exception would re-open exactly the
+    # private reachability an egress worker must not have.
+    scanner_vpn_egress_dispatch_cidrs: str = ""
+    # How often a RUNNING scan re-verifies the egress path. Without this a tunnel that dies
+    # mid-scan would let the remaining tools continue over direct egress.
+    scanner_vpn_egress_recheck_seconds: int = 60
+
+    # CONTROL-PLANE side of the egress model. The pool id(s) whose workers are VPN-egress
+    # workers, comma-separated. Read by the MANAGER to derive a worker's egress mode from
+    # its persisted `pool_id` -- which is why no new database column is required: pool
+    # membership is already persisted, operator-controlled and enforced at every
+    # authorization boundary. See scanner_workers/service.worker_egress_mode.
+    vpn_egress_pools: str = "public-vpn-egress"
+
+    @property
+    def vpn_egress_pool_list(self) -> list[str]:
+        raw = self.vpn_egress_pools or ""
+        return [p.strip() for p in raw.split(",") if p.strip()]
+
+    @property
+    def vpn_egress_enabled(self) -> bool:
+        return (self.scanner_egress_mode or "direct").strip().lower() == "vpn"
+
+    @property
+    def vpn_egress_forbidden_exit_ip_list(self) -> list[str]:
+        raw = self.scanner_vpn_egress_forbidden_exit_ips or ""
+        return [p.strip() for p in raw.split(",") if p.strip()]
+
+    @property
+    def vpn_egress_dispatch_cidr_list(self) -> list[str]:
+        raw = self.scanner_vpn_egress_dispatch_cidrs or ""
+        return [p.strip() for p in raw.split(",") if p.strip()]
+
     # M4.5 (G9): re-check DISCOVERED (derived) hosts against the target's authorized
     # scope before any active tool probes them. Out-of-scope / indeterminable-host
     # findings are recorded as observations but never actively scanned (fail closed).
@@ -257,8 +504,66 @@ class Settings(BaseSettings):
     # periodic reaper. Timeout must exceed the longest legitimate scan to avoid false
     # positives. The reaper never re-dispatches, so it cannot cause duplicate execution.
     scan_orphan_recovery_enabled: bool = True         # master switch for the reaper
-    scan_orphan_timeout_seconds: int = 7200           # 2h; 'running' older than this is an orphan
+    # LIVENESS-BASED orphan detection. The reaper keys on the executor's heartbeat
+    # (scans.last_heartbeat_at, stamped ~every TOOL_PROGRESS_INTERVAL_SECONDS while a tool
+    # runs), NOT on total runtime -- so a legitimately long scan (a 3-5h nuclei/ffuf run is
+    # normal on a large target) is never reaped while it is alive, and a scan whose worker
+    # was SIGKILLed/OOM-killed is recovered in minutes instead of waiting out a fixed
+    # wall-clock timeout. This is strictly better on BOTH axes than the previous
+    # `started_at`-age rule, which had to trade one against the other.
+    #
+    # 900s = 15 min, i.e. ~30 consecutive missed 30s heartbeats. Chosen well above any
+    # plausible transient stall (a slow heartbeat UPDATE, a GC pause, brief DB contention)
+    # so a live scan is never falsely reaped, while still recovering a dead worker far
+    # faster than the old 2h rule. This is NOT an execution limit: it caps how long a
+    # scan may be SILENT, never how long it may RUN.
+    scan_stale_heartbeat_seconds: int = 900
+    # Retained ONLY as the fallback for a scan that has never stamped a heartbeat (claimed
+    # but died before its first tick, or started by a pre-heartbeat build): the reaper
+    # COALESCEs last_heartbeat_at -> started_at, so this bounds that no-heartbeat case
+    # alone. A heartbeating scan is governed by scan_stale_heartbeat_seconds above and is
+    # NOT subject to this value at any runtime.
+    scan_orphan_timeout_seconds: int = 7200           # 2h; no-heartbeat fallback only
     scan_orphan_reaper_interval_seconds: int = 300    # reaper cadence (beat), default 5 min
+
+    # TOOL-RUN orphan reconciliation. Distinct from both reapers above, which recover a
+    # SCAN row: this one repairs `tool_runs` left in 'running' underneath a scan that has
+    # already reached a terminal status -- a lifecycle state that is, by definition,
+    # impossible to leave legitimately (nothing will ever report that tool's result again,
+    # because its scan is over).
+    #
+    # Incident 615d0e0b produced exactly one such row: the manager's asset INSERT failed,
+    # its transaction rolled back the ToolRun status write with it, and katana stayed
+    # 'running' for good -- the UI rendered a live-ticking timer for a process that had
+    # already been OOM-killed. The transactional fix prevents NEW ones; this reconciles the
+    # rows already stranded, and any produced by a route not yet foreseen.
+    #
+    # GRACE PERIOD, not an immediate sweep: scan finalization and the tool's own result
+    # submission are separate writes, so a tool result legitimately in flight can arrive
+    # microseconds AFTER its scan goes terminal. Reconciling instantly would race that
+    # write and mark a tool failed that was about to report success. 300s is far longer
+    # than that window while still repairing a stranded row within one reaper cycle or two.
+    toolrun_reconcile_enabled: bool = True
+    toolrun_reconcile_grace_seconds: int = 300
+
+    # MBS.SC PHASE 8 (P8-F) -- WORKER-level stale reaper. Distinct from the SCAN-level
+    # reaper above: that one recovers a dead scan, this one stops handing NEW work to a
+    # worker that has gone silent. Before it existed, `last_seen_at` was written by every
+    # heartbeat and consulted by nothing, so a worker silent for 42 minutes still leased
+    # successfully (verified live).
+    #
+    # 600s is deliberately CONSERVATIVE and sits well above the two cadences that matter:
+    # the idle heartbeat is 30s (lease_loop.BackoffPolicy.heartbeat_seconds) and the
+    # existing MbsScannerWorkerHeartbeatStale alert fires at 300s. So a worker must miss
+    # ~20 consecutive beats -- and be alerted on for ~5 minutes first -- before it is
+    # suspended. That ordering is intentional: an operator sees the alert before the
+    # platform acts, and a transient manager blip cannot turn a monitoring wobble into a
+    # scanning outage. The transition is to `suspended`, which is REVERSIBLE.
+    worker_stale_after_seconds: int = 600
+    # Sweep cadence. Reuses the SCAN reaper's 300s so the two liveness sweeps tick together
+    # and the platform has one recovery rhythm rather than two competing ones. At 300s a
+    # stale worker is suspended within 600-900s of its last beat.
+    worker_stale_reaper_interval_seconds: int = 300
     # P1.1 -- beat-liveness heartbeat. A tiny periodic task stamps a Redis timestamp each tick so a
     # stalled beat scheduler (or a down worker-default draining the default queue) is alertable via
     # mbs_beat_age_seconds -> MbsBeatStalled. Always scheduled; additive, cheap, low-cardinality.
@@ -272,6 +577,25 @@ class Settings(BaseSettings):
     # genuinely undelivered scans, never for scans already in flight (they have a task id).
     scan_queued_relay_enabled: bool = True
     scan_queued_relay_seconds: int = 300              # 5 min; 'queued' + no task id older than this
+
+    # WHICH MECHANISM DISPATCHES A SCAN. False (the default) = the MBS.SC LEASE model: the
+    # scan row itself is the queue, and a worker claims it through POST /v1/lease ->
+    # _claim_scan. True = the legacy CONTROL-PLANE Celery path, for a deployment that still
+    # runs an executor consuming `scans.public` / `scans.private.<site>`.
+    #
+    # DEFAULT OFF, AND THAT DEFAULT IS THE FIX. `create_scan` used to enqueue
+    # unconditionally, but under the deployed lease architecture nothing consumes those
+    # queues -- the scan worker is off `mbs-core`, cannot reach Redis, and runs
+    # `scanner_worker.main` rather than `celery worker`. Every scan therefore produced an
+    # undelivered message (measured: 110 in `scans.public`) AND set `celery_task_id`, which
+    # is precisely the field `_relay_queued()` uses to decide a scan was already dispatched.
+    # A successful-but-unconsumable enqueue thus disqualified the scan from its own safety
+    # net, leaving it `queued` forever.
+    #
+    # ENABLE THIS ONLY IF A CONSUMER ACTUALLY EXISTS for the scan queues. Turning it on
+    # without one reintroduces exactly that failure, which is why the default is the safe
+    # direction and why test_queue_topology asserts the two stay consistent.
+    celery_scan_dispatch_enabled: bool = False
 
     # Phase 4.1 -- worker observability. The Celery worker runs scans (record_scan_result,
     # tool/AI/reaper/relay metrics), but /metrics is served by the API process only. This
@@ -289,8 +613,33 @@ class Settings(BaseSettings):
     # last-resort force-kill and MUST be greater than the soft limit. Both stay BELOW the
     # orphan timeout so a self-terminated scan never has to wait on the reaper -- the
     # reaper remains the unchanged final fallback for a truly lost worker.
+    # NOTE: these are the limits for EVERY OTHER task. `scans.run_scan` is exempt -- see
+    # celery_app/worker.py's task_annotations and the two settings below.
     celery_task_soft_time_limit_seconds: int = 3600   # 1h; raises SoftTimeLimitExceeded in-task
     celery_task_time_limit_seconds: int = 3900        # soft + 5min; hard SIGKILL backstop
+    # SCAN EXECUTION IS NOT WALL-CLOCK BOUNDED. A scan's legitimate duration is a function of
+    # the target (subdomain/host/port/URL counts, crawl depth, wordlist and template counts,
+    # rate limiting), not of the clock: 3-5 hours is normal on a large scope. The global
+    # limits above used to apply to `scans.run_scan` too, which killed every such scan at 1h
+    # and marked it 'failed' purely for existing too long -- a correctness bug, not a
+    # safeguard. Scans are therefore exempted (None = no limit) and their liveness is
+    # governed by scan_stale_heartbeat_seconds instead, which detects a genuinely DEAD
+    # executor without ever penalising a healthy slow one.
+    #
+    # Set both to a positive number ONLY to deliberately re-impose a hard ceiling on scan
+    # runtime; leave at 0 for the intended behavior. Whatever is set here must stay BELOW
+    # celery_broker_visibility_timeout_seconds (asserted in the worker tests).
+    celery_scan_task_soft_time_limit_seconds: int = 0   # 0 = no soft limit for scans.run_scan
+    celery_scan_task_time_limit_seconds: int = 0        # 0 = no hard limit for scans.run_scan
+    # Redis broker visibility timeout, now set EXPLICITLY rather than derived from the hard
+    # task limit (which no longer exists for scans). Under acks_late an in-flight scan's
+    # message sits in the broker's unacked set; if this elapses first, Redis restores and
+    # REDELIVERS that message while the original worker is still scanning. The atomic claim
+    # stops the redelivery executing, but it consumes the one message that gave the scan its
+    # acks_late redelivery safety net -- so this must comfortably exceed the longest scan we
+    # intend to support. 21600s = 6h: the 5h upper bound of a legitimately long scan plus a
+    # ~20% margin. Raise it (not the scan limits) if scans longer than that become normal.
+    celery_broker_visibility_timeout_seconds: int = 21600
     # Recycle a worker child after this many tasks so long-lived scanner subprocesses
     # (nmap/nuclei/katana) can't leak memory unbounded. 0 disables recycling.
     celery_worker_max_tasks_per_child: int = 50
@@ -307,10 +656,43 @@ class Settings(BaseSettings):
     backup_retention_days: int = 7                # prune sets older than N days
     backup_min_keep: int = 3                      # always keep >= this many newest sets
     backup_include_objects: bool = True           # also back up object storage (evidence+reports)
-    backup_compression: bool = True               # gzip the object archive (db.dump is already -Fc compressed)
+    backup_compression: bool = True               # gzip the object archive (db.sql is plain-text, uncompressed)
     backup_verification_enabled: bool = True      # verify each set after creation / before restore
-    backup_pg_dump_cmd: str = "pg_dump"           # override to an absolute path / wrapper
-    backup_pg_restore_cmd: str = "pg_restore"     # override to an absolute path / wrapper
+    # Phase 0 MySQL cutover: backup_pg_dump_cmd/backup_pg_restore_cmd (pg_dump/pg_restore) ->
+    # backup_mysqldump_cmd/backup_mysql_cmd (mysqldump / the mysql client, which also performs
+    # restore -- MySQL's standard tooling has no separate "mysqlrestore" binary).
+    backup_mysqldump_cmd: str = "mysqldump"       # override to an absolute path / wrapper
+    backup_mysql_cmd: str = "mysql"               # override to an absolute path / wrapper
+    # TLS mode for the mysqldump/mysql CLIENTS specifically (NOT the app's own aiomysql engine,
+    # which negotiates its own TLS independently -- see core/db.py). Three accepted values:
+    #
+    #   "required"        (default) -- connect over TLS, but do NOT verify the server's
+    #                      certificate chain or hostname. The traffic is still ENCRYPTED; what
+    #                      is skipped is proving the server's identity.
+    #   "verify_identity" -- full verification: the chain must validate against backup_mysql_
+    #                      ssl_ca AND the certificate's CN/SAN must match the connection host.
+    #                      Requires certificates provisioned for the DB's actual hostname.
+    #   "disabled"        -- no TLS at all. Only for a local socket / already-encrypted tunnel.
+    #
+    # Why "required" is the DEFAULT rather than "verify_identity": the mysql:8.0 image
+    # auto-generates a SELF-SIGNED CA on first start, and the certificate it issues carries
+    # CN="MySQL_Server_<version>_Auto_Generated_Server_Certificate" -- a name that can never
+    # match the host it's reached by ("mysql" on the compose network). Both failures were
+    # reproduced against this project's own running stack: with no TLS option set at all,
+    # MariaDB's mysqldump (the client Debian's default-mysql-client ships, and the one baked
+    # into infra/docker/Dockerfile.worker) verifies BY DEFAULT and aborts with
+    #   'TLS/SSL error: self-signed certificate in certificate chain' (exit 2, EMPTY dump);
+    # and pointing ssl-ca at the server's real auto-generated ca.pem merely moves the failure to
+    #   'TLS/SSL error: Hostname verification failed'.
+    # That is why DR backups silently produced nothing before this setting existed. Note the
+    # asymmetry that hid it: Oracle's own mysql client does NOT verify by default, so the same
+    # command "works" on a machine with mysql-client instead of mariadb-client installed.
+    #
+    # Operators who provision real certificates for the database host SHOULD set this to
+    # "verify_identity" and point backup_mysql_ssl_ca at the issuing CA -- the code path is
+    # implemented and takes precedence; nothing needs to change but these two values.
+    backup_mysql_ssl_mode: str = "required"
+    backup_mysql_ssl_ca: str = ""                 # PEM path; required by "verify_identity"
     # Phase F5: per-task Celery time limits so a large backup isn't cut off by the scan-tuned
     # global limit. soft raises SoftTimeLimitExceeded in-task (graceful log + F4 metric); hard is
     # the SIGKILL backstop and MUST exceed soft (enforced at wiring time).
@@ -318,7 +700,7 @@ class Settings(BaseSettings):
     backup_task_time_limit_seconds: int = 7800        # soft + 10min
 
     # DR-2 -- backup encryption at rest. Additive + OPT-IN (default OFF -> unencrypted sets,
-    # identical to prior behavior). When enabled, each set's db.dump + objects archive are
+    # identical to prior behavior). When enabled, each set's db.sql + objects archive are
     # encrypted in place with AES-256-GCM; the key is derived from BACKUP_ENCRYPTION_KEY
     # (supports the <NAME>_FILE convention). verify/restore transparently decrypt; a wrong key
     # fails closed (authentication tag mismatch). Existing unencrypted sets stay readable.
@@ -381,11 +763,37 @@ class Settings(BaseSettings):
     retention_refresh_token_grace_days: int = 7   # expired refresh tokens, N days past expiry
     retention_notification_days: int = 90         # in-app notifications
     retention_audit_days: int = 730               # audit events (long compliance window)
+    # Remediation/assessment retention. remediation_events is the only one of the new tables
+    # that grows without bound (one row per workflow action, forever), so it gets its own
+    # window. The workflow ITEMS themselves are not aged off by time -- an item is deleted
+    # with its project, and purging live remediation work on a clock would destroy the record
+    # of outstanding obligations.
+    retention_remediation_event_days: int = 730   # remediation workflow history (matches audit)
+    # ISSUED assessments are CLIENT-FACING DELIVERABLES -- a client may ask for last year's
+    # report years later -- so they get the longest window of anything here, deliberately
+    # longer than the 365-day report window that ages off the rendered PDF.
+    retention_risk_assessment_days: int = 1825    # issued client assessments (5 years)
+    # Risk-acceptance expiry sweep cadence. Hourly: expiries are set in days/months, so a
+    # sub-hour lag is immaterial, while an hourly per-tenant status flip is negligible load.
+    risk_acceptance_expiry_interval_seconds: int = 3600
     # Phase F5: per-task Celery time limits (independent of the scan-tuned global limit). soft <
     # hard enforced at wiring time; a soft timeout is handled gracefully (per-workspace commits
     # mean partial progress is kept and the next run resumes).
     retention_task_soft_time_limit_seconds: int = 5400   # 90min
     retention_task_time_limit_seconds: int = 6000        # soft + 10min
+
+    # --- Local development convenience --------------------------------------
+    # DEV-ONLY escape hatch for the authorization-scope guardrail (apps/api/modules/
+    # authorization_scope): a real engagement must submit ownership proof for a target and
+    # have an owner separately verify it (and opt in to active testing) before ANY scan --
+    # that flow is unchanged and still the default. Flipping this on auto-authorizes every
+    # target (verified=True, active_testing_allowed=True) the moment a scan is requested,
+    # so a developer iterating against infrastructure they already own doesn't have to
+    # click through the manual submit-proof + owner-verify UI steps on every fresh dev
+    # database. NEVER set this for a real engagement -- F-05: startup is refused with this
+    # enabled unless ENVIRONMENT is an explicitly LOCAL name (_LOCAL_ENVIRONMENTS), not merely
+    # "not production" (see validate_production).
+    dev_auto_authorize_targets: bool = False
 
     # --- Security edge ------------------------------------------------------
     # Hosts allowed in the Host header (TrustedHostMiddleware). "*" disables the
@@ -440,6 +848,16 @@ class Settings(BaseSettings):
         return self.environment.lower() == "production"
 
     @property
+    def is_local_environment(self) -> bool:
+        """True only for an environment name explicitly recognised as a developer machine.
+
+        F-05: deliberately an ALLOW-list, not `not is_production`. A deny-list answers "is this
+        the one name we thought of?", which silently treats staging/prod/qa/typos as safe; an
+        allow-list answers "is this provably local?", so an unrecognised name fails closed.
+        Whitespace and case are normalised because ENVIRONMENT comes from a hand-edited .env."""
+        return self.environment.strip().lower() in _LOCAL_ENVIRONMENTS
+
+    @property
     def active_ai_api_key(self) -> str:
         """The API key for the currently selected provider ("" if unset). The
         local provider needs no real key, so it reports a sentinel -> ai_enabled."""
@@ -482,10 +900,125 @@ class Settings(BaseSettings):
 
     def validate_production(self) -> None:
         """Fail fast at startup if production is running with insecure dev defaults.
-        Called from the app lifespan. No-op outside production so local/dev/test are
-        unaffected. Missing AI key is intentionally NOT fatal (AI degrades gracefully)."""
+        Called from the app lifespan. Mostly a no-op outside production so local/dev/test are
+        unaffected -- the ONE exception is the F-05 guardrail check below, which deliberately
+        runs in EVERY environment. Missing AI key is intentionally NOT fatal (AI degrades
+        gracefully)."""
+        # --- F-05: the scan-authorization guardrail must not be silently disableable -------
+        # DEV_AUTO_AUTHORIZE_TARGETS short-circuits require_verified_target() entirely: with it
+        # on, MBS will actively scan any target the operator names, with no proof of ownership
+        # and overriding even an explicitly-unverified scope. That is the control that keeps
+        # this product's scanning lawful, so "it is only blocked in production" was too weak a
+        # guarantee -- `is_production` is a free-text comparison against the single literal
+        # "production", so ENVIRONMENT=staging / prod / qa (or a typo like " production")
+        # all sailed past the old check with the bypass fully active. Verified before the fix:
+        # every one of those booted successfully with the flag on.
+        #
+        # The rule is therefore inverted: the escape hatch is allowed ONLY in an environment
+        # explicitly recognised as local, and refused everywhere else -- including any
+        # environment name nobody anticipated. Fail closed on the unknown, which is the same
+        # posture core/tenancy.py and scanner_engine/scope_guard.py already take.
+        if self.dev_auto_authorize_targets and not self.is_local_environment:
+            raise RuntimeError(
+                "Insecure configuration: DEV_AUTO_AUTHORIZE_TARGETS is enabled with "
+                f"ENVIRONMENT={self.environment!r}. This flag bypasses the target-ownership "
+                "authorization guardrail entirely -- MBS would scan targets with no proof of "
+                "authorization. It is permitted only in a local environment "
+                f"({', '.join(sorted(_LOCAL_ENVIRONMENTS))}). Unset it, or set ENVIRONMENT to "
+                "a local value if this really is a developer machine."
+            )
+
         if not self.is_production:
             return
+
+        # MBS.SC -- THE SCANNER EXECUTION PLANE VALIDATES DIFFERENT INVARIANTS.
+        #
+        # Every check below this point asks "is this control-plane credential safe?" --
+        # JWT signing key, S3 credentials, the database DSN, CORS/TRUSTED_HOSTS, the AI
+        # budget. The scanner execution plane deliberately HAS NONE OF THEM (Property B),
+        # so running those checks against it fails on the absence of things whose absence
+        # is the entire point: verified directly, a production scanner refused to boot with
+        # "JWT_SECRET_KEY is a placeholder / DATABASE_URL uses default dev credentials".
+        #
+        # This is NOT a relaxation. The execution plane is held to its OWN invariants,
+        # which are stricter in the direction that matters for it: it must not possess a
+        # control-plane credential at all, and it must know where its manager is. A
+        # scanner that somehow acquired a real DSN fails here, where the control-plane
+        # branch would have happily accepted it as "a good production credential".
+        if self.scanner_execution_plane:
+            exec_problems: list[str] = []
+            from apps.api.celery_app.startup_security import (
+                ExecutionPlaneCredentialError,
+                enforce_execution_plane_credentials,
+            )
+
+            try:
+                enforce_execution_plane_credentials()
+            except ExecutionPlaneCredentialError as exc:
+                exec_problems.append(str(exc))
+            if not self.scanner_manager_url:
+                exec_problems.append(
+                    "SCANNER_MANAGER_URL must be set on a scanner execution worker: it is "
+                    "the only control-plane endpoint the execution plane may use."
+                )
+            if self.dev_auto_authorize_targets:
+                exec_problems.append("DEV_AUTO_AUTHORIZE_TARGETS must never be set on a scanner.")
+
+            # DEDICATED VPN EGRESS. Validated here, at startup, because every one of these
+            # gaps produces the SAME dangerous runtime symptom if left to be discovered
+            # later: a worker that believes it is a VPN worker while its traffic leaves
+            # over the platform's own address. Fail to start instead.
+            mode = (self.scanner_egress_mode or "direct").strip().lower()
+            if mode not in ("direct", "vpn"):
+                exec_problems.append(
+                    f"SCANNER_EGRESS_MODE must be 'direct' or 'vpn', not {mode!r}. It is "
+                    f"declared explicitly and never inferred, so an unrecognised value is "
+                    f"a refusal rather than a silent fallback to direct egress."
+                )
+            elif mode == "vpn":
+                if self.scanner_site_id:
+                    # The two roles are mutually exclusive by design: a site worker holds a
+                    # customer tunnel and must not also be a platform internet exit.
+                    exec_problems.append(
+                        "SCANNER_EGRESS_MODE=vpn cannot be combined with SCANNER_SITE_ID. "
+                        "A private-site worker and the VPN-egress worker are separate "
+                        "roles on separate networks; one container must never be both."
+                    )
+                for name, value in (
+                    ("SCANNER_VPN_EGRESS_PRIVATE_KEY_FILE",
+                     self.scanner_vpn_egress_private_key_file),
+                    ("SCANNER_VPN_EGRESS_PEER_PUBLIC_KEY",
+                     self.scanner_vpn_egress_peer_public_key),
+                    ("SCANNER_VPN_EGRESS_ENDPOINT_HOST",
+                     self.scanner_vpn_egress_endpoint_host),
+                    ("SCANNER_VPN_EGRESS_ADDRESS", self.scanner_vpn_egress_address),
+                ):
+                    if not value:
+                        exec_problems.append(
+                            f"{name} must be set when SCANNER_EGRESS_MODE=vpn; without it "
+                            f"the egress tunnel cannot be established and target traffic "
+                            f"would have no VPN path."
+                        )
+                if not self.scanner_vpn_egress_exit_ip_url:
+                    exec_problems.append(
+                        "SCANNER_VPN_EGRESS_EXIT_IP_URL must be set when "
+                        "SCANNER_EGRESS_MODE=vpn: tunnel-up and a handshake do not prove "
+                        "traffic is using the tunnel, so exit-IP verification is required."
+                    )
+                if not self.vpn_egress_dispatch_cidr_list:
+                    exec_problems.append(
+                        "SCANNER_VPN_EGRESS_DISPATCH_CIDRS must be set when "
+                        "SCANNER_EGRESS_MODE=vpn: the kill-switch denies egress by default, "
+                        "so the manager plane must be named explicitly or this worker "
+                        "cannot reach its manager."
+                    )
+            if exec_problems:
+                raise RuntimeError(
+                    "Refusing to start the scanner execution plane with insecure "
+                    "configuration:\n  - " + "\n  - ".join(exec_problems)
+                )
+            return
+
         problems: list[str] = []
         # A secret the operator declared via `<NAME>_FILE` but that could not be read. The
         # inherited value (typically a dev default from .env) must NOT be allowed to stand in
@@ -518,6 +1051,21 @@ class Settings(BaseSettings):
             problems.append("SSL_VERIFY is disabled; never disable TLS verification in production.")
         if not self.rate_limit_enabled:
             problems.append("RATE_LIMIT_ENABLED must be true in production (unrestricted limits are unsafe).")
+        # F-08: the refresh cookie carries a 7-day credential. Without Secure it would be sent
+        # over plaintext http, so a network attacker could lift it -- exactly the exposure the
+        # move off localStorage was meant to remove. Production serves TLS (F-01), so there is
+        # no legitimate reason for this to be false there.
+        if not self.refresh_cookie_secure:
+            problems.append(
+                "REFRESH_COOKIE_SECURE must be true in production: the refresh cookie is a "
+                "long-lived credential and must never travel over plaintext http."
+            )
+        if self.refresh_cookie_samesite.lower() not in ("strict", "lax"):
+            problems.append(
+                f"REFRESH_COOKIE_SAMESITE must be 'strict' or 'lax' in production, not "
+                f"'{self.refresh_cookie_samesite}': 'none' would attach the refresh cookie to "
+                "cross-site requests and reintroduce CSRF on /auth/refresh."
+            )
         # Rate-limit IDENTITY. Production mandates rate limiting above, but a limiter is only as
         # good as the client identity it buckets on. The app cannot observe how many proxies sit
         # in front of it, and guessing is unsafe in BOTH directions: too low and every anonymous
@@ -537,6 +1085,40 @@ class Settings(BaseSettings):
         # MFA Step 3: production must be able to encrypt TOTP secrets at rest.
         if not self.mfa_encryption_key:
             problems.append("MFA_ENCRYPTION_KEY must be set in production (MFA cannot function without it).")
+        # --- F-06: a METERED AI provider in production must have a spend cap -----------------
+        # The production overlay ships AI_PROVIDER=openrouter with a real API key on api,
+        # worker AND worker-default, while budget enforcement defaulted OFF -- so the shipped
+        # production configuration billed without limit. It is reachable by any authenticated
+        # member holding project:read (POST /assistant/ask), bounded only by RATE_LIMIT_AI
+        # ("30/minute"), which caps REQUEST RATE, not COST -- and which itself fails open when
+        # Redis is down. A runaway agent loop or a single abusive tenant therefore had no
+        # spend ceiling at all.
+        #
+        # TWO independent switches had to be right (`ai_budget_enforce` AND a positive
+        # `ai_daily_budget_usd`); setting only one silently left spend unlimited, which is the
+        # trap this check exists to catch -- both partial configurations are refused by name.
+        #
+        # Scope is deliberately narrow: only when AI is actually LIVE (a real key is present)
+        # and the provider is metered. `local` (self-hosted Ollama) has no per-token cost, so
+        # it is exempt -- this guards a billing/abuse boundary, not AI usage as such.
+        if self.ai_enabled and self.ai_provider in _METERED_AI_PROVIDERS:
+            if not self.ai_budget_enforce:
+                problems.append(
+                    f"AI_BUDGET_ENFORCE must be true in production with the metered AI provider "
+                    f"'{self.ai_provider}': without it a runaway agent loop or an abusive tenant "
+                    "can bill without limit (RATE_LIMIT_AI caps request rate, not cost)."
+                )
+            if self.ai_daily_budget_usd <= 0:
+                problems.append(
+                    f"AI_DAILY_BUDGET_USD must be greater than 0 in production with the metered "
+                    f"AI provider '{self.ai_provider}': enforcement is inert without a positive "
+                    "cap, so spend stays unlimited even with AI_BUDGET_ENFORCE=true."
+                )
+        if self.dev_auto_authorize_targets:
+            problems.append(
+                "DEV_AUTO_AUTHORIZE_TARGETS must never be enabled in production -- it bypasses the "
+                "target-ownership authorization guardrail entirely."
+            )
         # DR-2: if backup encryption is enabled, the key must be present (fail closed).
         if self.backup_enabled and self.backup_encryption_enabled and not self.backup_encryption_key:
             problems.append("BACKUP_ENCRYPTION_KEY must be set when BACKUP_ENCRYPTION_ENABLED is true.")
@@ -588,5 +1170,9 @@ def get_settings() -> Settings:
     from apps.api.core.secrets import load_external_secrets
 
     load_external_secrets()
+    _resolve_database_url_from_parts()
     _resolve_file_secrets()
-    return Settings()
+    # AUDIT-013: pydantic BaseSettings populates every field from the environment/defaults
+    # at construction; mypy (without the pydantic plugin) reads the generated __init__ as
+    # requiring each field explicitly. Verified correct at runtime by the whole test suite.
+    return Settings()  # type: ignore[call-arg]

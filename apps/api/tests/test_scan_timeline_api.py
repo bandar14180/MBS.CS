@@ -5,11 +5,11 @@ pagination headers, event shape, and NO sensitive-blob leakage in the decision t
 import asyncio
 import uuid
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from apps.api.ai_agent.agent import AgentDecision as _Decision, CandidateAction
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.agent.models import AgentStep
 from apps.api.modules.agent.repo import persist_agent_decision
@@ -30,7 +30,7 @@ async def _seed_events(ws_id: str, scan_id: str):
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with maker() as s:
-            await s.execute(text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": ws_id})
+            tenancy.bind_workspace(ws_id)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             s.add(ToolRun(scan_id=uuid.UUID(scan_id), tool_name="httpx", tool_version="1", status="completed", command_hash="x"))
             step = AgentStep(workspace_id=uuid.UUID(ws_id), scan_id=uuid.UUID(scan_id), step_no=0,
                              phase="reconnaissance", action_type="tool_run", tool_or_module="httpx", status="completed")

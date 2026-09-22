@@ -1,8 +1,8 @@
 """Phase 1.6 -- backup & disaster recovery.
 
 Exercises the full DR flow (backup / restore / verify / cleanup) via injectable seams --
-a fake PgRunner that writes a synthetic PGDMP archive and an in-memory ObjectStore -- so no
-postgres client or live MinIO is required. Covers success/failure, missing + corrupted
+a fake MySQLRunner that writes a synthetic mysqldump-shaped file and an in-memory ObjectStore --
+so no MySQL client or live MinIO is required. Covers success/failure, missing + corrupted
 backups, retention policy, verification, metrics, structured logging, and config defaults.
 """
 import json
@@ -23,12 +23,12 @@ from apps.api.dr.service import (
     verify_backup,
 )
 
-VALID_DUMP = b"PGDMP" + b"\x00" * 200   # magic + non-trivial size
+VALID_DUMP = b"-- MySQL dump" + b" " * 200   # magic + non-trivial size
 
 
 # --- fakes --------------------------------------------------------------------------------
 
-class FakePgRunner:
+class FakeMySQLRunner:
     def __init__(self, *, fail_dump=False, fail_restore=False, body=VALID_DUMP):
         self.fail_dump = fail_dump
         self.fail_restore = fail_restore
@@ -37,12 +37,12 @@ class FakePgRunner:
 
     def dump(self, database_url, out_path):
         if self.fail_dump:
-            raise RuntimeError("pg_dump failed")
+            raise RuntimeError("mysqldump failed")
         Path(out_path).write_bytes(self.body)
 
     def restore(self, database_url, dump_path):
         if self.fail_restore:
-            raise RuntimeError("pg_restore failed")
+            raise RuntimeError("mysql restore failed")
         self.restored.append((database_url, str(dump_path)))
 
 
@@ -86,9 +86,9 @@ def _sample_store():
 def _settings(tmp_path, **over):
     base = dict(
         backup_directory=str(tmp_path / "backups"),
-        database_url="postgresql+asyncpg://mbs:mbs@postgres:5432/mbs",
-        backup_pg_dump_cmd="pg_dump",
-        backup_pg_restore_cmd="pg_restore",
+        database_url="mysql+aiomysql://mbs:mbs@mysql:3306/mbs",
+        backup_mysqldump_cmd="mysqldump",
+        backup_mysql_cmd="mysql",
         backup_include_objects=True,
         backup_compression=True,
         backup_verification_enabled=True,
@@ -102,46 +102,46 @@ def _settings(tmp_path, **over):
 # --- backup -------------------------------------------------------------------------------
 
 def test_successful_backup_creates_verified_set(tmp_path):
-    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner())
+    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner())
     assert res.ok is True
     d = res.set_dir
     assert d.name[:8].isdigit()                       # timestamped set name
-    assert (d / "db.dump").read_bytes().startswith(b"PGDMP")
+    assert (d / "db.sql").read_bytes().startswith(b"-- MySQL dump")
     assert (d / "objects.tar.gz").exists() and (d / "objects.meta.json").exists()
-    assert (d / "db.dump.sha256").exists() and (d / "objects.tar.gz.sha256").exists()
+    assert (d / "db.sql.sha256").exists() and (d / "objects.tar.gz.sha256").exists()
     man = json.loads((d / "MANIFEST.json").read_text(encoding="utf-8"))
     assert man["status"] == "completed"
-    assert man["components"]["postgres"]["bytes"] >= 64
+    assert man["components"]["mysql"]["bytes"] >= 64
     assert man["components"]["objects"]["count"] == 2
 
 
 def test_backup_never_overwrites_previous_sets(tmp_path):
     s = _settings(tmp_path)
-    first = run_backup(s, store=_sample_store(), runner=FakePgRunner()).set_dir
+    first = run_backup(s, store=_sample_store(), runner=FakeMySQLRunner()).set_dir
     time.sleep(1.05)   # ensure a distinct second-resolution timestamp
-    second = run_backup(s, store=_sample_store(), runner=FakePgRunner()).set_dir
+    second = run_backup(s, store=_sample_store(), runner=FakeMySQLRunner()).set_dir
     assert first != second and first.exists() and second.exists()
 
 
 def test_failed_backup_records_failure(tmp_path):
-    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner(fail_dump=True))
+    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner(fail_dump=True))
     assert res.ok is False
     man = json.loads((res.set_dir / "MANIFEST.json").read_text(encoding="utf-8"))
     assert man["status"] == "failed"
-    assert "error" in man["components"]["postgres"]
+    assert "error" in man["components"]["mysql"]
 
 
 # --- restore ------------------------------------------------------------------------------
 
 def test_successful_restore_roundtrip_preserves_metadata(tmp_path):
     s = _settings(tmp_path)
-    res = run_backup(s, store=_sample_store(), runner=FakePgRunner())
+    res = run_backup(s, store=_sample_store(), runner=FakeMySQLRunner())
     assert res.ok
     target = FakeObjectStore()
-    runner = FakePgRunner()
+    runner = FakeMySQLRunner()
     ok = run_restore(s, res.set_dir, store=target, runner=runner, include_objects=True)
     assert ok is True
-    assert runner.restored                             # pg_restore was invoked
+    assert runner.restored                             # mysql restore was invoked
     ev = target._d["mbs-evidence"]["scan1/out.txt"]
     assert ev["data"] == b"hello evidence"
     assert ev["content_type"] == "text/plain"          # metadata preserved
@@ -149,15 +149,15 @@ def test_successful_restore_roundtrip_preserves_metadata(tmp_path):
 
 
 def test_restore_missing_backup_returns_false(tmp_path):
-    ok = run_restore(_settings(tmp_path), tmp_path / "backups" / "nope", runner=FakePgRunner())
+    ok = run_restore(_settings(tmp_path), tmp_path / "backups" / "nope", runner=FakeMySQLRunner())
     assert ok is False
 
 
 def test_restore_refuses_when_verification_fails(tmp_path):
     s = _settings(tmp_path)
-    res = run_backup(s, store=_sample_store(), runner=FakePgRunner())
-    (res.set_dir / "db.dump").write_bytes(b"PGDMP" + b"\xff" * 200)   # checksum now mismatches
-    runner = FakePgRunner()
+    res = run_backup(s, store=_sample_store(), runner=FakeMySQLRunner())
+    (res.set_dir / "db.sql").write_bytes(b"-- MySQL dump" + b"\xff" * 200)   # checksum now mismatches
+    runner = FakeMySQLRunner()
     ok = run_restore(s, res.set_dir, runner=runner, include_objects=False)
     assert ok is False and runner.restored == []       # never mutated the target
 
@@ -165,20 +165,20 @@ def test_restore_refuses_when_verification_fails(tmp_path):
 # --- corruption / verification ------------------------------------------------------------
 
 def test_corrupted_db_dump_fails_verification(tmp_path):
-    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner())
-    (res.set_dir / "db.dump").write_bytes(b"PGDMP" + b"\x01" * 200)   # magic ok, checksum mismatch
+    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner())
+    (res.set_dir / "db.sql").write_bytes(b"-- MySQL dump" + b"\x01" * 200)   # magic ok, checksum mismatch
     assert verify_backup(res.set_dir) is False
 
 
 def test_corrupted_objects_archive_fails_verification(tmp_path):
-    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner())
+    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner())
     (res.set_dir / "objects.tar.gz").write_bytes(b"not a gzip stream")
     assert verify_backup(res.set_dir) is False
 
 
 def test_verification_good_set_and_missing_manifest(tmp_path):
     s = _settings(tmp_path)
-    res = run_backup(s, store=_sample_store(), runner=FakePgRunner())
+    res = run_backup(s, store=_sample_store(), runner=FakeMySQLRunner())
     assert verify_backup(res.set_dir) is True
     empty = Path(s.backup_directory) / "emptyset"
     empty.mkdir()
@@ -237,8 +237,8 @@ def test_metrics_increment_and_are_low_cardinality(tmp_path):
     v0 = m.VERIFICATION_SUCCESS.labels("full")._value.get()
     r0 = m.RESTORE_SUCCESS.labels("full")._value.get()
     s = _settings(tmp_path)
-    res = run_backup(s, store=_sample_store(), runner=FakePgRunner())
-    run_restore(s, res.set_dir, store=FakeObjectStore(), runner=FakePgRunner(), include_objects=True)
+    res = run_backup(s, store=_sample_store(), runner=FakeMySQLRunner())
+    run_restore(s, res.set_dir, store=FakeObjectStore(), runner=FakeMySQLRunner(), include_objects=True)
     assert m.BACKUP_SUCCESS.labels("full")._value.get() == b0 + 1
     assert m.VERIFICATION_SUCCESS.labels("full")._value.get() >= v0 + 1
     assert m.RESTORE_SUCCESS.labels("full")._value.get() == r0 + 1
@@ -251,16 +251,16 @@ def test_metrics_increment_and_are_low_cardinality(tmp_path):
 def test_failed_backup_increments_failure_metric(tmp_path):
     if not m._PROM:
         pytest.skip("prometheus_client not installed")
-    f0 = m.BACKUP_FAILED.labels("postgres")._value.get()
-    run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner(fail_dump=True))
-    assert m.BACKUP_FAILED.labels("postgres")._value.get() == f0 + 1
+    f0 = m.BACKUP_FAILED.labels("mysql")._value.get()
+    run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner(fail_dump=True))
+    assert m.BACKUP_FAILED.labels("mysql")._value.get() == f0 + 1
 
 
 # --- structured logging -------------------------------------------------------------------
 
 def test_backup_emits_structured_lifecycle_events(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="mbs.backup")
-    run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner())
+    run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner())
     events = {getattr(r, "event", None) for r in caplog.records}
     assert {"backup.started", "backup.completed", "verification.completed"} <= events
 

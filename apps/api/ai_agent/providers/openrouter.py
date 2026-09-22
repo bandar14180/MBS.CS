@@ -19,6 +19,11 @@ class OpenRouterClient(BaseAIProvider):
     is pulled in and the sync surface matches SupportsComplete."""
 
     provider_name = "openrouter"
+    # Subclass override point: request the OpenAI-compatible `response_format: json_object`
+    # mode. Left off here (OpenRouter fans out to many backing models, not all of which
+    # reliably honor the field the same way) -- LocalClient turns it on for its single,
+    # known-compatible Ollama server (see that subclass).
+    _json_mode: bool = False
 
     def __init__(
         self,
@@ -59,6 +64,8 @@ class OpenRouterClient(BaseAIProvider):
                 {"role": "user", "content": user},
             ],
         }
+        if self._json_mode:
+            payload["response_format"] = {"type": "json_object"}
         with sync_client(self._timeout_s) as client:
             resp = client.post(f"{self._base_url}/chat/completions", headers=headers, json=payload)
         # Terminal client errors (bad request / auth / payment / forbidden /

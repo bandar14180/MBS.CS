@@ -2,8 +2,8 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
-from apps.api.core.deps import CurrentUserDep, DbDep, require_permission
-from apps.api.modules.workspaces import service
+from apps.api.core.deps import CurrentUserDep, DbDep, WorkspaceContextDep, require_permission
+from apps.api.modules.workspaces import service, tenant_service
 from apps.api.modules.workspaces.schemas import (
     MemberInvite,
     MemberRead,
@@ -12,6 +12,7 @@ from apps.api.modules.workspaces.schemas import (
     WorkspaceCreate,
     WorkspaceRead,
 )
+from apps.api.modules.workspaces.tenant_schemas import WorkspaceDeleteConfirm, WorkspaceExport
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 roles_router = APIRouter(tags=["workspaces"])
@@ -66,6 +67,36 @@ async def update_member_role(
 )
 async def remove_member(workspace_id: uuid.UUID, user_id: uuid.UUID, db: DbDep) -> None:
     await service.remove_member(db, workspace_id, user_id)
+
+
+@router.get(
+    "/{workspace_id}/export",
+    response_model=WorkspaceExport,
+    dependencies=[Depends(require_permission("workspace:export"))],
+)
+async def export_workspace(workspace_id: uuid.UUID, db: DbDep) -> WorkspaceExport:
+    """Complete, read-only, workspace-scoped export (owner/admin). Object references only;
+    secrets/credentials are never included."""
+    return await tenant_service.export_workspace(db, workspace_id)
+
+
+@router.delete(
+    "/{workspace_id}",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_permission("workspace:delete"))],
+)
+async def delete_workspace(
+    workspace_id: uuid.UUID,
+    payload: WorkspaceDeleteConfirm,
+    db: DbDep,
+    ctx: WorkspaceContextDep,
+    current_user: CurrentUserDep,
+) -> dict:
+    """Owner-only, name-confirmed, irreversible. Flips the workspace to `deleting` and enqueues
+    the async deletion task; returns 202. `workspace:delete` is owner/admin, and the service
+    additionally enforces owner-only."""
+    await tenant_service.request_workspace_deletion(db, workspace_id, current_user, payload.confirm_name)
+    return {"status": "deleting", "workspace_id": str(workspace_id)}
 
 
 @roles_router.get("/roles", response_model=list[RoleRead])

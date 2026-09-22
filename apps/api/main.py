@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse, Response
 
 from apps.api.core.config import configure_networking, get_settings
 from apps.api.core.logging import configure_logging
+from apps.api.core.stack_mode import assert_stack_mode_configured
 from apps.api.core.middleware import (
     ObservabilityMiddleware,
     RateLimitMiddleware,
@@ -23,6 +24,7 @@ from apps.api.core.observability import (
     register_reliability_collector,
 )
 from apps.api.modules.api_keys.router import router as api_keys_router
+from apps.api.modules.assessment.router import router as risk_assessments_router
 from apps.api.modules.assets.router import router as assets_router
 from apps.api.modules.assistant.router import ai_router as ai_status_router
 from apps.api.modules.assistant.router import router as assistant_router
@@ -35,6 +37,7 @@ from apps.api.modules.notifications.router import router as notifications_router
 from apps.api.modules.authorization_scope.router import router as authorization_scope_router
 from apps.api.modules.dashboard.router import router as dashboard_router
 from apps.api.modules.projects.router import router as projects_router
+from apps.api.modules.remediation.router import router as remediation_router
 from apps.api.modules.reports.router import router as reports_router
 from apps.api.modules.scans.router import capabilities_router as scan_capabilities_router
 from apps.api.modules.scans.router import router as scans_router
@@ -46,12 +49,24 @@ from apps.api.modules.workspaces.router import router as workspaces_router
 
 logger = logging.getLogger("mbs.app")
 
+# Refuse to run STALE, BAKED-IN IMAGE CODE. A dev stack started from an incomplete compose
+# `-f` list loses the apps/api bind mount and silently serves whatever was in the image at
+# its last build -- see apps/api/core/stack_mode.py for the full failure mode.
+#
+# Deliberately at IMPORT time, not inside `lifespan`: uvicorn's --reload supervisor imports
+# this module in a child process, and an exception here stops the boot immediately with the
+# remedy on stderr, rather than after the app has bound its port and reported itself healthy.
+# The guard is a no-op unless the compose sentinel is present, so importing this module from
+# tests, scripts or a non-compose runtime is unaffected.
+assert_stack_mode_configured()
+
 _ROUTERS = (
     auth_router, users_router, workspaces_router, roles_router, projects_router,
     dashboard_router, authorization_scope_router, scans_router, scan_capabilities_router, schedules_router,
     assets_router, vulnerabilities_router, reports_router, assistant_router,
     ai_status_router, billing_router, plans_public_router, notifications_router,
     audit_router, api_keys_router, ai_usage_router,
+    remediation_router, risk_assessments_router,
 )
 
 
@@ -63,9 +78,26 @@ async def lifespan(app: FastAPI):
     configure_networking(settings)
     # Fail fast if production is misconfigured (placeholder secrets, wildcard CORS, ...).
     settings.validate_production()
+    # Phase 0 MySQL cutover: workspace isolation moved from Postgres RLS to an
+    # app-layer ORM filter (apps/api/core/tenancy.py). Install it FIRST, before the
+    # runtime security checks below -- one of those checks (M4.6.1 / F4) verifies the
+    # filter is actually installed, so installing it after would make that check
+    # always fail. Every router imported at module level above has already pulled in
+    # its models transitively, so Base.metadata is fully populated by this point.
+    from apps.api.core import tenancy
+
+    tenancy.install()
+
+    # Prompt 34: the audit tables are documented append-only; this installs the ORM-level
+    # guard that actually enforces it (UPDATE never, DELETE only via the retention escape
+    # hatch). Same phase as tenancy for the same reason -- mappers are fully registered.
+    from apps.api.modules.audit import immutability as audit_immutability
+
+    audit_immutability.install()
+
     # Runtime security checks that need DB context (M4.6.1): refuse to start in
-    # production on a superuser DB role (would bypass FORCE RLS / workspace isolation),
-    # and warn when derived-scope enforcement is disabled. Dev warns and continues.
+    # production if workspace isolation isn't installed, and warn when derived-scope
+    # enforcement is disabled. Dev warns and continues.
     from apps.api.core.db import engine
     from apps.api.core.startup_checks import run_startup_security_checks
 
@@ -153,7 +185,17 @@ def create_app() -> FastAPI:
 
     @app.get("/ready")
     async def ready() -> Response:
-        """Readiness: can the app actually serve? Probes Postgres and Redis; 503 if either is down."""
+        """Readiness: can the app actually serve?
+
+        Three INDEPENDENT checks, reported separately (AUDIT-002 / AUDIT-007):
+          * database  -- connectivity (MySQL, not Postgres: the docstring predated the cutover)
+          * schema    -- the live alembic_version matches this build's migration head
+          * redis     -- broker/cache liveness, deliberately kept apart from schema validation
+
+        503 if any fails. `SELECT 1` alone was NOT readiness: it answers "is a database
+        listening", not "is it the schema this code expects" -- a node whose migration step
+        was skipped reported ready and then 500ed on the first query touching a missing table.
+        """
         checks: dict[str, str] = {}
         ok = True
         try:
@@ -173,6 +215,39 @@ def create_app() -> FastAPI:
                        "correlation_id": get_correlation_id()},
                 exc_info=True,
             )
+        # Schema version -- separate from both connectivity and Redis. Only reported as ok
+        # when the DB revision is exactly this build's head; behind/ahead/unknown all mean
+        # this node must not receive traffic.
+        try:
+            from apps.api.core.db import engine as _schema_engine
+            from apps.api.core.schema_version import check_schema_version
+
+            schema_status = await check_schema_version(_schema_engine)
+            if schema_status.is_healthy:
+                checks["schema"] = "ok"
+            else:
+                # State name only -- never the revision ids or detail text, which would
+                # disclose deployment internals on this unauthenticated probe.
+                checks["schema"] = schema_status.state.value
+                ok = False
+                logger.warning(
+                    "ready.check_failed component=schema",
+                    extra={"event": "ready.check_failed", "component": "schema",
+                           "state": schema_status.state.value,
+                           "db_revision": schema_status.db_revision,
+                           "head_revision": schema_status.head_revision,
+                           "correlation_id": get_correlation_id()},
+                )
+        except Exception:  # noqa: BLE001
+            checks["schema"] = "error"
+            ok = False
+            logger.warning(
+                "ready.check_failed component=schema",
+                extra={"event": "ready.check_failed", "component": "schema",
+                       "correlation_id": get_correlation_id()},
+                exc_info=True,
+            )
+
         try:
             import redis.asyncio as aioredis
 

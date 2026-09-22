@@ -13,11 +13,11 @@ and tagging are the real code paths. RLS not involved (these paths are scans-sco
 import asyncio
 import uuid
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from apps.api.ai_agent.agent import AgentDecision, CandidateAction, RedTeamAgent
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.projects.models import Project, Target
 from apps.api.modules.scans.models import Scan
@@ -32,9 +32,11 @@ DOMAIN = "example.com"
 
 
 async def _set_guc(session, ws_id):
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :wid, false)"), {"wid": str(ws_id)}
-    )
+    # Phase 0 MySQL cutover: was a Postgres `set_config` GUC call (session-level RLS binding).
+    # Replaced by tenancy.bind_workspace -- a plain Python ContextVar set, not DB-side at all
+    # (see apps.api.core.tenancy's module docstring). `session` is now unused but kept as a
+    # parameter so every call site in this file is unchanged.
+    tenancy.bind_workspace(ws_id)
 
 
 async def _seed_domain_scan(session) -> Scan:
@@ -77,7 +79,7 @@ async def _capture_httpx_prior(prior, monkeypatch_run) -> list[str]:
 
 
 def _install_capture(monkeypatch) -> dict:
-    state = {"received": []}
+    state: dict = {"received": []}
 
     async def _cap(self, target_value, config, prior_findings):
         state["received"] = [f.value for f in prior_findings]

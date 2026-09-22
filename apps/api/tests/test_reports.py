@@ -251,7 +251,10 @@ def _finding_block_text(v: VulnRow) -> str:
         if hasattr(flowable, "getPlainText"):
             texts.append(flowable.getPlainText())
 
-    _walk(block)
+    # Phase 4.2: _finding_block returns a LIST (an atomic header group + flowing body) rather
+    # than one oversized KeepTogether that could never fit a page. Walk each top-level flowable.
+    for _flowable in (block if isinstance(block, list) else [block]):
+        _walk(_flowable)
     return "\n".join(texts)
 
 
@@ -313,7 +316,10 @@ def _group_block_text(group: dict) -> str:
         if text is not None:
             texts.append(str(text))
 
-    _walk(block)
+    # Phase 4.2: _finding_block returns a LIST (an atomic header group + flowing body) rather
+    # than one oversized KeepTogether that could never fit a page. Walk each top-level flowable.
+    for _flowable in (block if isinstance(block, list) else [block]):
+        _walk(_flowable)
     return "\n".join(texts)
 
 
@@ -343,8 +349,8 @@ def test_technical_report_shows_template_matcher_matched_at_and_status():
     # The four Phase-1 lines are rendered with their real values.
     assert "Template: unix-command-injection" in text
     assert "Matcher: time-based" in text
-    # One location -> listed under "Affected locations", still showing the full URL.
-    assert "Affected locations (1):" in text
+    # One location -> listed under "Affected Location(s)", still showing the full URL.
+    assert "Affected Location(s)" in text and "1 location(s):" in text
     assert "https://x/a?p=1" in text
     assert "Status: open" in text
     # And the whole report still renders to a valid PDF.
@@ -370,7 +376,7 @@ def test_two_locations_of_one_vulnerability_are_one_block_listing_both_urls():
     assert len(groups) == 1, "same template at two URLs must be ONE finding"
     text = _group_block_text(groups[0])
     # The single block lists BOTH urls, and the shared metadata appears only once.
-    assert "Affected locations (2):" in text
+    assert "Affected Location(s)" in text and "2 location(s):" in text
     assert "https://x/a?p=1" in text and "https://x/b?p=2" in text
     assert text.count("Template: unix-command-injection") == 1
 
@@ -403,7 +409,7 @@ def test_report_renders_na_when_location_is_unavailable():
     text = _finding_block_text(row)
     assert "Template: legacy-hash-only" in text    # the one part it could recover
     assert "Matcher: N/A" in text
-    assert "Affected locations: N/A" in text
+    assert "No specific location was recorded" in text
     data = ReportData(
         project_name="P", security_score=85,
         severity_counts={"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 0},
@@ -425,33 +431,37 @@ def test_report_renders_na_for_a_completely_empty_fingerprint():
         text = _finding_block_text(row)
         assert "Template: N/A" in text
         assert "Matcher: N/A" in text
-        assert "Affected locations: N/A" in text
+        assert "No specific location was recorded" in text
 
 
 # --- P0 #1: CVSS 0.0 vs N/A must stay distinguishable in the report -----------------------
-# A genuine CVSS of 0.0 is a real score and must render "CVSS 0.0"; a missing score (None)
-# must render "CVSS N/A". Truthiness logic (`x or 0.0`, `if not x`) would wrongly collapse
+# A genuine CVSS of 0.0 is a real score and must render its value; a missing score (None)
+# must render "N/A". Truthiness logic (`x or 0.0`, `if not x`) would wrongly collapse
 # 0.0 into a fallback -- these pin the explicit-None behaviour instead. Reuses the existing
 # _finding_block_text / _vuln_row_with_fingerprint helpers (no PDF-text dependency).
+#
+# The fact card states the score once as "CVSS: <score> (<band>)" -- the value and its CVSS
+# v3.1 band together -- so 0.0 reads "CVSS: 0.0 (None)" and a missing score "CVSS: N/A". The
+# INVARIANT under test is unchanged: the two must never be rendered alike.
 
 _FP = "unix-command-injection|time-based|https://x/a?p=1"
 
 
 def test_genuine_zero_cvss_renders_as_0_not_na():
     text = _finding_block_text(_vuln_row_with_fingerprint(_FP, cvss_score=0.0))
-    assert "CVSS 0.0" in text
-    assert "CVSS N/A" not in text          # 0.0 must NOT be shown as missing
+    assert "CVSS: 0.0" in text
+    assert "CVSS: N/A" not in text         # 0.0 must NOT be shown as missing
 
 
 def test_missing_cvss_renders_as_na_not_zero():
     text = _finding_block_text(_vuln_row_with_fingerprint(_FP, cvss_score=None))
-    assert "CVSS N/A" in text
-    assert "CVSS 0.0" not in text          # missing must NOT be shown as 0.0
+    assert "CVSS: N/A" in text
+    assert "CVSS: 0.0" not in text         # missing must NOT be shown as 0.0
 
 
 def test_normal_cvss_still_renders_its_value():
     text = _finding_block_text(_vuln_row_with_fingerprint(_FP, cvss_score=9.8))
-    assert "CVSS 9.8" in text
+    assert "CVSS: 9.8" in text
 
 
 def test_zero_and_none_are_distinguishable_in_the_same_report():
@@ -459,8 +469,8 @@ def test_zero_and_none_are_distinguishable_in_the_same_report():
     b = _vuln_row_with_fingerprint("t|m|https://x/none", cvss_score=None)
     text_a = _finding_block_text(a)
     text_b = _finding_block_text(b)
-    assert "CVSS 0.0" in text_a and "CVSS N/A" not in text_a
-    assert "CVSS N/A" in text_b and "CVSS 0.0" not in text_b
+    assert "CVSS: 0.0" in text_a and "CVSS: N/A" not in text_a
+    assert "CVSS: N/A" in text_b and "CVSS: 0.0" not in text_b
     # And the full technical report still renders both together as a valid PDF.
     data = ReportData(
         project_name="P", security_score=0,
@@ -766,7 +776,7 @@ def test_all_unique_locations_are_retained_under_the_finding():
     assert len(group["matched_ats"]) == 20
     assert group["occurrence_count"] == 21  # every row still counted
     text = _group_block_text(group)
-    assert "Affected locations (20):" in text
+    assert "Affected Location(s)" in text and "20 location(s)" in text
     for u in urls:
         assert u in text
 
@@ -797,7 +807,7 @@ def test_severity_cvss_and_risk_are_not_incorrectly_merged():
     assert group["cvss_score"] == 9.5
     assert group["final_risk_score"] == 10.0
     text = _group_block_text(group)
-    assert "CRITICAL" in text and "CVSS 9.5" in text
+    assert "CRITICAL" in text and "CVSS: 9.5" in text
 
 
 def test_single_location_finding_still_renders_normally():
@@ -805,7 +815,7 @@ def test_single_location_finding_still_renders_normally():
     (group,) = render._finding_groups([_g_row("CVE-2022-0591", "https://h/only")])
     assert group["occurrence_count"] == 1
     text = _group_block_text(group)
-    assert "Affected locations (1):" in text
+    assert "Affected Location(s)" in text and "1 location(s):" in text
     assert "https://h/only" in text
     assert "Template: CVE-2022-0591" in text
 

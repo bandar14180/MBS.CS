@@ -48,6 +48,10 @@ async def _seed_scan_and_evidence(s):
     ws = Workspace(name="ing-ws", owner_user_id=user.id)
     s.add(ws)
     await s.flush()
+    # Bind the just-created workspace before inserting into it -- same step production
+    # takes in workspaces.service.create_workspace, required by the INSERT guard in
+    # core/tenancy.py (an ORM flush INSERT bypasses the SELECT/UPDATE/DELETE filter).
+    tenancy.bind_workspace(ws.id)
     project = Project(workspace_id=ws.id, name="ing-proj", created_by=user.id)
     s.add(project)
     await s.flush()

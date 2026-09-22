@@ -12,10 +12,11 @@ storage are the real code paths. RLS stays enabled (workspace GUC set).
 import asyncio
 import uuid
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.assets.models import Asset
 from apps.api.modules.projects.models import Project, Target
@@ -31,9 +32,9 @@ DOMAIN = "example.com"
 
 
 async def _set_guc(session, ws_id):
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :wid, false)"), {"wid": str(ws_id)}
-    )
+    # Phase 0 MySQL cutover: was a Postgres set_config GUC call; tenancy.bind_workspace is the
+    # app-layer replacement (a plain ContextVar set) -- see apps.api.core.tenancy.
+    tenancy.bind_workspace(ws_id)
 
 
 async def _seed_domain(session):

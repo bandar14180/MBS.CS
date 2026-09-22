@@ -7,7 +7,7 @@ from apps.api.modules.ai_usage import service
 from apps.api.modules.ai_usage.schemas import AIUsageReport
 
 # AI-2.2B-2: workspace-scoped AI cost report. Mounted under /workspaces/{workspace_id}/... so
-# WorkspaceContextDep sets the RLS GUC + verifies membership; workspace:view gates access (cost
+# WorkspaceContextDep binds the workspace + verifies membership; workspace:view gates access (cost
 # aggregates are provider/model/token/cost only -- no prompts/findings/secrets).
 router = APIRouter(prefix="/workspaces/{workspace_id}/ai-usage", tags=["ai-usage"])
 

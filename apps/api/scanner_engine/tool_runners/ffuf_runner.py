@@ -125,10 +125,12 @@ class FfufRunner(BaseToolRunner):
             len(targets), MAX_CONCURRENT_TARGETS, per_target_timeout, rate, wordlist, entries,
         )
 
-        async def _fuzz_one(index: int, target: str) -> tuple[str, str, str, int]:
-            """Fuzz ONE target. Returns (command, stdout, stderr, exit_code) and never
-            raises -- a crash or timeout on one host is reported, not propagated, so the
-            other targets still produce results."""
+        async def _fuzz_one(index: int, target: str) -> tuple[str, str, str, int, bool]:
+            """Fuzz ONE target. Returns (command, stdout, stderr, exit_code, timed_out) and
+            never raises -- a crash or timeout on one host is reported, not propagated, so
+            the other targets still produce results. `timed_out` is a structured boolean
+            (Prompt 10) rather than something a caller has to infer by matching "timed out"
+            in the stderr text."""
             url = target.rstrip("/") + "/FUZZ"
             command = [
                 "ffuf",
@@ -162,7 +164,7 @@ class FfufRunner(BaseToolRunner):
                     )
                 except OSError as exc:  # binary missing / cannot spawn
                     logger.error("ffuf.target_failed url=%s error=%s", url, exc)
-                    return command_str, "", f"{target}: {type(exc).__name__}: {exc}", -1
+                    return command_str, "", f"{target}: {type(exc).__name__}: {exc}", -1, False
                 # Incremental capture: a timeout now KEEPS the hits found so far instead of
                 # discarding them (the measured run lost all 146).
                 result = await run_with_timeout(proc, per_target_timeout, "ffuf")
@@ -180,6 +182,7 @@ class FfufRunner(BaseToolRunner):
                         result.stdout,
                         f"{target}: timed out after {per_target_timeout}s; preserved {hits} hit(s)",
                         -1,
+                        True,
                     )
 
                 stdout = result.stdout
@@ -199,13 +202,13 @@ class FfufRunner(BaseToolRunner):
                         "It is likely down, rate-limiting, or blocking automated scanners.",
                         index + 1, len(targets), url, time.monotonic() - started,
                     )
-                    return command_str, "", f"{target}: target errored on every request (ffuf: spurious errors)", -1
+                    return command_str, "", f"{target}: target errored on every request (ffuf: spurious errors)", -1, False
 
                 logger.info(
                     "ffuf.target_done %d/%d url=%s exit=%s hits=%d duration=%.1fs",
                     index + 1, len(targets), url, proc.returncode, hits, time.monotonic() - started,
                 )
-                return command_str, stdout, stderr, proc.returncode or 0
+                return command_str, stdout, stderr, proc.returncode or 0, False
 
         results = await asyncio.gather(*(_fuzz_one(i, t) for i, t in enumerate(targets)))
 
@@ -215,12 +218,16 @@ class FfufRunner(BaseToolRunner):
         # Any target that failed marks the run non-zero; the orchestrator still keeps the
         # findings the successful targets produced (classify_run -> "partial").
         exit_code = next((r[3] for r in results if r[3]), 0)
+        # True iff AT LEAST ONE fanned-out target hit its per-target budget -- same
+        # conservative "any" aggregate as arjun's multi-target runner (Prompt 10).
+        any_timed_out = any(r[4] for r in results)
 
         return RawToolOutput(
             command=" && ".join(commands),
             stdout="\n".join(stdout_parts),
             stderr="\n".join(stderr_parts),
             exit_code=exit_code,
+            timed_out=any_timed_out,
         )
 
     def parse(self, raw: RawToolOutput) -> list[CommonFinding]:

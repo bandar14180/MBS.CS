@@ -16,6 +16,7 @@ CLI:
     python -m apps.api.celery_app.dlq remove <scan_id>
     python -m apps.api.celery_app.dlq purge
 """
+import uuid
 import json
 
 from apps.api.celery_app.tasks.scan_tasks import DLQ_KEY
@@ -56,15 +57,76 @@ def remove(scan_id: str) -> int:
 def replay(scan_id: str) -> bool:
     """Re-enqueue the scan once, then drop it from the DLQ. Idempotent: a scan that
     already finished successfully is skipped by the orchestrator. Returns True if a
-    matching DLQ entry was found and re-enqueued."""
+    matching DLQ entry was found and re-enqueued.
+
+    DISPATCH MODEL. Under the LEASE model (`celery_scan_dispatch_enabled` False, the
+    deployed default) there is no consumer for the scan queues, so enqueueing here would
+    put the replayed scan onto a queue nothing reads -- the operator would be told the
+    replay succeeded while nothing ever ran. A scan is instead replayed by making it
+    LEASABLE again, which is what `_claim_scan` already understands: it claims from
+    `queued` and from reaper-recovered `failed`. This is deliberately NOT done by writing
+    the scan row from here -- that would need a DB session in a Redis-only module -- so the
+    caller is told plainly what to do rather than being given a false success.
+    """
     entries = [e for e in inspect() if e.get("scan_id") == scan_id]
     if not entries:
         return False
+
+    from apps.api.core.config import get_settings
+
+    if not get_settings().celery_scan_dispatch_enabled:
+        # Refuse rather than enqueue into a queue with no consumer. The DLQ entry is
+        # deliberately LEFT IN PLACE: dropping it would destroy the record of the failure
+        # without anything having been replayed.
+        raise RuntimeError(
+            f"scan {scan_id}: Celery scan dispatch is disabled (lease model), so a replay "
+            "cannot be enqueued -- nothing consumes the scan queues. Re-run the scan "
+            "through the API instead; the DLQ entry has been left in place."
+        )
+
     from apps.api.celery_app.tasks.scan_tasks import run_scan_task
 
-    run_scan_task.delay(scan_id)
+    # MBS.SC Phase 5: replay MUST re-route, not just re-enqueue. `.delay()` would use the
+    # task's default route (`scans.public`), so replaying a failed PRIVATE scan would drop
+    # it onto the public queue -- where a public worker with internet egress and no tunnel
+    # would pick it up. Re-derive the queue from the scan's own persisted zone/site.
+    queue = _queue_for_scan_id(scan_id)
+    run_scan_task.apply_async(args=[scan_id], queue=queue)
     remove(scan_id)
     return True
+
+
+def _queue_for_scan_id(scan_id: str) -> str:
+    """The queue this scan must be replayed to, read from the scan row.
+
+    Falls back to the PUBLIC queue only when the scan row genuinely says public (or has
+    vanished). A private scan whose site cannot be determined is not replayed to a
+    lesser-authority queue -- queue_for_scan raises instead, which surfaces the problem
+    rather than silently misrouting an internal engagement.
+    """
+    import asyncio
+
+    from apps.api.scanner_engine.scan_routing import queue_for_scan
+
+    async def _load() -> tuple[str, str | None]:
+        from apps.api.core.db import make_worker_engine
+        from apps.api.modules.scans.models import Scan
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+
+        engine = make_worker_engine()
+        try:
+            maker = async_sessionmaker(engine, expire_on_commit=False)
+            async with maker() as session:
+                scan = await session.get(Scan, uuid.UUID(scan_id))
+                if scan is None:
+                    return "public", None
+                cfg = scan.config or {}
+                return (cfg.get("network_zone") or "public"), cfg.get("site_id")
+        finally:
+            await engine.dispose()
+
+    zone, site_id = asyncio.run(_load())
+    return queue_for_scan(network_zone=zone, site_id=site_id)
 
 
 def purge() -> int:

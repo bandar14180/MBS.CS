@@ -1,7 +1,7 @@
 """DR-2 -- backup encryption at rest (AES-256-GCM).
 
 Encrypts a backup artifact IN PLACE so the rest of the DR system keeps its existing filenames
-and set layout (db.dump, objects.tar.gz); only the file *content* becomes ciphertext. An
+and set layout (db.sql, objects.tar.gz); only the file *content* becomes ciphertext. An
 8-byte magic header marks an MBS-encrypted artifact and lets verify/restore detect it without
 a flag. GCM gives authenticated encryption: a wrong key or a single flipped byte fails the tag
 check, so `decrypt_*` raises `DecryptionError` and verification fails CLOSED (never silently

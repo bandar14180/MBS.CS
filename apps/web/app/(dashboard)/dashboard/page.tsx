@@ -194,7 +194,7 @@ function Recommendations() {
       <p className="mb-3 text-xs text-slate-500">{t("recommendations.subtitle")}</p>
       <div className="space-y-2">
         {items.map((r) => (
-          <Link key={r.vulnerability_id} href={`/projects/${r.project_id}`}>
+          <Link key={r.vulnerability_id} href={`/projects/${r.project_id}/vulnerabilities`}>
             <Card className="flex items-center justify-between gap-3 transition hover:border-accent-cyan/40">
               <div className="flex items-center gap-3">
                 <Badge kind="severity" value={r.severity} />
@@ -223,7 +223,7 @@ function RecentScans({ summary }: { summary: DashboardSummary }) {
       <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-slate-400">{t("dashboard.recentScans")}</h2>
       <div className="space-y-2">
         {summary.recent_scans.map((s) => (
-          <Link key={s.id} href={`/projects/${s.project_id}`}>
+          <Link key={s.id} href={`/projects/${s.project_id}/scans`}>
             <Card className="flex items-center justify-between gap-3 transition hover:border-accent-cyan/40">
               <div className="flex items-center gap-3">
                 <Badge kind="status" value={s.status} />

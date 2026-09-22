@@ -21,8 +21,13 @@ class LogoutRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
+    """F-08: `refresh_token` is OPTIONAL because a browser no longer receives it in the body --
+    it arrives as an HttpOnly cookie instead, so echoing it here would hand script the very
+    secret the cookie exists to hide. Non-browser clients (no Origin/Referer) still get it,
+    because they have no cookie jar. See _strip_refresh_from_body in the auth router."""
+
     access_token: str
-    refresh_token: str
+    refresh_token: str | None = None
     token_type: str = "bearer"
 
 

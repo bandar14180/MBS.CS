@@ -170,7 +170,7 @@ def _hardened(**overrides) -> Settings:
         jwt_secret_key="a" * 48,
         s3_access_key="real-access",
         s3_secret_key="real-secret",
-        database_url="postgresql+asyncpg://user:strongpass@db:5432/mbs",
+        database_url="mysql+aiomysql://user:strongpass@db:3306/mbs",
         cors_allow_origins=["https://mbs.example.com"],
         trusted_hosts=["mbs.example.com"],
         ai_provider="openrouter",
@@ -178,6 +178,9 @@ def _hardened(**overrides) -> Settings:
         metrics_mode="token",
         mfa_encryption_key="a-real-mfa-encryption-key",
         trusted_proxy_count=0,
+        # F-08: production now requires the refresh cookie to be Secure (it carries a
+        # long-lived credential). A 'hardened production config' must therefore set it.
+        refresh_cookie_secure=True,
     )
     base.update(overrides)
     return Settings(**base)
@@ -273,7 +276,7 @@ def test_validate_production_rejects_disabled_ssl() -> None:
         jwt_secret_key="a" * 48,
         s3_access_key="real",
         s3_secret_key="real",
-        database_url="postgresql+asyncpg://u:p@db:5432/mbs",
+        database_url="mysql+aiomysql://u:p@db:3306/mbs",
         cors_allow_origins=["https://x.example.com"],
         trusted_hosts=["x.example.com"],
         ssl_verify=False,

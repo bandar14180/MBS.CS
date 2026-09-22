@@ -14,8 +14,14 @@ import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@
 import { useAssistant } from "@/components/assistant/AssistantWidget";
 
 const SEVERITIES = ["", "critical", "high", "medium", "low", "info"];
-const STATUSES = ["", "open", "confirmed", "false_positive", "remediated", "accepted_risk"];
-const STATUS_CHOICES = ["confirmed", "false_positive", "remediated", "accepted_risk"];
+// Must mirror the BACKEND lifecycle exactly (vulnerabilities/models.py + service.SETTABLE_STATUSES):
+// open | confirmed | false_positive | fixed | accepted_risk, plus the engine-set `reopened`.
+// `remediated` was never a valid backend status -- filtering by it returned nothing, and
+// submitting it was rejected by the API -- so the "mark as remediated" control could not work.
+const STATUSES = ["", "open", "confirmed", "reopened", "false_positive", "fixed", "accepted_risk"];
+// Only statuses an analyst may SET (service.SETTABLE_STATUSES). `reopened` is engine-set on
+// re-detection and is deliberately not offered here.
+const STATUS_CHOICES = ["confirmed", "false_positive", "fixed", "accepted_risk"];
 
 export function VulnerabilitiesTab({ projectId }: { projectId: string }) {
   const { t } = useTranslation();

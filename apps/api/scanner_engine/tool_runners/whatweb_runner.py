@@ -99,6 +99,7 @@ class WhatwebRunner(BaseToolRunner):
                 stdout=result.stdout,
                 stderr=(result.stderr + "\n" + note).strip(),
                 exit_code=-1,
+                timed_out=True,
             )
 
         return RawToolOutput(

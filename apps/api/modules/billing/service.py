@@ -21,6 +21,37 @@ async def _plan_for(db: AsyncSession, workspace_id: uuid.UUID) -> Plan:
     return get_plan(tier)
 
 
+async def _plan_for_update(db: AsyncSession, workspace_id: uuid.UUID) -> Plan:
+    """The workspace's plan, read under a ROW LOCK on that workspace row.
+
+    THE RACE THIS CLOSES (Phase 3). Every quota check was
+        SELECT COUNT(*) -> compare to limit -> caller INSERTs -> COMMIT
+    with nothing serialising the gap. The app runs at READ COMMITTED (see
+    apps/api/core/db.py::_mysql_isolation_level), where a plain SELECT takes NO locks, so N
+    concurrent requests all read the same pre-limit count and all proceed. Measured against
+    real MySQL before this fix: 8 concurrent create_project calls on the FREE plan
+    (max_projects=2) produced 8 rows -- a 4x quota bypass.
+
+    `SELECT ... FOR UPDATE` on the single `workspaces` row makes each tenant's quota check
+    serial: the second concurrent request blocks until the first COMMITs, then re-counts and
+    sees the row the first one inserted. The lock is held until the caller's transaction ends,
+    which is exactly the window that must be protected (check -> insert -> commit).
+
+    WHY THE WORKSPACE ROW. It is the natural per-tenant mutex: every quota in this module is
+    scoped to one workspace, and the row already has to be read to resolve the plan, so this
+    adds no extra round trip. Locking is therefore PER TENANT -- workspace A's quota check
+    never blocks workspace B (no global lock, no cross-tenant lock, no table lock), and
+    lock ordering cannot deadlock because only ever one workspace row is locked per request.
+
+    Fail-open on a missing row is preserved: get_plan(None) returns the unlimited default, so
+    a workspace that vanished mid-request is not retroactively capped.
+    """
+    tier = await db.scalar(
+        select(Workspace.plan_tier).where(Workspace.id == workspace_id).with_for_update()
+    )
+    return get_plan(tier)
+
+
 async def _count_projects(db: AsyncSession, workspace_id: uuid.UUID) -> int:
     return await db.scalar(
         select(func.count()).select_from(Project).where(Project.workspace_id == workspace_id)
@@ -49,7 +80,9 @@ def _over(current: int, limit: int | None) -> bool:
 
 
 async def enforce_project_quota(db: AsyncSession, workspace_id: uuid.UUID) -> None:
-    plan = await _plan_for(db, workspace_id)
+    # _plan_for_update (not _plan_for): takes the per-workspace row lock so this count and the
+    # caller's INSERT cannot interleave with a concurrent request. See _plan_for_update.
+    plan = await _plan_for_update(db, workspace_id)
     if _over(await _count_projects(db, workspace_id), plan.max_projects):
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,
@@ -58,7 +91,7 @@ async def enforce_project_quota(db: AsyncSession, workspace_id: uuid.UUID) -> No
 
 
 async def enforce_target_quota(db: AsyncSession, workspace_id: uuid.UUID) -> None:
-    plan = await _plan_for(db, workspace_id)
+    plan = await _plan_for_update(db, workspace_id)
     if _over(await _count_targets(db, workspace_id), plan.max_targets):
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,
@@ -67,7 +100,7 @@ async def enforce_target_quota(db: AsyncSession, workspace_id: uuid.UUID) -> Non
 
 
 async def enforce_scan_quota(db: AsyncSession, workspace_id: uuid.UUID) -> None:
-    plan = await _plan_for(db, workspace_id)
+    plan = await _plan_for_update(db, workspace_id)
     if _over(await _count_scans_this_month(db, workspace_id), plan.max_scans_per_month):
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,

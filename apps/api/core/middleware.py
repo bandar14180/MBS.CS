@@ -70,6 +70,18 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             record_http_metrics(request.method, path, status, duration)
 
 
+# FastAPI's built-in interactive-docs HTML (Swagger UI at /docs, ReDoc at /redoc -- neither
+# path is overridden in main.py's `FastAPI(...)` call, so these are the real, fixed URLs) is
+# the one part of this app that is actual browser-rendered HTML pulling in external JS/CSS/
+# images and running inline bootstrap scripts. Every other route returns JSON, which never
+# legitimately needs to load or execute anything -- that's exactly what `default-src 'none'`
+# is for, and it must stay the default. Found by actually loading /docs in a browser: the
+# strict CSP silently blocked every asset the Swagger UI page needs, rendering a blank page
+# with no visible error except in the browser console. /openapi.json is untouched by this
+# exception (it's plain JSON, not HTML) and gets the strict policy like any other endpoint.
+_DOCS_UI_PATHS = frozenset({"/docs", "/redoc"})
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Adds standard hardening headers to every response. HSTS is opt-in (only
     when actually served over HTTPS) to avoid poisoning http:// local dev."""
@@ -83,7 +95,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
-        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        if request.url.path not in _DOCS_UI_PATHS:
+            response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
         if self._enable_hsts:
             response.headers.setdefault(
                 "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
@@ -98,9 +111,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     Uses a per-key Redis sorted set of request timestamps: each request drops
     entries older than the window, records itself, and counts what remains. Unlike
     a fixed window this smooths the boundary burst (a fixed window allows up to 2x
-    the limit across an edge). Fail-open -- if Redis is unreachable, requests are
-    allowed (availability over enforcement) and a warning is logged, so a Redis
-    blip never takes the API down."""
+    the limit across an edge).
+
+    OUTAGE BEHAVIOUR IS BUCKET-DEPENDENT (F-07). It used to be fail-open for
+    everything: one `except Exception` around the whole dispatch meant a Redis
+    outage silently removed every limit. For ordinary traffic that trade is right --
+    availability beats enforcement, and a Redis blip must not take the API down.
+    For `/auth/` it is not: the limiter is the ONLY throttle on password and MFA
+    guessing (the per-user MFA lockout in modules/auth/mfa_guard.py is Redis-backed
+    too and also fails open), so an outage removed EVERY brute-force defence at once
+    and turned a cache incident into an open credential-guessing window.
+
+    So the auth bucket now FAILS CLOSED -- 503 with Retry-After while the limiter is
+    unavailable -- and every other bucket keeps failing open. Read/scan/report traffic
+    is unaffected by a Redis blip; only credential endpoints pause, which is the
+    correct direction to fail for an authentication boundary."""
 
     def __init__(self, app, *, redis_url: str, default: str, auth: str, ai: str):
         super().__init__(app)
@@ -167,6 +192,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     status_code=429,
                     headers={"Retry-After": str(window)},
                 )
-        except Exception:  # noqa: BLE001 -- fail open on limiter/redis failure
+        except Exception:  # noqa: BLE001 -- limiter/redis failure
+            # F-07: fail CLOSED for auth, OPEN for everything else. See the class docstring.
+            if bucket == "auth":
+                logger.warning(
+                    "rate limiter unavailable; REFUSING auth request (fail closed)", exc_info=True
+                )
+                from apps.api.core.errors import build_error_envelope
+
+                return JSONResponse(
+                    build_error_envelope(
+                        "Authentication is temporarily unavailable. Try again shortly.",
+                        "service_unavailable",
+                    ),
+                    status_code=503,
+                    headers={"Retry-After": str(window)},
+                )
             logger.warning("rate limiter unavailable; allowing request", exc_info=True)
         return await call_next(request)

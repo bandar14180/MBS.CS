@@ -39,7 +39,7 @@ async def notify_scan_finished(db: AsyncSession, scan) -> None:
     """Emit an in-app notification for a finished scan. Best-effort: never let a
     notification failure affect the scan outcome (caller wraps this).
 
-    Runs inside the worker's session with the workspace RLS GUC already set."""
+    Runs inside the worker's session with the workspace already bound."""
     from apps.api.modules.vulnerabilities.models import Vulnerability
 
     if scan.status == "failed":

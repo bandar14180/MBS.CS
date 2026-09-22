@@ -36,6 +36,11 @@ _CODE_BY_STATUS = {
     409: "conflict",
     422: "validation_error",
     429: "rate_limited",
+    # F-07: the auth rate limiter fails CLOSED when Redis is unavailable and returns 503.
+    # Mapped explicitly so it reads as a dependency outage rather than collapsing into the
+    # generic "internal_error" bucket -- an operator seeing this needs to know it is Redis,
+    # not a code fault. Still low-cardinality, so the metric label set stays bounded.
+    503: "service_unavailable",
 }
 
 

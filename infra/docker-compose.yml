@@ -1,27 +1,100 @@
+# MBS.SC network segmentation.
+#
+# Before this change there were NO `networks:` declarations at all, so every service --
+# including the scanner `worker` that executes untrusted tool binaries against customer
+# targets -- shared Docker's implicit default bridge. A compromised scanner could open a
+# TCP connection straight to mysql:3306, redis:6379, minio:9000, api:8000, prometheus:9090
+# and alertmanager:9093. Application-layer checks were the ONLY boundary; there was no
+# network boundary at all.
+#
+# The planes below are enforced by Docker itself, so a compromised scanner process cannot
+# reach the control plane even if it ignores every line of Python in this repo:
+#
+#   mbs-edge      nginx <-> web/api. The only plane with a published host port.
+#   mbs-core      api/beat/worker-default <-> mysql/redis/minio/ollama. internal: true.
+#   mbs-dispatch  the NARROW manager boundary: scanner-manager <-> scanner workers.
+#                 internal: true. Carries the manager API and nothing else.
+#   mbs-scan-egress
+#                 the scanner execution plane's route OUT to customer targets. NOT
+#                 internal (scanning the public internet is the job) and deliberately
+#                 carries no control-plane service.
+#
+# The scanner `worker` is attached to mbs-dispatch + mbs-scan-egress ONLY. It is on no
+# network that any datastore is on, which is what makes Property A structural.
+# `internal: true` on core/dispatch means no NAT to the outside world for those planes.
+networks:
+  mbs-edge:
+    driver: bridge
+  mbs-core:
+    driver: bridge
+    internal: true
+  mbs-dispatch:
+    driver: bridge
+    internal: true
+  mbs-scan-egress:
+    driver: bridge
+
 services:
-  postgres:
-    image: postgres:16-alpine
+  # Phase 0 MySQL cutover: this used to be the `postgres` service (postgres:16-alpine).
+  # Postgres support has been fully removed -- see docs/architecture for the cutover
+  # decision -- so this is a straight service swap, not an addition alongside it.
+  mysql:
+    # AUDIT-005: pinned by IMMUTABLE DIGEST. A tag is a moving pointer -- the registry can
+    # repoint it at new content at any time, so a tag alone means the stack you deploy is
+    # not provably the stack you tested. Verified real: `redis:7-alpine`, `nginx:alpine`
+    # and `python:3.12-slim` had ALREADY drifted -- the images on this host resolved to
+    # different digests than the same tags resolve to in the registry today.
+    # The tag is kept in the comment for human readability; the digest is what is deployed.
+    # To update: `docker buildx imagetools inspect <image>:<tag>` and replace BOTH.
+    # mysql:8.0
+    image: mysql@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
     restart: unless-stopped
+    # --transaction-isolation=READ-COMMITTED is NOT cosmetic. MySQL/MariaDB default to
+    # REPEATABLE READ; this codebase's atomic-claim / cooperative-shutdown machinery
+    # (apps/api/scanner_engine/orchestrator.py, apps/api/celery_app/shutdown.py) is written
+    # assuming Postgres's default of READ COMMITTED -- a fresh read within an ongoing
+    # transaction sees another connection's already-committed write. Under the MySQL
+    # default that write stays invisible until the reading transaction ends, which silently
+    # breaks scan revocation (verified directly: a stub tool loop kept launching after
+    # revocation with the default isolation level, and stopped correctly with this flag).
+    # apps/api/core/db.py also sets `isolation_level="READ COMMITTED"` on every engine the
+    # app itself creates, as defense in depth -- but any OTHER client that ever connects to
+    # this database (a one-off script, `mysql` CLI session, migration tooling) would
+    # otherwise fall back to the server default, so the server itself is set here too.
+    command: ["--transaction-isolation=READ-COMMITTED", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
     environment:
-      POSTGRES_USER: mbs
-      POSTGRES_PASSWORD: mbs
-      POSTGRES_DB: mbs
-    # B1: NO host publication. The database is reachable in-network as `postgres:5432` by
+      MYSQL_USER: mbs
+      MYSQL_PASSWORD: mbs
+      MYSQL_DATABASE: mbs
+      MYSQL_ROOT_PASSWORD: mbs
+    # B1: NO host publication. The database is reachable in-network as `mysql:3306` by
     # api/worker/worker-default/beat, and migrations run via `compose exec|run api`, so a host
-    # port buys nothing in production while exposing a superuser role to the network. Compose
+    # port buys nothing in production while exposing a root role to the network. Compose
     # APPENDS `ports` across -f files rather than replacing them, so a publication here could
     # not be withdrawn by the production overlay -- dev access lives in
     # docker-compose.override.yml instead.
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mysql_data:/var/lib/mysql
+    # MBS.SC Property A: mbs-core ONLY. The scanner execution plane is not on this
+    # network, so a compromised scanner has no route to 3306 at the IP layer.
+    networks:
+      - mbs-core
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mbs -d mbs"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "mbs", "-pmbs"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    # AUDIT-005: pinned by IMMUTABLE DIGEST. A tag is a moving pointer -- the registry can
+    # repoint it at new content at any time, so a tag alone means the stack you deploy is
+    # not provably the stack you tested. Verified real: `redis:7-alpine`, `nginx:alpine`
+    # and `python:3.12-slim` had ALREADY drifted -- the images on this host resolved to
+    # different digests than the same tags resolve to in the registry today.
+    # The tag is kept in the comment for human readability; the digest is what is deployed.
+    # To update: `docker buildx imagetools inspect <image>:<tag>` and replace BOTH.
+    # redis:7-alpine
+    image: redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     restart: unless-stopped
     # R1a: durability. Redis backs the Celery broker + scan DLQ + rate-limit / AI-budget /
     # MFA-lockout counters + reliability freshness timestamps -- all of which were previously
@@ -31,12 +104,16 @@ services:
     # never evicted. Additive + reversible; no consumer behavior changes (all are idempotent /
     # fail-open, and task replay is safe via the atomic scan claim + orphan reaper).
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
-    # B1: NO host publication -- see the postgres note. Redis backs the Celery broker, the DLQ
+    # B1: NO host publication -- see the mysql note. Redis backs the Celery broker, the DLQ
     # and the rate-limit / AI-budget / MFA-lockout counters; an exposed, unauthenticated
     # instance allows task injection and tampering with those controls. In-network `redis:6379`
     # serves every consumer; dev access lives in docker-compose.override.yml.
     volumes:
       - redis_data:/data
+    # MBS.SC Property A: mbs-core ONLY. Scanner workers no longer speak to the broker
+    # directly -- they receive work through the scanner-manager on mbs-dispatch.
+    networks:
+      - mbs-core
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -44,33 +121,131 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    # AUDIT-005: pinned by IMMUTABLE DIGEST. A tag is a moving pointer -- the registry can
+    # repoint it at new content at any time, so a tag alone means the stack you deploy is
+    # not provably the stack you tested. Verified real: `redis:7-alpine`, `nginx:alpine`
+    # and `python:3.12-slim` had ALREADY drifted -- the images on this host resolved to
+    # different digests than the same tags resolve to in the registry today.
+    # The tag is kept in the comment for human readability; the digest is what is deployed.
+    # To update: `docker buildx imagetools inspect <image>:<tag>` and replace BOTH.
+    # minio/minio:RELEASE.2025-09-07T16-13-09Z (was the MUTABLE tag `latest`)
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    # B1: NO host publication -- see the postgres note. The buckets hold scan evidence and
+    # B1: NO host publication -- see the mysql note. The buckets hold scan evidence and
     # generated reports; the API streams both to the browser itself (reports/router.py) and the
     # storage provider issues no presigned URLs, so nothing outside the compose network ever
     # needs to reach MinIO. Dev access (incl. the :9001 console) lives in the dev override.
     volumes:
       - minio_data:/data
+    # MBS.SC Property A: mbs-core ONLY. Evidence is written by the manager (Phase 6),
+    # never by the execution worker, so the worker needs no route to object storage.
+    networks:
+      - mbs-core
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  # Self-hosted AI (apps/api/ai_agent/providers/local.py): an OpenAI-compatible endpoint the
+  # AI layer can use with AI_PROVIDER=local -- NO external API key, no egress, scan data never
+  # leaves this machine. In-network only as `ollama:11434` (B1 pattern); dev host access lives
+  # in docker-compose.override.yml.
+  ollama:
+    # AUDIT-005: pinned by IMMUTABLE DIGEST. A tag is a moving pointer -- the registry can
+    # repoint it at new content at any time, so a tag alone means the stack you deploy is
+    # not provably the stack you tested. Verified real: `redis:7-alpine`, `nginx:alpine`
+    # and `python:3.12-slim` had ALREADY drifted -- the images on this host resolved to
+    # different digests than the same tags resolve to in the registry today.
+    # The tag is kept in the comment for human readability; the digest is what is deployed.
+    # To update: `docker buildx imagetools inspect <image>:<tag>` and replace BOTH.
+    # ollama/ollama:0.33.1 (was the MUTABLE tag `latest`)
+    image: ollama/ollama@sha256:32931b46719f673c05fdbaa81ccb26da18ea4a1c57590a754874ab28ba269eb2
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - mbs-core
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: pulls the configured model into the `ollama_data` volume, then exits. Re-running
+  # `docker compose up` is a cheap no-op once the model is already present (`ollama pull` skips
+  # layers it already has). OLLAMA_MODEL defaults here to match core/config.py's Settings default;
+  # override both together if you want a different model.
+  ollama-init:
+    # AUDIT-005: pinned by IMMUTABLE DIGEST. A tag is a moving pointer -- the registry can
+    # repoint it at new content at any time, so a tag alone means the stack you deploy is
+    # not provably the stack you tested. Verified real: `redis:7-alpine`, `nginx:alpine`
+    # and `python:3.12-slim` had ALREADY drifted -- the images on this host resolved to
+    # different digests than the same tags resolve to in the registry today.
+    # The tag is kept in the comment for human readability; the digest is what is deployed.
+    # To update: `docker buildx imagetools inspect <image>:<tag>` and replace BOTH.
+    # ollama/ollama:0.33.1 (was the MUTABLE tag `latest`)
+    image: ollama/ollama@sha256:32931b46719f673c05fdbaa81ccb26da18ea4a1c57590a754874ab28ba269eb2
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+    networks:
+      - mbs-core
+    entrypoint: ["sh", "-c", "ollama pull \"$$OLLAMA_MODEL\""]
+
   api:
     build:
       context: ..
       dockerfile: infra/docker/Dockerfile.api
     restart: unless-stopped
+    # Docker's embedded DNS proxy (127.0.0.11) stays the container's nameserver either way
+    # (needed to resolve other compose service names like `mysql`/`redis`) -- but WITHOUT this,
+    # its upstream for anything it doesn't know is whatever the HOST's resolver is, reached via
+    # Docker Desktop VM -> WSL2 -> Windows host. That forwarding hop is a documented source of
+    # intermittent external-resolution failures on Docker Desktop for Windows (observed
+    # directly: scanner_engine.net_guard's resolve_hostname failing for a genuinely-live public
+    # host, then succeeding moments later with no code change). This repoints the embedded
+    # proxy's upstream at public resolvers directly, skipping that flaky hop; internal service
+    # names are unaffected -- those never leave the embedded proxy.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     env_file:
       - ../.env
+    # STACK-MODE SENTINEL -- the guard against running the API from a STALE IMAGE.
+    #
+    # This service's application code is BAKED INTO THE IMAGE. That is correct for
+    # production, and wrong for development, where the code must come from the host tree via
+    # the bind mount in docker-compose.override.yml. Compose auto-merges that override ONLY
+    # for a bare `docker compose up` with NO `-f` flag; the moment any `-f` appears the list
+    # is exact, and `-f infra/docker-compose.yml` alone silently drops the mount. The
+    # container then boots happily and serves whatever code was baked in whenever the image
+    # was last built -- no error, no warning, just quietly stale behaviour. Observed for
+    # real: an API container serving a months-old reports renderer while the host tree had
+    # moved on, discovered only from the CONTENT of a generated report.
+    #
+    # `unconfigured` is the sentinel. BOTH real invocations replace it:
+    #   docker-compose.override.yml -> development   (bare `up`, or an -f list naming it)
+    #   docker-compose.prod.yml     -> production    (the production -f list)
+    # so the value can only survive when the -f list is INCOMPLETE. apps/api/main.py refuses
+    # to start on the sentinel (core/stack_mode.py), turning a silent stale-code failure into
+    # a loud one at boot, with the correct command in the message.
+    #
+    # Why an environment sentinel and not `${VAR:?}` interpolation: compose interpolates
+    # BEFORE merging the -f files, so a required-variable marker here fails even for a
+    # correct invocation. Verified directly against this Compose version.
+    environment:
+      MBS_STACK_MODE: unconfigured
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -92,6 +267,72 @@ services:
     # image (prod) and bind-mounted only in the dev override.
     volumes:
       - ../db:/srv/db
+    # Edge (nginx/web reach the API) + core (mysql/redis/minio/ollama). Deliberately NOT
+    # on mbs-dispatch: the execution plane must not be able to reach the API at all.
+    networks:
+      - mbs-edge
+      - mbs-core
+
+  # MBS.SC Property G -- THE CONTROL-PLANE BOUNDARY.
+  #
+  # The scanner execution plane no longer reads MySQL / Redis / MinIO. It asks this service,
+  # which sits on BOTH mbs-core (so it can persist) and mbs-dispatch (so workers can reach
+  # it), and which authorizes every single request against the worker's authenticated
+  # identity before touching anything.
+  #
+  # This is deliberately NOT a generic proxy to the control plane. It exposes a fixed, small
+  # set of operations (register / heartbeat / lease / submit result / submit evidence), and
+  # each one re-derives worker -> pool -> site -> workspace -> scan authorization server-side
+  # from persisted state. A worker cannot name a workspace, a scan or a site it was not
+  # issued; it can only present its own credential and be told what it may have.
+  scanner-manager:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.api
+    restart: unless-stopped
+    command: ["uvicorn", "apps.api.scanner_manager.app:app", "--host", "0.0.0.0", "--port", "8100"]
+    env_file:
+      - ../.env
+    # MBS.SC P8-D -- the runtime emergency kill switch.
+    #
+    # A read-only DIRECTORY in which an operator creates or removes
+    # `EMERGENCY_DISABLE_PRIVATE_SCANNING` to stop all private scanning platform-wide within
+    # ~5s, with NO manager restart. It replaces nothing: the environment setting still works
+    # and the effective value is the OR of the two, so the sentinel can only ever ADD
+    # restriction (see apps/api/core/runtime_flags.py).
+    #
+    # A DIRECTORY, not the file: a single-file bind mount is pinned to an inode, so an atomic
+    # replace (`mv`) would leave the container reading the old file forever. Verified against
+    # Docker before this was chosen.
+    #
+    # `:ro` so the manager can never write its own kill switch. NO WORKER MOUNTS THIS -- no
+    # worker, public or private, has any host bind mount at all, which is what keeps the
+    # switch operator-controlled and unreachable from the execution plane.
+    volumes:
+      - ./runtime:/run/mbs:ro
+    # Bridges the two planes -- the ONLY service that does. It is not on mbs-edge: the
+    # manager is an internal boundary and is never published to the internet.
+    networks:
+      - mbs-core
+      - mbs-dispatch
+    stop_grace_period: 30s
+    # The manager inherits Dockerfile.api's HEALTHCHECK, which probes the API on :8000 --
+    # but this service listens on :8100, so that probe can only ever fail (observed: a
+    # perfectly healthy manager reported `unhealthy` while serving every request). Override
+    # it with the manager's own unauthenticated liveness endpoint. `/health` is deliberately
+    # open and discloses nothing about workers, tenants or scans.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   # DEDICATED SCAN worker (F1): consumes ONLY the heavy `scans` queue (routed via task_routes),
   # so long-running scans can never starve the control-plane tasks -- those run on
@@ -101,9 +342,34 @@ services:
       context: ..
       dockerfile: infra/docker/Dockerfile.worker
     restart: unless-stopped
-    command: ["celery", "-A", "apps.api.celery_app.worker.celery_app", "worker", "-Q", "scans", "--loglevel=info"]
+    # See the `api` service's `dns:` comment -- repoints Docker's embedded resolver's upstream
+    # at public DNS instead of the flaky Docker Desktop VM -> WSL2 -> host forwarding hop. This
+    # is the service that actually runs the scanner tool binaries and resolves scan targets, so
+    # it matters most here.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    # MBS.SC -- the LEASE LOOP, not `celery worker`.
+    #
+    # A Celery worker MUST reach Redis to consume tasks, and Redis is deliberately
+    # unreachable from this plane (see the networks below). So the execution worker pulls
+    # authorized work from the scanner-manager over mbs-dispatch instead. The manager
+    # claims each scan atomically through the SAME conditional UPDATE that has always
+    # fenced Celery redelivery, so the two dispatch models share one fencing mechanism.
+    #
+    # Celery is NOT removed from the platform -- it still runs the control plane
+    # (`worker-default`, `beat`): scheduling, orphan recovery, DLQ, retention, backups.
+    command: ["python", "-m", "apps.api.scanner_worker.main"]
+    # MBS.SC Property B (credential minimization). This service used to load `env_file:
+    # ../.env` -- the SAME flat file the API gets -- handing the process that executes
+    # untrusted scanner binaries the DB DSN, the Redis URL, the MinIO root credentials,
+    # the JWT signing secret and the OpenRouter key. A compose overlay CANNOT unset an
+    # env_file-sourced variable, so the only way to withhold them is to never load that
+    # file here. It now loads a SEPARATE, deliberately minimal scanner env file.
+    #
+    # Anything the scanner genuinely needs arrives through the manager boundary.
     env_file:
-      - ../.env
+      - ../.env.scanner
     # W1: aggregate prefork-child metrics. Celery's prefork pool runs tasks in child processes;
     # without this each child has an isolated registry and the :9100 endpoint (MainProcess) never
     # sees their counters. PROMETHEUS_MULTIPROC_DIR makes prometheus_client write per-process files
@@ -124,11 +390,17 @@ services:
     # Celery soft/hard time limits and, in the worst case (worker SIGKILLed), recovered by
     # the orphan reaper. Raise if your typical scan needs longer to drain on deploy.
     stop_grace_period: 120s
+    # MBS.SC Property A. mbs-dispatch (reach the scanner-manager, and NOTHING else on it)
+    # + mbs-scan-egress (reach customer targets). NOT on mbs-core, so mysql/redis/minio/
+    # ollama are unreachable at the IP layer, and NOT on mbs-edge, so the API is too.
+    # This is the structural half of "a compromised scanner cannot reach the control plane";
+    # the manager's per-request authorization is the application half.
+    networks:
+      - mbs-dispatch
+      - mbs-scan-egress
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      scanner-manager:
+        condition: service_started
 
   # DEDICATED DEFAULT worker (F1): consumes ONLY the `default` queue -- schedules.enqueue_due,
   # scans.reap_orphans, backup.run, retention.purge. Isolated from scan load so the orphan reaper
@@ -158,8 +430,13 @@ services:
         target: /run/prometheus-multiproc
         tmpfs:
           mode: 01777
+    # CONTROL-PLANE worker (reaper/scheduler/backup/retention). It runs no scanner tool
+    # binary against a customer target, so it legitimately stays on mbs-core with full
+    # credentials. Only the `scans` execution worker is moved off the core plane.
+    networks:
+      - mbs-core
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -177,35 +454,64 @@ services:
     # Beat is a stateless emitter (PID 1, exec form); SIGTERM stops it cleanly and any
     # missed tick is re-emitted next interval. A short grace is plenty (Phase 1.5).
     stop_grace_period: 30s
+    networks:
+      - mbs-core
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
 
   web:
+    # Builds Dockerfile.web's FINAL (`runtime`) stage: the built Next.js app plus production
+    # dependencies only, served by `next start` as a non-root user. Nothing here is dev-only.
+    #
+    # THE HOT-RELOAD DEV SETUP LIVES IN docker-compose.override.yml, NOT HERE. It used to be in
+    # this file, and because the production merge (`-f docker-compose.yml -f
+    # docker-compose.prod.yml`) includes this file but NOT the override, production silently
+    # inherited it: the container ran `npm run dev` with the host source bind-mounted over /srv.
+    # Keeping dev-only settings in the auto-merged override file makes that class of leak
+    # structurally impossible -- production cannot inherit what the shared file never declares.
     build:
       context: ..
       dockerfile: infra/docker/Dockerfile.web
     restart: unless-stopped
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      # F-08: EMPTY = the browser calls the API SAME-ORIGIN through nginx (/api/v1/... ->
+      # api:8000). Same-origin is what makes the refresh cookie's SameSite=strict workable and
+      # is itself the CSRF control for the cookie-authenticated /auth routes. Pointing this back
+      # at a cross-origin http://localhost:8000 would silently stop the cookie being sent.
+      NEXT_PUBLIC_API_URL: ""
       API_INTERNAL_URL: http://api:8000
+    networks:
+      - mbs-edge
     depends_on:
       - api
-    # B1: NO host publication -- see the postgres note. nginx proxies `/` to `web:3000`
+    # B1: NO host publication -- see the mysql note. nginx proxies `/` to `web:3000`
     # in-network, so the app is served through the single public entrypoint. Publishing 3000
-    # bypasses nginx entirely and, since the image runs `next dev`, exposes a development
-    # server. Dev access lives in docker-compose.override.yml.
-    volumes:
-      - ../apps/web:/srv
-      - web_node_modules:/srv/node_modules
+    # bypasses nginx entirely. Dev access (and the dev server itself) lives in
+    # docker-compose.override.yml.
 
   nginx:
-    image: nginx:alpine
+    # AUDIT-005: pinned by IMMUTABLE DIGEST. A tag is a moving pointer -- the registry can
+    # repoint it at new content at any time, so a tag alone means the stack you deploy is
+    # not provably the stack you tested. Verified real: `redis:7-alpine`, `nginx:alpine`
+    # and `python:3.12-slim` had ALREADY drifted -- the images on this host resolved to
+    # different digests than the same tags resolve to in the registry today.
+    # The tag is kept in the comment for human readability; the digest is what is deployed.
+    # To update: `docker buildx imagetools inspect <image>:<tag>` and replace BOTH.
+    # nginx:alpine
+    image: nginx@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3
     restart: unless-stopped
     volumes:
+      # DEV = plaintext :80. Production REPLACES this first mount with nginx.tls.conf via
+      # docker-compose.prod.yml (same container path, different source) and terminates TLS
+      # on :443 -- see F-01. The snippets directory carries the shared routing rules that
+      # both configs `include`, so the dev and production edges cannot drift apart.
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+    networks:
+      - mbs-edge
     depends_on:
       - api
       - web
@@ -213,10 +519,15 @@ services:
       - "80:80"
 
 volumes:
-  postgres_data:
+  mysql_data:
   minio_data:
   web_node_modules:
+  # FE-6: Next.js build output (`.next`), kept off the host bind-mount -- see the web service.
+  web_next:
   # DR-1: durable storage for backup sets so they persist across worker-default recreation.
   backup_data:
   # R1a: durable Redis AOF storage so the broker/DLQ + operational counters survive a restart.
   redis_data:
+  # Downloaded model weights -- survives container recreation so `ollama-init` doesn't
+  # re-download multiple GB on every restart.
+  ollama_data:

@@ -16,7 +16,11 @@ hand-built ASGI scope is the honest unit under test.
 """
 import uuid
 
+from starlette.applications import Starlette
 from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
 
 from apps.api.core.config import get_settings
 from apps.api.core.middleware import RateLimitMiddleware, _client_ip
@@ -163,3 +167,79 @@ def test_a_non_access_token_is_not_accepted_as_a_principal(monkeypatch):
     challenge = create_mfa_challenge_token(uuid.uuid4())
     assert RateLimitMiddleware._principal(
         _request({"authorization": f"Bearer {challenge}"})) == f"ip:{PEER}"
+
+
+# --- F-07: outage behaviour is bucket-dependent -------------------------------------------
+# The limiter used to wrap its whole dispatch in one `except Exception` and allow the request,
+# so a Redis outage silently removed EVERY limit. For `/auth/` that is the wrong direction to
+# fail: the limiter is the only throttle on password/MFA guessing (the per-user MFA lockout in
+# modules/auth/mfa_guard.py is Redis-backed too and also fails open), so a cache incident
+# became an open credential-guessing window. Auth now fails CLOSED (503); everything else
+# keeps failing open so a Redis blip never takes the API down.
+
+class _DeadRedis:
+    """A Redis client whose every pipeline attempt fails, exactly as an outage presents."""
+
+    def pipeline(self, *args, **kwargs):
+        raise ConnectionError("redis down")
+
+
+def _client_with_dead_redis(monkeypatch) -> TestClient:
+    async def _dead(self):
+        return _DeadRedis()
+
+    monkeypatch.setattr(RateLimitMiddleware, "_get_redis", _dead)
+
+    async def ok(request):
+        return PlainTextResponse("ok")
+
+    app = Starlette(routes=[
+        Route("/api/v1/auth/login", ok, methods=["POST"]),
+        Route("/api/v1/assistant/ask", ok, methods=["POST"]),
+        Route("/api/v1/projects", ok, methods=["GET"]),
+    ])
+    app.add_middleware(
+        RateLimitMiddleware,
+        redis_url="redis://127.0.0.1:6379/0",
+        default="100/minute", auth="3/minute", ai="30/minute",
+    )
+    return TestClient(app)
+
+
+def test_f07_auth_fails_closed_when_the_limiter_is_unavailable(monkeypatch):
+    """THE F-07 PROPERTY. Before the fix every one of these returned 200 with no limit."""
+    client = _client_with_dead_redis(monkeypatch)
+    codes = [client.post("/api/v1/auth/login").status_code for _ in range(6)]
+    assert codes == [503] * 6, (
+        "auth must fail CLOSED during a limiter outage -- allowing these leaves password and "
+        "MFA guessing entirely unthrottled"
+    )
+
+
+def test_f07_non_auth_traffic_still_fails_open(monkeypatch):
+    """Availability still wins everywhere else: a Redis blip must not take the API down."""
+    client = _client_with_dead_redis(monkeypatch)
+    assert [client.get("/api/v1/projects").status_code for _ in range(6)] == [200] * 6
+    assert [client.post("/api/v1/assistant/ask").status_code for _ in range(3)] == [200] * 3
+
+
+def test_f07_outage_response_uses_the_standard_envelope_and_retry_after(monkeypatch):
+    """The 503 must be actionable and shaped like every other error in the contract."""
+    client = _client_with_dead_redis(monkeypatch)
+    resp = client.post("/api/v1/auth/login")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"] == "service_unavailable"
+    assert set(body) == {"detail", "error", "correlation_id"}
+    assert resp.headers.get("Retry-After"), "a 503 must tell the client when to retry"
+
+
+def test_f07_auth_bucket_detection_covers_the_real_auth_paths(monkeypatch):
+    """The fail-closed branch keys off the bucket, so bucket detection is security-relevant."""
+    mw = RateLimitMiddleware(
+        app=None, redis_url="redis://x", default="1/minute", auth="2/minute", ai="3/minute"
+    )
+    for path in ("/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/mfa/verify"):
+        assert mw._limit_for(path)[0] == "auth", f"{path} must land in the auth bucket"
+    assert mw._limit_for("/api/v1/projects")[0] == "default"
+    assert mw._limit_for("/api/v1/assistant/ask")[0] == "ai"

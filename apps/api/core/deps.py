@@ -5,9 +5,10 @@ from typing import Annotated
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core import tenancy
 from apps.api.core.config import Settings, get_settings
 from apps.api.core.db import get_db
 from apps.api.core.security import decode_access_token
@@ -79,6 +80,24 @@ async def get_workspace_context(
     if key_ws is not None and key_ws != workspace_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "API key is not valid for this workspace")
 
+    # Phase 0 MySQL cutover: bind the workspace-isolation context (apps/api/core/tenancy.py)
+    # BEFORE the membership lookup below, not after. Under the old Postgres RLS flow, the
+    # equivalent `set_config` call ran AFTER the membership SELECT, which worked there only
+    # because the pre-check below re-filters explicitly by workspace_id/user_id regardless.
+    # Binding first here is deliberate and safe even though `workspace_id` isn't verified
+    # yet: the membership query is still explicitly scoped to it either way, so an
+    # unauthorized caller gets exactly the same 403 -- nothing is read or returned before
+    # that check. This ordering also means the tenancy filter is provably active (not
+    # merely redundant with the app-layer check) for the membership query itself.
+    # AUDIT-004 classification: INTENTIONALLY PERSISTENT, and it must stay that way.
+    # This is a FastAPI request dependency: the binding has to outlive this function and
+    # cover the whole request (router, service, and the response serialisation that may
+    # lazy-load). A `with` scope here would unbind before the endpoint body ever runs.
+    # Safety comes from the boundary, not the scope: each request is served in its own
+    # asyncio Task with its own contextvars Context, so this binding cannot outlive the
+    # request or be observed by a concurrent one (see tenancy.py's module docstring).
+    tenancy.bind_workspace(workspace_id)
+
     member = await db.scalar(
         select(WorkspaceMember).where(
             WorkspaceMember.workspace_id == workspace_id,
@@ -88,11 +107,16 @@ async def get_workspace_context(
     if member is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this workspace")
 
-    # Defense-in-depth: scope the DB session to this workspace for any Postgres
-    # row-level security policies, in addition to the app-layer check above.
-    await db.execute(
-        text("SELECT set_config('app.current_workspace_id', :wid, true)"), {"wid": str(workspace_id)}
-    )
+    # Deletion gate: once a workspace is `deleting`, block every new MUTATING operation so
+    # nothing can be created into (or re-dispatched within) a half-torn-down tenant. Reads
+    # (GET/HEAD/OPTIONS) still work so an operator can observe the teardown; the DELETE
+    # endpoint itself is idempotent and re-entrant (it short-circuits when already deleting).
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        from apps.api.modules.workspaces.models import Workspace
+
+        ws = await db.get(Workspace, workspace_id)
+        if ws is not None and ws.status == "deleting" and request.method != "DELETE":
+            raise HTTPException(status.HTTP_409_CONFLICT, "Workspace is being deleted")
 
     perm_keys = await db.scalars(
         select(Permission.key)

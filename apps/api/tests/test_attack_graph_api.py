@@ -6,10 +6,10 @@ to avoid running a live scan; the API must return that ACTUAL persisted graph.""
 import asyncio
 import uuid
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.agent.models import EngagementState
 # Reuse the established API helpers from the scans tests (no_celery_dispatch is a conftest fixture).
@@ -39,9 +39,7 @@ async def _seed_engagement(ws_id: str, scan_id: str, graph: dict) -> None:
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with maker() as s:
-            await s.execute(
-                text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": ws_id}
-            )
+            tenancy.bind_workspace(ws_id)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             s.add(EngagementState(
                 workspace_id=uuid.UUID(ws_id), scan_id=uuid.UUID(scan_id),
                 status="completed", current_phase="reconnaissance",
@@ -133,7 +131,7 @@ def test_report_aggregates_attack_graph(client, no_celery_dispatch):
         maker = async_sessionmaker(engine, expire_on_commit=False)
         try:
             async with maker() as s:
-                await s.execute(text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": ws})
+                tenancy.bind_workspace(ws)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
                 return await gather_report_data(s, _uuid.UUID(proj))
         finally:
             await engine.dispose()

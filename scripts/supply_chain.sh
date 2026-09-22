@@ -39,11 +39,24 @@ _sbom() {
   cyclonedx-py requirements "$REQ" -o "$ROOT/sbom.cdx.json" || rc=1
 }
 
+# F-03: BOTH shipped images are scanned, with the SAME policy CI uses (CRITICAL + fixed only
+# + .trivyignore). Before this, only the api image was scanned here -- so the local gate was
+# strictly weaker than CI on the image that actually matters: the worker runs the scanner
+# binaries and is what `worker`, `worker-default` and `beat` execute in production.
+#
+# PREREQUISITE: the worker image build is large (~2.35GB, downloads eight tool archives and the
+# nuclei template set), so this step takes several minutes on a cold cache. It builds the image
+# itself -- no pre-built image is assumed -- and a build failure fails the gate rather than
+# skipping the scan.
 _image() {
   if ! _have docker || ! _have trivy; then echo "[skip] image scan needs docker + trivy"; return 0; fi
   echo "[image] building + scanning api image (CRITICAL, fixed only)"
   docker build -f "$ROOT/infra/docker/Dockerfile.api" -t mbs-api:local "$ROOT" || { rc=1; return; }
   trivy image --severity CRITICAL --ignore-unfixed --ignorefile "$ROOT/.trivyignore" --exit-code 1 mbs-api:local || rc=1
+
+  echo "[image] building + scanning worker image (CRITICAL, fixed only)"
+  docker build -f "$ROOT/infra/docker/Dockerfile.worker" -t mbs-worker:local "$ROOT" || { rc=1; return; }
+  trivy image --severity CRITICAL --ignore-unfixed --ignorefile "$ROOT/.trivyignore" --exit-code 1 mbs-worker:local || rc=1
 }
 
 _secrets() {

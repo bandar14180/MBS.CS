@@ -50,25 +50,21 @@ def test_httpx_run_feeds_original_hostname_not_resolved_ip(monkeypatch) -> None:
     # a real production domain came back as a 308 redirect to https://vercel.com/, not an
     # error, so nothing about the run looked broken.
     import apps.api.scanner_engine.tool_runners.httpx_runner as httpx_runner_module
+    from apps.api.tests.test_tool_timeouts import _FakeProc
 
     monkeypatch.setattr(httpx_runner_module, "resolve_scan_host", lambda h: "203.0.113.9")
 
-    captured = {}
-
-    class _FakeProc:
-        returncode = 0
-
-        async def communicate(self, input=None):
-            captured["stdin"] = input.decode()
-            return b"", b""
+    proc_holder = {}
 
     async def _fake_exec(*args, **kwargs):
-        return _FakeProc()
+        proc = _FakeProc([])
+        proc_holder["proc"] = proc
+        return proc
 
     monkeypatch.setattr(httpx_runner_module.asyncio, "create_subprocess_exec", _fake_exec)
 
     raw = asyncio.run(HttpxRunner().run("www.example.com", {}, []))
-    assert captured["stdin"] == "www.example.com"
+    assert proc_holder["proc"].stdin.written == b"www.example.com"
     assert raw.exit_code == 0
 
 
@@ -190,17 +186,13 @@ def _amass_command(config: dict | None = None) -> list[str]:
 
     from apps.api.scanner_engine.tool_runners.amass_runner import AmassRunner
 
+    from apps.api.tests.test_tool_timeouts import _FakeProc
+
     captured: list[str] = []
-
-    class _Proc:
-        returncode = 0
-
-        async def communicate(self):
-            return b"", b""
 
     async def _fake_exec(*argv, **_kwargs):
         captured.extend(argv)
-        return _Proc()
+        return _FakeProc([])
 
     runner = AmassRunner()
     original = _asyncio.create_subprocess_exec

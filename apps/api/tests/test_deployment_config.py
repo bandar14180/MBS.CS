@@ -20,7 +20,7 @@ The invariants covered here grew with the deployment findings that followed:
   2. TOPOLOGY -- a non-zero hop count is only meaningful if clients cannot bypass the proxy.
      No file in the production merge may publish the API on a routable interface, or the
      trusted X-Forwarded-For entries become caller-supplied.
-  3. SECURITY BOUNDARY (B1) -- nginx:80 is the ONLY routable publication; postgres, redis,
+  3. SECURITY BOUNDARY (B1) -- nginx:80 is the ONLY routable publication; mysql, redis,
      minio and web must not be on the host at all, and dev keeps its access via the override.
   4. REDIS AUTH (B3) -- production Redis requires a password from a Docker Secret, its
      healthcheck authenticates, and every consumer reads the same authenticated URL.
@@ -59,7 +59,7 @@ DEV_OVERRIDE = REPO_ROOT / "infra" / "docker-compose.override.yml"
 _RUNTIME_SECRETS = {
     "JWT_SECRET_KEY": "z" * 48,
     "MFA_ENCRYPTION_KEY": "a-real-mfa-encryption-key",
-    "DATABASE_URL": "postgresql+asyncpg://mbsapp:a-real-strong-password@postgres:5432/mbs",
+    "DATABASE_URL": "mysql+aiomysql://mbsapp:a-real-strong-password@mysql:3306/mbs",
     "S3_ACCESS_KEY": "a-real-access-key",
     "S3_SECRET_KEY": "a-real-secret-key",
 }
@@ -83,7 +83,7 @@ def _svc_env(service: dict) -> dict:
     A `None` value is preserved rather than coerced: in compose a key with no value means
     "inherit from the host shell", so when the host does not define it the variable ends up
     UNSET in the container. That is how the production overlay removes a base-file literal
-    such as `POSTGRES_PASSWORD: mbs`, and `_prod_env()` relies on seeing the None."""
+    such as `MYSQL_ROOT_PASSWORD: mbs`, and `_prod_env()` relies on seeing the None."""
     env = service.get("environment", {})
     if isinstance(env, list):
         return dict(e.split("=", 1) for e in env if "=" in e)
@@ -246,7 +246,7 @@ def test_dev_override_keeps_the_api_reachable_locally():
 # nothing. Loopback bindings are permitted for host-local operations.
 _PUBLIC_SERVICES = {"nginx"}
 _BOUNDARY_SERVICES = (
-    "nginx", "api", "postgres", "redis", "minio", "web", "prometheus", "alertmanager",
+    "nginx", "api", "mysql", "redis", "minio", "web", "prometheus", "alertmanager",
 )
 
 
@@ -258,8 +258,8 @@ def _is_loopback(port) -> bool:
 def test_production_publishes_only_nginx_on_a_routable_interface():
     """THE SECURITY BOUNDARY. Everything behind nginx must be unreachable from off-host.
 
-    Before this was enforced the production merge published postgres 5432, redis 6379, minio
-    9000/9001 and web 3000 on 0.0.0.0 -- a superuser database, an unauthenticated broker, an
+    Before this was enforced the production merge published mysql 3306, redis 6379, minio
+    9000/9001 and web 3000 on 0.0.0.0 -- a root-accessible database, an unauthenticated broker, an
     object store holding scan evidence and reports, and a Next.js dev server, all directly
     addressable. None of them needs a host port: the API and workers reach them over the
     compose network, and nginx proxies the browser."""
@@ -281,7 +281,7 @@ def test_datastores_publish_no_host_port_at_all_in_production():
     """Stronger than the boundary above for the four that have no operational reason to be on
     the host: they must be absent entirely, not merely loopback-bound."""
     _require_compose(BASE_COMPOSE, PROD_COMPOSE)
-    for service in ("postgres", "redis", "minio", "web"):
+    for service in ("mysql", "redis", "minio", "web"):
         assert not _port_publications(service), \
             f"{service} must publish no host port in the production merge"
 
@@ -299,7 +299,7 @@ def test_dev_override_restores_local_access_to_every_service():
     _require_compose(DEV_OVERRIDE)
     services = _compose(DEV_OVERRIDE)["services"]
     for service, expected in (
-        ("postgres", "5432"), ("redis", "6379"), ("minio", "9000"), ("web", "3000"),
+        ("mysql", "3306"), ("redis", "6379"), ("minio", "9000"), ("web", "3000"),
     ):
         ports = [str(p) for p in (services.get(service) or {}).get("ports", []) or []]
         assert any(expected in p for p in ports), \
@@ -308,7 +308,14 @@ def test_dev_override_restores_local_access_to_every_service():
 
 # --- 4. Redis authentication (B3) -------------------------------------------------------
 
-_APP_SERVICES = ("api", "worker", "worker-default", "beat")
+# MBS.SC: services that legitimately hold CONTROL-PLANE credentials. The scanner `worker`
+# was deliberately REMOVED from this list -- it is the execution plane, it no longer loads
+# `../.env`, and it reaches the control plane only through the scanner-manager. Withholding
+# those credentials is the point of the change, so asserting it must still have them would
+# assert the vulnerability. `scanner-manager` takes its place: it is the component that now
+# performs validated persistence on the worker's behalf. The scanner worker's own (negative)
+# expectations are asserted in test_scanner_credential_isolation.py.
+_APP_SERVICES = ("api", "scanner-manager", "worker-default", "beat")
 
 
 def _prod_service(name: str) -> dict:
@@ -409,15 +416,19 @@ def test_production_redis_preserves_the_image_privilege_drop():
 _DEFAULT_CREDENTIALS = ("minioadmin", "mbs:mbs@")
 
 
-def test_production_postgres_uses_a_secret_not_the_default_password():
-    """The base file hardcodes POSTGRES_PASSWORD: mbs as a literal, so it cannot be overridden
-    from .env. Production must unset it and read the password from a Docker Secret."""
+def test_production_mysql_uses_a_secret_not_the_default_password():
+    """The base file hardcodes MYSQL_ROOT_PASSWORD/MYSQL_PASSWORD: mbs as literals, so neither
+    can be overridden from .env. Production must unset both and read them from Docker Secrets
+    (Phase 0 MySQL cutover: was POSTGRES_PASSWORD)."""
     _require_compose(BASE_COMPOSE, PROD_COMPOSE)
-    env = _prod_env("postgres")
-    assert "POSTGRES_PASSWORD" not in env, \
-        "the default POSTGRES_PASSWORD literal must be unset in production"
-    assert env.get("POSTGRES_PASSWORD_FILE") == "/run/secrets/postgres_password"
-    assert "postgres_password" in _prod_service("postgres")["secrets"]
+    env = _prod_env("mysql")
+    for key, secret_env_key, secret_name in (
+        ("MYSQL_ROOT_PASSWORD", "MYSQL_ROOT_PASSWORD_FILE", "mysql_root_password"),
+        ("MYSQL_PASSWORD", "MYSQL_PASSWORD_FILE", "mysql_password"),
+    ):
+        assert key not in env, f"the default {key} literal must be unset in production"
+        assert env.get(secret_env_key) == f"/run/secrets/{secret_name}"
+        assert secret_name in _prod_service("mysql")["secrets"]
 
 
 def test_production_minio_uses_secrets_not_minioadmin():
@@ -447,7 +458,10 @@ def test_application_services_take_db_and_storage_credentials_from_secrets():
     real credentials win (see the precedence tests below). Every service that touches the
     database or object storage must declare them."""
     _require_compose(PROD_COMPOSE)
-    for service in ("api", "worker", "worker-default"):
+    # MBS.SC: `worker` is intentionally absent -- the scanner execution plane holds NO
+    # database or object-storage credential at all (see test_scanner_credential_isolation).
+    # `scanner-manager` is the service that now writes evidence on its behalf.
+    for service in ("api", "scanner-manager", "worker-default"):
         env = _svc_env(_prod_service(service))
         assert env.get("DATABASE_URL_FILE") == "/run/secrets/database_url", \
             f"{service} must read DATABASE_URL from a secret"
@@ -467,15 +481,15 @@ def test_secret_file_beats_an_inherited_value(tmp_path):
     from apps.api.core import config as cfg
 
     secret_file = tmp_path / "database_url"
-    secret_file.write_text("postgresql+asyncpg://app:from-the-secret@postgres:5432/mbs\n")
+    secret_file.write_text("mysql+aiomysql://app:from-the-secret@mysql:3306/mbs\n")
     env = {
-        "DATABASE_URL": "postgresql+asyncpg://mbs:mbs@postgres:5432/mbs",   # inherited default
+        "DATABASE_URL": "mysql+aiomysql://mbs:mbs@mysql:3306/mbs",   # inherited default
         "DATABASE_URL_FILE": str(secret_file),
     }
     with mock.patch.dict(os.environ, env, clear=True):
         cfg._resolve_file_secrets()
         resolved = os.environ["DATABASE_URL"]
-    assert resolved.endswith("@postgres:5432/mbs")
+    assert resolved.endswith("@mysql:3306/mbs")
     assert "from-the-secret" in resolved      # the file won
     assert "mbs:mbs@" not in resolved         # the inherited default did not
 
@@ -521,11 +535,16 @@ def test_non_secret_configuration_is_untouched():
 # --- 7. nginx routing (Finding A) -------------------------------------------------------
 
 NGINX_CONF = REPO_ROOT / "infra" / "nginx" / "nginx.conf"
+NGINX_TLS_CONF = REPO_ROOT / "infra" / "nginx" / "nginx.tls.conf"
+# F-01 split the single :80 server block into a dev (plaintext) and a production (TLS) config.
+# The ROUTING itself moved into this snippet, which both `include`, so it -- not either
+# server file -- is where the /api/v1 vs /api prefix behaviour now lives and is asserted.
+NGINX_ROUTES = REPO_ROOT / "infra" / "nginx" / "snippets" / "proxy_routes.conf"
 
 
 def _nginx_api_locations() -> list:
     """[(prefix, proxy_pass)] for every `location` that proxies to the API upstream."""
-    text = NGINX_CONF.read_text(encoding="utf-8")
+    text = NGINX_ROUTES.read_text(encoding="utf-8")
     locations, current = [], None
     for raw in text.splitlines():
         line = raw.strip()
@@ -572,7 +591,7 @@ def test_nginx_preserves_the_api_v1_prefix():
     """FINDING A. `location /api/ { proxy_pass .../; }` stripped the prefix, so /api/v1/plans
     reached the app as /v1/plans and every browser API call 404'd. The v1 family must arrive
     unchanged, matching where the routers are actually mounted."""
-    _require_compose(NGINX_CONF)
+    _require_compose(NGINX_ROUTES)
     assert _upstream_path("/api/v1/plans") == "/api/v1/plans"
     assert _upstream_path("/api/v1/auth/login") == "/api/v1/auth/login"
     prefix = Settings().api_v1_prefix
@@ -589,7 +608,7 @@ def test_nginx_root_level_endpoints_keep_working(request_path, upstream):
     """These three work ONLY because of the prefix strip -- they are served at the root of the
     same app. Removing the trailing slash outright would have broken all of them, so the fix
     had to add a longer-prefix location rather than change the existing one."""
-    _require_compose(NGINX_CONF)
+    _require_compose(NGINX_ROUTES)
     assert _upstream_path(request_path) == upstream
     assert upstream in _app_route_paths(), f"{upstream} must be a real route on the API"
 
@@ -597,8 +616,8 @@ def test_nginx_root_level_endpoints_keep_working(request_path, upstream):
 def test_nginx_api_locations_preserve_forwarding_headers():
     """TRUSTED_PROXY_COUNT=1 depends on nginx appending exactly one X-Forwarded-For entry; a
     location that forgets the headers would break the rate-limit identity for its routes."""
-    _require_compose(NGINX_CONF)
-    text = NGINX_CONF.read_text(encoding="utf-8")
+    _require_compose(NGINX_ROUTES)
+    text = NGINX_ROUTES.read_text(encoding="utf-8")
     blocks = [b for b in text.split("location ") if b.startswith("/api")]
     assert len(blocks) >= 2, "expected both /api/v1/ and /api/ locations"
     for block in blocks:
@@ -606,3 +625,235 @@ def test_nginx_api_locations_preserve_forwarding_headers():
         for header in ("Host $host", "X-Real-IP", "X-Forwarded-For $proxy_add_x_forwarded_for",
                        "X-Forwarded-Proto"):
             assert header in body, f"an /api location is missing proxy_set_header {header}"
+
+
+# --- 8. Transport security (F-01) --------------------------------------------------------
+# F-01: the production merge previously defined every service EXCEPT nginx, so it inherited
+# the base file's plaintext `80:80` and served the whole application -- credentials, JWTs,
+# scan evidence -- in cleartext, while ENABLE_HSTS=true advertised a TLS guarantee that did
+# not exist. These tests are the enforcement: they assert the SHIPPED production artifacts
+# terminate TLS, never serve application content over plaintext, and carry no certificate.
+
+
+def test_production_nginx_terminates_tls_on_443():
+    """The production merge must publish :443, not just inherit :80."""
+    _require_compose(BASE_COMPOSE, PROD_COMPOSE)
+    published = [str(p) for _, p in _port_publications("nginx")]
+    assert any("443" in p for p in published), (
+        "production nginx must publish :443 -- without it the bundled stack has no TLS "
+        "listener at all and every request crosses the network in cleartext"
+    )
+
+
+def test_production_nginx_uses_the_tls_config_not_the_plaintext_one():
+    """The overlay must REPLACE the config mount, not merely add one. Compose merges
+    `volumes` by container path, so the same target with a different source substitutes."""
+    _require_compose(PROD_COMPOSE)
+    nginx = _compose(PROD_COMPOSE)["services"]["nginx"]
+    mounts = [str(v) for v in nginx.get("volumes", [])]
+    conf = [m for m in mounts if m.endswith(":/etc/nginx/nginx.conf:ro")]
+    assert len(conf) == 1, f"expected exactly one nginx.conf mount, got {conf}"
+    assert "nginx.tls.conf" in conf[0], (
+        "production must mount nginx.tls.conf at /etc/nginx/nginx.conf; mounting the "
+        "plaintext nginx.conf reopens F-01"
+    )
+
+
+def test_production_nginx_serves_no_application_content_over_plaintext():
+    """:80 may exist (compose APPENDS ports across -f files and the base publication cannot
+    be withdrawn) but it must only redirect -- plus the ACME challenge path, which has to
+    stay reachable over :80 or certificate renewal breaks."""
+    _require_compose(NGINX_TLS_CONF)
+    text = NGINX_TLS_CONF.read_text(encoding="utf-8")
+    plaintext_block = text.split("listen 80;", 1)[1].split("listen 443", 1)[0]
+    assert "return 308" in plaintext_block, ":80 must permanently redirect to https"
+    assert "proxy_pass" not in plaintext_block, (
+        "the :80 server block must not proxy to any upstream -- that would serve real "
+        "application content in cleartext"
+    )
+
+
+def test_production_redirect_preserves_method_and_body():
+    """308, not 301/302: a 302 turns a POST into a GET, silently downgrading an API write
+    into a no-op instead of replaying it over TLS."""
+    _require_compose(NGINX_TLS_CONF)
+    text = NGINX_TLS_CONF.read_text(encoding="utf-8")
+    assert "return 308" in text
+    assert "return 301" not in text and "return 302" not in text
+
+
+def test_production_tls_disables_obsolete_protocols():
+    """TLS 1.2/1.3 only -- SSLv3/TLS1.0/TLS1.1 are broken (POODLE/BEAST) and fail PCI DSS."""
+    _require_compose(NGINX_TLS_CONF)
+    text = NGINX_TLS_CONF.read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.strip().startswith("ssl_protocols"))
+    assert "TLSv1.2" in line and "TLSv1.3" in line
+    for obsolete in ("SSLv2", "SSLv3", "TLSv1 ", "TLSv1;", "TLSv1.1"):
+        assert obsolete not in line, f"{obsolete.strip()} must not be enabled"
+
+
+def test_production_tls_uses_forward_secret_aead_ciphers_only():
+    """Every configured suite must be ECDHE (forward secrecy) + AEAD (GCM/ChaCha20)."""
+    _require_compose(NGINX_TLS_CONF)
+    text = NGINX_TLS_CONF.read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.strip().startswith("ssl_ciphers"))
+    suites = line.split("ssl_ciphers", 1)[1].strip().rstrip(";").split(":")
+    for suite in [s for s in suites if s]:
+        assert suite.startswith("ECDHE"), f"{suite} is not forward-secret"
+        assert "GCM" in suite or "CHACHA20" in suite, f"{suite} is not an AEAD suite"
+        assert "CBC" not in suite and "3DES" not in suite and "RC4" not in suite
+
+
+def test_production_hsts_is_only_asserted_on_the_tls_listener():
+    """The F-01 false-advertisement half: HSTS over plaintext tells a browser to refuse the
+    only scheme that works. It must be sent from the 443 block and nowhere else."""
+    _require_compose(NGINX_TLS_CONF, NGINX_CONF)
+    tls_text = NGINX_TLS_CONF.read_text(encoding="utf-8")
+    plaintext_block = tls_text.split("listen 80;", 1)[1].split("listen 443", 1)[0]
+    assert "Strict-Transport-Security" not in plaintext_block, \
+        "HSTS must not be sent from the plaintext :80 server block"
+    assert "Strict-Transport-Security" in tls_text.split("listen 443", 1)[1], \
+        "the TLS listener must assert HSTS"
+    assert "Strict-Transport-Security" not in NGINX_CONF.read_text(encoding="utf-8"), \
+        "the dev (plaintext-only) config must never send HSTS"
+
+
+def test_production_tls_material_comes_from_secrets_and_is_never_committed():
+    """Certificate + key arrive as Docker Secrets from infra/secrets/, which .gitignore
+    excludes wholesale. Nothing certificate-shaped may be tracked in the repo."""
+    _require_compose(PROD_COMPOSE)
+    cfg = _compose(PROD_COMPOSE)
+    nginx = cfg["services"]["nginx"]
+    assert set(nginx.get("secrets", [])) >= {"tls_cert", "tls_key"}
+    for name in ("tls_cert", "tls_key"):
+        path = cfg["secrets"][name]["file"]
+        assert path.startswith("./secrets/"), f"{name} must live in the gitignored secrets dir"
+        assert not (REPO_ROOT / "infra" / path.lstrip("./")).exists(), (
+            f"{path} is present in the working tree -- TLS material must never be committed"
+        )
+
+
+def test_production_nginx_fails_closed_without_a_certificate():
+    """A missing certificate must STOP the container, not silently degrade to plaintext.
+    Without this the operator's fix for a crash loop is to revert to nginx.conf, which
+    quietly reopens F-01."""
+    _require_compose(PROD_COMPOSE)
+    entrypoint = _compose(PROD_COMPOSE)["services"]["nginx"].get("entrypoint")
+    assert entrypoint, "production nginx needs a guard entrypoint"
+    script = " ".join(str(part) for part in entrypoint)
+    assert "/run/secrets/tls_cert" in script and "/run/secrets/tls_key" in script
+    assert "exit 1" in script, "the guard must abort startup, not warn and continue"
+
+
+# ---------------------------------------------------------------------------------------
+# 8. STALE-IMAGE GUARD -- a development stack cannot silently run baked-in image code.
+#
+# The failure these close: `docker compose -f infra/docker-compose.yml up -d api` is a
+# COMPLETE, successful command that produces a WRONG container. Compose merges an override
+# file implicitly only for a bare `up`; any explicit `-f` makes the list exact, so that
+# invocation drops docker-compose.override.yml and with it the `../apps/api` bind mount. The
+# API then serves whatever code was baked into the image at its last build, reports healthy,
+# and drifts further from the working tree with every commit. It was found in production-like
+# use only from the CONTENT of a generated report -- months of drift, no error anywhere.
+#
+# The guard is a sentinel: the base file sets MBS_STACK_MODE=unconfigured and each real
+# overlay replaces it, so the value survives exactly when the -f list is incomplete -- the
+# same condition that drops the mount. These tests pin all three halves (base sets it, each
+# overlay clears it, the app refuses to boot on it) so that removing any one of them fails
+# here rather than by shipping stale reports again.
+# ---------------------------------------------------------------------------------------
+
+def test_base_compose_sets_the_stack_mode_sentinel():
+    """The base file alone must NOT describe a runnable dev API. It bakes code into the
+    image, so on its own it is only ever half of a correct invocation."""
+    _require_compose(BASE_COMPOSE)
+    env = _svc_env(_compose(BASE_COMPOSE)["services"]["api"])
+    assert env.get("MBS_STACK_MODE") == "unconfigured", (
+        "infra/docker-compose.yml must set MBS_STACK_MODE=unconfigured on `api`; it is what "
+        "makes an incomplete `-f` list fail loudly instead of serving stale image code"
+    )
+
+
+def test_dev_override_clears_the_sentinel_and_mounts_the_source_tree():
+    """The two must live in the SAME file. That is the whole mechanism: an -f list that
+    drops the bind mount necessarily also drops the value that permits startup."""
+    _require_compose(DEV_OVERRIDE)
+    api = _compose(DEV_OVERRIDE)["services"]["api"]
+    assert _svc_env(api).get("MBS_STACK_MODE") == "development"
+    mounts = [str(v) for v in api.get("volumes", [])]
+    assert any(m.startswith("../apps/api:") for m in mounts), (
+        "the dev override must bind-mount ../apps/api -- without it the container runs the "
+        "image's baked-in copy of the code"
+    )
+
+
+def test_production_merge_clears_the_sentinel():
+    """Production is the case where baked-in image code is CORRECT, so the production merge
+    must resolve to a real mode -- the guard must never be able to strand a deployment."""
+    _require_compose(BASE_COMPOSE, PROD_COMPOSE)
+    assert _prod_env("api").get("MBS_STACK_MODE") == "production"
+
+
+def test_production_merge_never_bind_mounts_application_code():
+    """The counterpart invariant: production must serve the audited image, not a host tree.
+    A bind mount here would let whatever sits on the deploy host's disk become the running
+    application, defeating image pinning and review entirely."""
+    _require_compose(BASE_COMPOSE, PROD_COMPOSE)
+    for path in (BASE_COMPOSE, PROD_COMPOSE):
+        api = _compose(path)["services"].get("api", {})
+        for volume in api.get("volumes", []):
+            source = str(volume).split(":", 1)[0] if isinstance(volume, str) else \
+                str(volume.get("source", ""))
+            assert not source.rstrip("/").endswith("apps/api"), (
+                f"{path.name} bind-mounts application code into the production api service"
+            )
+
+
+def test_api_refuses_to_start_on_the_sentinel():
+    """The runtime half. Without this the compose sentinel is only a comment."""
+    from apps.api.core.stack_mode import (
+        ENV_VAR, SENTINEL, StaleStackError, assert_stack_mode_configured,
+    )
+    with pytest.raises(StaleStackError) as excinfo:
+        assert_stack_mode_configured({ENV_VAR: SENTINEL})
+    # The operator meets this message at 2am; it has to carry the fix, not just the fault.
+    assert "docker-compose.override.yml" in str(excinfo.value)
+
+
+def test_stack_mode_guard_allows_every_legitimate_invocation():
+    """Both real compose modes, and -- critically -- an UNSET variable. The guard keys on the
+    fingerprint of a known-broken invocation only, so pytest, a bare uvicorn, an IDE runner
+    and any non-compose deployment stay unaffected; it can never strand a stack that did not
+    opt into the convention."""
+    from apps.api.core.stack_mode import ENV_VAR, assert_stack_mode_configured
+    for env in ({}, {ENV_VAR: "development"}, {ENV_VAR: "production"}):
+        assert_stack_mode_configured(env)
+
+
+def test_readme_documents_no_api_compose_command_that_drops_the_dev_override():
+    """The documentation is part of the guard. Every README `docker compose` line that starts
+    or execs the api/worker/beat services must name BOTH dev files (or be the production
+    invocation) -- a copy-pasteable `-f infra/docker-compose.yml` alone is exactly how the
+    stale container was created in the first place."""
+    readme = REPO_ROOT / "README.md"
+    _require_compose(readme)
+    offenders = []
+    for lineno, line in enumerate(readme.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped.startswith("docker compose ") or "-f " not in stripped:
+            continue
+        if "docker-compose.prod.yml" in stripped:       # production, override excluded by design
+            continue
+        if "docker-compose.local-ca.yml" in stripped:   # build-only overlay, starts nothing
+            continue
+        # Only commands that RUN code in a code-bearing service can serve stale code.
+        if not any(verb in stripped for verb in (" up", " exec ", " run ", " restart")):
+            continue
+        if not any(svc in stripped for svc in ("api", "worker", "beat")):
+            continue
+        if "docker-compose.override.yml" not in stripped:
+            offenders.append(f"README.md:{lineno}: {stripped}")
+    assert not offenders, (
+        "these README commands omit infra/docker-compose.override.yml, so they drop the "
+        "apps/api bind mount and run the image's baked-in code:\n  " + "\n  ".join(offenders)
+    )

@@ -16,8 +16,12 @@ Fully deterministic: subprocesses are faked, no network, no real katana binary.
 """
 
 import asyncio
+import time
+
+import pytest
 
 from apps.api.scanner_engine.tool_runners import katana_runner
+from apps.api.scanner_engine.tool_runners import base
 from apps.api.scanner_engine.tool_runners.base import CommonFinding, RawToolOutput, classify_run
 
 
@@ -142,11 +146,14 @@ def test_command_uses_the_installed_versions_flags(monkeypatch) -> None:
     _raw, cap = _run_katana(monkeypatch, stdout=[b"https://target.example/a\n"])
     cmd = cap["command"]
     assert cmd[0] == "katana"
-    for flag in ("-silent", "-no-color", "-depth", "-js-crawl", "-jsluice",
+    for flag in ("-silent", "-no-color", "-depth", "-js-crawl",
                  "-field-scope", "-concurrency", "-parallelism", "-rate-limit", "-timeout"):
         assert flag in cmd, f"{flag} missing from katana invocation"
     # JS crawling must stay on: it is what surfaces API endpoints for the DAST runner.
-    assert "-js-crawl" in cmd and "-jsluice" in cmd
+    assert "-js-crawl" in cmd
+    # -jsluice is OPT-IN (JSLUICE_DEFAULT is False): measured at 3.6-3.8 GiB peak for ONE URL
+    # on real targets vs ~75 MiB for ~2465 URLs without it. Absent from argv unless enabled.
+    assert "-jsluice" not in cmd
     assert cmd[cmd.index("-field-scope") + 1] == "fqdn"
 
 
@@ -875,12 +882,26 @@ def test_summary_accounts_for_every_target(monkeypatch) -> None:
 
 # --- capability preservation --------------------------------------------------------------
 
-def test_js_crawl_and_jsluice_present_in_every_invocation(monkeypatch) -> None:
-    """The capabilities this fix must not trade away, asserted per PROCESS."""
+def test_js_crawl_present_in_every_invocation(monkeypatch) -> None:
+    """The capability this fix must not trade away, asserted per PROCESS.
+
+    -js-crawl is the one that carries the coverage (measured 2580 URLs at a 72 MiB peak) and
+    stays unconditional. -jsluice is opt-in and therefore absent by default."""
     _raw, rec = _run_multi(monkeypatch, [f"https://h{i}.example" for i in range(4)])
     for launch in rec.launches:
         assert "-js-crawl" in launch["command"]
+        assert "-jsluice" not in launch["command"]
+
+
+def test_jsluice_is_opt_in_and_applies_to_every_process(monkeypatch) -> None:
+    """Enabling it explicitly puts it on EVERY per-target process, not just the first."""
+    _raw, rec = _run_multi(
+        monkeypatch, [f"https://h{i}.example" for i in range(4)], config={"jsluice": True},
+    )
+    assert len(rec.launches) == 4
+    for launch in rec.launches:
         assert "-jsluice" in launch["command"]
+        assert "-js-crawl" in launch["command"]
 
 
 def test_parallelism_two_present_in_every_invocation(monkeypatch) -> None:
@@ -902,7 +923,8 @@ def test_all_required_flags_present_in_every_invocation(monkeypatch) -> None:
         cmd = launch["command"]
         for flag, value in expected.items():
             assert cmd[cmd.index(flag) + 1] == value
-        assert "-js-crawl" in cmd and "-jsluice" in cmd
+        assert "-js-crawl" in cmd
+        assert "-jsluice" not in cmd  # opt-in; see JSLUICE_DEFAULT
 
 
 def test_gomemlimit_env_is_passed_to_every_process(monkeypatch) -> None:
@@ -910,3 +932,1176 @@ def test_gomemlimit_env_is_passed_to_every_process(monkeypatch) -> None:
     _raw, rec = _run_multi(monkeypatch, ["https://a.example", "https://b.example"])
     for launch in rec.launches:
         assert launch["env"]["GOMEMLIMIT"] == "1433MiB"
+
+
+# ============================ 9. Duplicate bare-host targets ===============================
+#
+# THE duplicate-execution fix. `web_targets()` -> `http_service_urls()` now collapses
+# `https://host` and `https://host/` before katana ever sees them (see _web.py's
+# `_dedupe_bare_hosts()`). Evidence: a real 29-target run had `new`, `www`, the root domain,
+# `cpanel` and `webmail` each crawled TWICE this way, and every one of those pairs was
+# already at the per-target timeout/OOM boundary -- duplication doubled cost on exactly the
+# targets that could least afford it, for zero additional coverage (both strings are the
+# same resource). This is a target-SELECTION fix upstream of KatanaRunner.run(); the runner
+# itself is unchanged, so it is verified here as an end-to-end launch-count guard.
+
+def test_bare_host_and_trailing_slash_launch_katana_exactly_once(monkeypatch) -> None:
+    """THE regression this fix closes: one logical host, one katana process."""
+    findings = [
+        CommonFinding(asset_type="http_service", value="https://host.example", metadata={}),
+        CommonFinding(asset_type="http_service", value="https://host.example/", metadata={}),
+    ]
+    rec = _Recorder([([b"https://host.example/a\n"], 0)]).install(monkeypatch)
+    runner = katana_runner.KatanaRunner()
+    raw = asyncio.run(runner.run("https://host.example", {}, findings))
+
+    assert len(rec.launches) == 1
+    assert rec.stdins[0].strip() == "https://host.example"
+    assert "1 target(s)" in raw.stderr
+
+
+def test_distinct_hosts_still_each_get_their_own_process(monkeypatch) -> None:
+    """The fix narrows only the bare-host+slash pair; genuinely different hosts are untouched."""
+    findings = [
+        CommonFinding(asset_type="http_service", value="https://a.example", metadata={}),
+        CommonFinding(asset_type="http_service", value="https://a.example/", metadata={}),
+        CommonFinding(asset_type="http_service", value="https://b.example", metadata={}),
+    ]
+    rec = _Recorder([([b"x\n"], 0)]).install(monkeypatch)
+    runner = katana_runner.KatanaRunner()
+    asyncio.run(runner.run("https://a.example", {}, findings))
+
+    assert len(rec.launches) == 2
+    assert [s.strip() for s in rec.stdins] == ["https://a.example", "https://b.example"]
+
+
+# ============ Per-target OUTPUT budget (resource-limited execution) =========================
+#
+# These cover the resource path that per-target PROCESS isolation did NOT: a single target
+# emitting so much output that the PARENT's accumulation exhausts the worker cgroup. The
+# fixtures below are synthetic high-volume generators -- deliberately NOT the real 163k-URL
+# target, which must not be re-crawled merely to exercise a bound.
+
+
+class _FloodStream:
+    """A stdout pipe that keeps emitting URLs, the way a pathological crawl does.
+
+    `max_chunks` exists only so a BROKEN implementation fails the test instead of hanging the
+    suite forever; a correct one stops reading long before reaching it.
+    """
+
+    def __init__(self, line: bytes = b"https://flood.example/" + b"p" * 40 + b"\n",
+                 per_chunk: int = 200, max_chunks: int = 10_000):
+        self.line = line
+        self.per_chunk = per_chunk
+        self.max_chunks = max_chunks
+        self.chunks_served = 0
+
+    async def read(self, _n: int = -1) -> bytes:
+        if self.chunks_served >= self.max_chunks:
+            return b""
+        self.chunks_served += 1
+        return self.line * self.per_chunk
+
+
+class _FloodProc:
+    """A subprocess that floods stdout and never exits on its own."""
+
+    def __init__(self, stream=None):
+        self.stdout = stream or _FloodStream()
+        self.stderr = _FakeStream([])
+        self.stdin = _FakeStdin()
+        self.returncode = None
+        self.killed = 0
+        self.reaped = False
+
+    async def wait(self):
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
+
+    def kill(self):
+        self.killed += 1
+        self.returncode = -9
+
+    async def communicate(self):
+        self.reaped = True
+        return b"", b""
+
+
+def _run_flood(monkeypatch, *, targets=1, config=None):
+    """Drive the runner against `targets` flooding processes."""
+    procs: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        proc = _FloodProc()
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    runner = katana_runner.KatanaRunner()
+    prior = _targets(*[f"https://h{i}.example" for i in range(targets)]) if targets > 1 else []
+    raw = asyncio.run(runner.run("https://target.example", config or {}, prior))
+    return raw, procs
+
+
+# --- 1. the budget exists and is enforced --------------------------------------------------
+
+def test_both_budgets_are_independent_not_derived_from_each_other() -> None:
+    """The URL budget is NO LONGER multiplied into the byte budget.
+
+    That derivation was the bug: `max_urls_per_target=10000` produced a 5,120,000-byte cap
+    and NO URL enforcement, so a run configured for 10,000 URLs was observed stopping at
+    74,364. Both numbers are now real and separately configurable."""
+    urls, byts = katana_runner.resolve_output_budgets({})
+    assert urls == katana_runner.MAX_URLS_PER_TARGET == 10_000
+    assert byts == katana_runner.MAX_STDOUT_BYTES_PER_TARGET == 5 * 1024 * 1024
+    # Changing one must not move the other.
+    urls2, byts2 = katana_runner.resolve_output_budgets({"max_urls_per_target": 25})
+    assert (urls2, byts2) == (25, katana_runner.MAX_STDOUT_BYTES_PER_TARGET)
+    urls3, byts3 = katana_runner.resolve_output_budgets({"max_stdout_bytes_per_target": 4096})
+    assert (urls3, byts3) == (katana_runner.MAX_URLS_PER_TARGET, 4096)
+
+
+def test_the_5mib_byte_boundary_is_preserved() -> None:
+    """The memory boundary the runtime validation exercised must not move."""
+    assert katana_runner.MAX_STDOUT_BYTES_PER_TARGET == 5_242_880
+
+
+def test_a_pathological_target_is_bounded_not_unbounded(monkeypatch) -> None:
+    """THE fix. A target that would emit unbounded output is stopped at its budget."""
+    # A tiny BYTE budget, so this test exercises the byte boundary specifically.
+    cap = 4096
+    raw, procs = _run_flood(monkeypatch, config={"max_stdout_bytes_per_target": cap})
+    # The cap is PER PROCESS, and web_targets() expands a bare target into its http:// and
+    # https:// forms -- so the aggregate bound is cap x len(procs), not cap. What matters is
+    # that it is a BOUND at all: without the fix this is the whole flood.
+    #
+    # The "+ 1 per process" is the runner's newline repair: truncating mid-line leaves a chunk
+    # without its trailing newline, and the runner appends one so the last URL of one target
+    # cannot be glued to the first URL of the next. One byte each, and load-bearing.
+    assert len(raw.stdout.encode()) <= (cap + 1) * len(procs)
+    # Each process was OFFERED far more than its budget and still stayed within it.
+    for proc in procs:
+        offered = proc.stdout.chunks_served * proc.stdout.per_chunk * len(proc.stdout.line)
+        assert offered > cap, "the fixture did not actually exceed the budget"
+    # And it did not simply read the generator dry.
+    for proc in procs:
+        assert proc.stdout.chunks_served < proc.stdout.max_chunks
+
+
+# --- 2. invalid budget rejected BEFORE any process spawns ----------------------------------
+
+def test_zero_budget_is_rejected_not_treated_as_unlimited() -> None:
+    with pytest.raises(katana_runner.KatanaBudgetError):
+        katana_runner.resolve_output_budgets({"max_urls_per_target": 0})
+
+
+def test_negative_budget_is_rejected() -> None:
+    with pytest.raises(katana_runner.KatanaBudgetError):
+        katana_runner.resolve_output_budgets({"max_urls_per_target": -1})
+
+
+def test_an_invalid_byte_budget_is_rejected_too() -> None:
+    """BOTH budgets are safety controls, so both are validated."""
+    with pytest.raises(katana_runner.KatanaBudgetError):
+        katana_runner.resolve_output_budgets({"max_stdout_bytes_per_target": 0})
+
+
+def test_invalid_budget_rejected_before_any_process_is_spawned(monkeypatch) -> None:
+    """The guard must fire ahead of the loop, not after spawning N-1 processes."""
+    spawned: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        spawned.append(command)
+        return _FakeProc(stdout=[b""], returncode=0)
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    runner = katana_runner.KatanaRunner()
+    with pytest.raises(katana_runner.KatanaBudgetError):
+        asyncio.run(runner.run("https://target.example", {"max_urls_per_target": 0},
+                               _targets("https://a.example", "https://b.example")))
+    assert spawned == []
+
+
+# --- 3./4. the run becomes resource-limited AND keeps what it collected --------------------
+
+def test_flooding_target_is_marked_resource_limited(monkeypatch) -> None:
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert "exit=resource_limited" in raw.stderr
+
+
+def test_output_collected_before_termination_is_preserved(monkeypatch) -> None:
+    """Bounded is not the same as discarded: the prefix survives."""
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    lines = [ln for ln in raw.stdout.splitlines() if ln.strip()]
+    assert lines, "collected output was discarded instead of preserved"
+    assert all(ln.startswith("https://flood.example/") for ln in lines)
+
+
+def test_truncation_at_the_budget_does_not_splice_two_targets_urls(monkeypatch) -> None:
+    """A cap that lands mid-line must not glue one target's last URL to the next's first.
+
+    The budget makes mid-line truncation ROUTINE rather than exceptional (it stops reading at
+    an arbitrary byte offset), so the runner's newline repair is now load-bearing on the
+    common path, not just after a SIGKILL."""
+    raw, procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert len(procs) > 1, "this test needs more than one process to be meaningful"
+    for line in raw.stdout.splitlines():
+        if line.strip():
+            # A spliced line would contain a second scheme partway through.
+            assert line.strip().count("https://") == 1
+
+
+def test_preserved_output_still_parses_into_findings(monkeypatch) -> None:
+    """Preservation is only meaningful if the URLs remain usable downstream."""
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    findings = katana_runner.KatanaRunner().parse(raw)
+    assert findings
+    assert all(f.asset_type == "url" for f in findings)
+
+
+# --- 5. the process is terminated and reaped ----------------------------------------------
+
+def test_resource_limited_process_is_terminated_and_reaped(monkeypatch) -> None:
+    _raw, procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert procs[0].killed >= 1, "the flooding process was not terminated"
+    assert procs[0].reaped, "the flooding process was not reaped"
+    assert procs[0].returncode is not None
+
+
+# --- 6./7./8. outcomes stay DISTINCT -------------------------------------------------------
+
+def test_resource_limit_is_distinct_from_timeout(monkeypatch) -> None:
+    """A budget kill must not masquerade as a timeout, or an operator raises the wrong knob."""
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert raw.timed_out is False
+    assert "timed out" not in raw.stderr
+
+
+def test_timeout_path_does_not_claim_resource_limited(monkeypatch) -> None:
+    """The existing timeout path is unchanged and does NOT claim resource_limited."""
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0)
+    assert raw.timed_out is False
+    # NB: the header always carries a "(N resource_limited)" tally, so a bare substring test
+    # would be vacuous. Key on the per-target marker, and assert the tally is zero.
+    assert "exit=resource_limited" not in raw.stderr
+    assert "(0 resource_limited)" in raw.stderr
+
+
+def test_process_failure_remains_distinct(monkeypatch) -> None:
+    """A plain non-zero exit is neither a timeout nor a resource limit."""
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=2)
+    assert "exit=2" in raw.stderr
+    assert "exit=resource_limited" not in raw.stderr
+    assert "(0 resource_limited)" in raw.stderr
+    assert raw.timed_out is False
+
+
+def test_sigkill_remains_distinct_from_resource_limit(monkeypatch) -> None:
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=-9)
+    assert "exit=-9" in raw.stderr
+    assert "exit=resource_limited" not in raw.stderr
+    assert "(0 resource_limited)" in raw.stderr
+
+
+def test_resource_limited_run_can_never_be_successful(monkeypatch) -> None:
+    """THE correctness rule: a capped crawl is partial, never `completed`."""
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert raw.exit_code != 0
+    assert classify_run(katana_runner.KatanaRunner(), raw, produced_findings=True) == "partial"
+
+
+def test_resource_limited_summary_does_not_claim_completion(monkeypatch) -> None:
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert "0 completed" in raw.stderr
+
+
+def test_resource_limited_summary_warns_surface_is_not_proven_absent(monkeypatch) -> None:
+    """A partial crawl must never read as evidence the rest of the surface does not exist."""
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert "NOT proven absent" in raw.stderr
+
+
+# --- 9./10. isolation holds: one bad target does not harm the others -----------------------
+
+def test_one_flooding_target_does_not_terminate_the_others(monkeypatch) -> None:
+    """Only the offending process is killed; the rest run and are not touched."""
+    procs: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        # First target floods; the rest behave.
+        if not procs:
+            proc = _FloodProc()
+        else:
+            proc = _FakeProc(stdout=[b"https://ok.example/1\n"], returncode=0)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    runner = katana_runner.KatanaRunner()
+    raw = asyncio.run(runner.run(
+        "https://target.example", {"max_urls_per_target": 100},
+        _targets("https://a.example", "https://b.example", "https://c.example"),
+    ))
+    assert len(procs) == 3, "a flooding target stopped the others from being attempted"
+    assert procs[0].killed >= 1
+    # The healthy processes exited on their own terms and were never killed.
+    assert procs[1].returncode == 0 and procs[2].returncode == 0
+    assert "https://ok.example/1" in raw.stdout
+
+
+def test_flooding_target_does_not_consume_another_targets_budget(monkeypatch) -> None:
+    """The budget is PER PROCESS, so a healthy later target still gets its full output."""
+    calls = {"n": 0}
+
+    async def _fake_exec(*command, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FloodProc()
+        return _FakeProc(stdout=[b"https://ok.example/kept\n"], returncode=0)
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    runner = katana_runner.KatanaRunner()
+    raw = asyncio.run(runner.run(
+        "https://target.example", {"max_urls_per_target": 100},
+        _targets("https://a.example", "https://b.example"),
+    ))
+    assert "https://ok.example/kept" in raw.stdout
+
+
+def test_process_per_target_isolation_is_intact_under_a_budget(monkeypatch) -> None:
+    """The existing isolation property must survive the new control."""
+    urls = [f"https://h{i}.example" for i in range(4)]
+    _raw, rec = _run_multi(monkeypatch, urls, config={"max_urls_per_target": 100})
+    assert len(rec.launches) == 4
+    for stdin in rec.stdins:
+        assert len(stdin.split()) == 1  # exactly one target per process
+
+
+# --- 11. reproducibility --------------------------------------------------------------------
+
+def test_effective_limits_are_recorded_for_reproducibility(monkeypatch) -> None:
+    """The command string is hashed into ToolRun.command_hash / effective_command."""
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0)
+    for key in ("katana_version=", "per_target_timeout_s=", "crawl_duration_s=",
+                "crawl_depth=", "max_urls_per_target=", "max_stdout_bytes_per_target=",
+                "parallelism=", "concurrency=", "gomemlimit_mib="):
+        assert key in raw.command, f"{key} missing from the reproducibility record"
+
+
+def test_reproducibility_records_the_configured_budget_not_the_default(monkeypatch) -> None:
+    raw, _captured = _run_katana(
+        monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0,
+        config={"max_urls_per_target": 250},
+    )
+    assert "max_urls_per_target=250" in raw.command
+    # The byte budget is INDEPENDENT -- it stays at its default when only URLs are configured.
+    assert f"max_stdout_bytes_per_target={katana_runner.MAX_STDOUT_BYTES_PER_TARGET}" in raw.command
+
+
+def test_unavailable_gomemlimit_is_reported_not_invented(monkeypatch) -> None:
+    """No cgroup limit => say so, never substitute a plausible number."""
+    monkeypatch.setattr(katana_runner, "_cgroup_memory_max_bytes", lambda: None)
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0)
+    assert "gomemlimit_mib=unavailable" in raw.command
+
+
+def test_declared_katana_version_is_recorded(monkeypatch) -> None:
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0)
+    assert f"katana_version={katana_runner.KatanaRunner.version}" in raw.command
+
+
+# --- 12./13. nothing else changed ------------------------------------------------------------
+
+def test_normal_output_parsing_is_unchanged_under_the_budget(monkeypatch) -> None:
+    """A normal run is identical in what it parses."""
+    out = b"https://a.example/1\nhttps://a.example/2?q=1\n"
+    raw, _captured = _run_katana(monkeypatch, stdout=[out], returncode=0)
+    findings = katana_runner.KatanaRunner().parse(raw)
+    assert [f.value for f in findings] == ["https://a.example/1", "https://a.example/2?q=1"]
+    assert findings[1].metadata["has_params"] is True
+
+
+def test_a_normal_run_is_not_marked_resource_limited(monkeypatch) -> None:
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0)
+    assert raw.exit_code == 0
+    assert "exit=resource_limited" not in raw.stderr
+    assert "(0 resource_limited)" in raw.stderr
+    assert classify_run(katana_runner.KatanaRunner(), raw, produced_findings=True) == "completed"
+
+
+def test_scope_filtering_is_unchanged(monkeypatch) -> None:
+    """-field-scope fqdn still pins the crawl to the target host."""
+    _raw, captured = _run_katana(monkeypatch, stdout=[b""], returncode=0)
+    cmd = captured["command"]
+    assert "-field-scope" in cmd
+    assert cmd[cmd.index("-field-scope") + 1] == "fqdn"
+
+
+def test_budget_does_not_alter_the_crawl_flags(monkeypatch) -> None:
+    """The bound is on OUTPUT, not on coverage: js-crawl/depth are untouched."""
+    _raw, captured = _run_katana(monkeypatch, stdout=[b""], returncode=0,
+                                 config={"max_urls_per_target": 100})
+    cmd = captured["command"]
+    assert "-js-crawl" in cmd
+    assert cmd[cmd.index("-depth") + 1] == "2"
+
+
+# --- 14. a partial crawl creates no finding/verification status -----------------------------
+
+def test_partial_crawl_creates_no_finding_merely_because_it_was_capped(monkeypatch) -> None:
+    """A resource limit is an EXECUTION fact, never a vulnerability signal."""
+    raw, _procs = _run_flood(monkeypatch, config={"max_urls_per_target": 100})
+    findings = katana_runner.KatanaRunner().parse(raw)
+    # Only crawled URLs -- no synthetic "crawl was truncated" finding.
+    assert all(f.asset_type == "url" for f in findings)
+    assert all(f.metadata.get("source") == "katana" for f in findings)
+    assert not any("resource" in f.value.lower() or "limit" in f.value.lower()
+                   for f in findings)
+
+
+# ============ URL-count budget is GENUINELY enforced =======================================
+#
+# The semantics bug these cover: `max_urls_per_target` used to be multiplied by 512 into a
+# byte cap and never enforced as a count, so a run configured for 10,000 URLs stopped at
+# 74,364. Both limits are now real, and whichever is hit FIRST wins.
+
+class _ShortLineFloodStream(_FloodStream):
+    """Floods SHORT URLs, so the URL cap is reached long before any sane byte cap.
+
+    This is the exact shape that exposed the old bug: real URLs are far shorter than the
+    512-byte estimate, so the byte cap always fired first and the URL count never bound.
+    """
+
+    def __init__(self, per_chunk: int = 200, max_chunks: int = 10_000):
+        super().__init__(line=b"https://s.test/a\n", per_chunk=per_chunk, max_chunks=max_chunks)
+
+
+def _run_short_flood(monkeypatch, *, config=None):
+    procs: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        proc = _FloodProc(_ShortLineFloodStream())
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    runner = katana_runner.KatanaRunner()
+    raw = asyncio.run(runner.run("https://target.example", config or {}, []))
+    return raw, procs
+
+
+def test_url_budget_is_actually_enforced_as_a_count(monkeypatch) -> None:
+    """THE fix. A 100-URL budget stops at 100 URLs per process -- not at a byte estimate."""
+    raw, procs = _run_short_flood(monkeypatch, config={"max_urls_per_target": 100})
+    total = len([ln for ln in raw.stdout.splitlines() if ln.strip()])
+    # Each process contributes at most its budget; nothing exceeds count x processes.
+    assert total <= 100 * len(procs)
+    # And it genuinely reached the cap rather than stopping early for some other reason.
+    assert total == 100 * len(procs)
+
+
+def test_short_urls_no_longer_overshoot_the_configured_count(monkeypatch) -> None:
+    """The regression guard for the reported bug.
+
+    With the old derivation, 100 URLs became a 51,200-byte cap and ~3,000 short URLs got
+    through. The count must now bind regardless of how short the URLs are."""
+    raw, procs = _run_short_flood(monkeypatch, config={"max_urls_per_target": 100})
+    total = len([ln for ln in raw.stdout.splitlines() if ln.strip()])
+    assert total < 500, f"URL cap did not bind: {total} URLs for a 100-URL budget"
+
+
+def test_url_limited_run_reports_the_url_limit_not_the_byte_limit(monkeypatch) -> None:
+    """An operator must be told WHICH limit fired, so they raise the right one."""
+    raw, _procs = _run_short_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert "URL limit (100 URL(s))" in raw.stderr
+    assert "output byte limit" not in raw.stderr
+
+
+def test_byte_limited_run_reports_the_byte_limit(monkeypatch) -> None:
+    """The other side of the same contract: a byte-bound run says so."""
+    raw, _procs = _run_flood(monkeypatch, config={"max_stdout_bytes_per_target": 4096})
+    assert "output byte limit (4096 bytes)" in raw.stderr
+    assert "URL limit" not in raw.stderr
+
+
+def test_whichever_limit_comes_first_wins(monkeypatch) -> None:
+    """Long URLs hit BYTES first; short URLs hit the COUNT first. Same config, both paths."""
+    # Long lines (~63 bytes each): a 10,000-byte cap is reached well before 10,000 URLs.
+    long_raw, _ = _run_flood(
+        monkeypatch, config={"max_urls_per_target": 10_000, "max_stdout_bytes_per_target": 10_000})
+    assert "output byte limit" in long_raw.stderr
+    # Short lines with a generous byte cap: the URL count binds instead.
+    short_raw, _ = _run_short_flood(
+        monkeypatch, config={"max_urls_per_target": 50, "max_stdout_bytes_per_target": 5_000_000})
+    assert "URL limit (50 URL(s))" in short_raw.stderr
+
+
+def test_url_cap_keeps_whole_lines_only(monkeypatch) -> None:
+    """A count-based cut must never truncate mid-URL and emit a partial one."""
+    raw, _procs = _run_short_flood(monkeypatch, config={"max_urls_per_target": 100})
+    for line in raw.stdout.splitlines():
+        if line.strip():
+            assert line == "https://s.test/a", f"partial URL emitted: {line!r}"
+
+
+def test_url_limited_output_is_preserved_and_parses(monkeypatch) -> None:
+    """Bounded by count is still bounded-and-kept, not discarded."""
+    raw, _procs = _run_short_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert raw.stdout.strip(), "collected output was discarded"
+    findings = katana_runner.KatanaRunner().parse(raw)
+    assert findings
+    assert all(f.asset_type == "url" for f in findings)
+
+
+def test_url_limited_run_is_partial_never_completed(monkeypatch) -> None:
+    """The status contract is unchanged for the new limit."""
+    raw, _procs = _run_short_flood(monkeypatch, config={"max_urls_per_target": 100})
+    assert raw.exit_code != 0
+    assert raw.timed_out is False
+    assert classify_run(katana_runner.KatanaRunner(), raw, produced_findings=True) == "partial"
+
+
+def test_url_limited_process_is_terminated_and_reaped(monkeypatch) -> None:
+    _raw, procs = _run_short_flood(monkeypatch, config={"max_urls_per_target": 100})
+    for proc in procs:
+        assert proc.killed >= 1
+        assert proc.reaped
+
+
+def test_reproducibility_records_both_limits(monkeypatch) -> None:
+    """A resource_limited run is exactly the case that must be reproducible."""
+    raw, _captured = _run_katana(
+        monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0,
+        config={"max_urls_per_target": 250, "max_stdout_bytes_per_target": 777_000},
+    )
+    assert "max_urls_per_target=250" in raw.command
+    assert "max_stdout_bytes_per_target=777000" in raw.command
+
+
+def test_a_normal_run_under_both_budgets_still_completes(monkeypatch) -> None:
+    """The common path is untouched: output below both limits is a clean success."""
+    raw, _captured = _run_katana(
+        monkeypatch, stdout=[b"https://a.example/1\nhttps://a.example/2\n"], returncode=0)
+    assert raw.exit_code == 0
+    assert "exit=resource_limited" not in raw.stderr
+    assert classify_run(katana_runner.KatanaRunner(), raw, produced_findings=True) == "completed"
+    assert len(katana_runner.KatanaRunner().parse(raw)) == 2
+
+
+# ==========================================================================================
+# jsluice default-off: the root cause of the "full per-target timeout, one URL" runs
+# ==========================================================================================
+#
+# ROOT CAUSE, measured on this worker (katana v1.7.0, identical flags, live authorized
+# targets, RSS sampled every 500 ms -- only -jsluice differs):
+#
+#   target                        -js-crawl -jsluice      -js-crawl only
+#   ----------------------------  --------------------    --------------------
+#   cpanel.brightvision-og.com    3601 MiB,    1 URL       73 MiB, 2465 URLs
+#   webmail.brightvision-og.com   3838 MiB,    1 URL       77 MiB, 2464 URLs
+#   www.brightvision-og.com       3740 MiB,    1 URL       53 MiB,    1 URL
+#
+# The jsluice runs grew ~48 -> 3695 MiB in 5.5s and ended in a cgroup OOM kill (exit 137)
+# with stdout still at ONE line. In production this surfaced as `katana.target_timeout ...
+# urls_preserved=1` on 30 of 30 timing-out targets: the shared 4 GiB worker cgroup was driven
+# to ~100% (memory.pressure full avg10=78.97), which starved every process in the container --
+# even `katana -version` took 52-301s there against 48-138 ms on an unpressured worker.
+#
+# These tests pin the DEFAULT and the opt-in. They do not re-test the output budgets; those
+# have their own sections above and are deliberately untouched by this change.
+
+def test_jsluice_is_absent_by_default(monkeypatch) -> None:
+    """DEFAULT OFF. Absent from argv entirely -- not passed with a falsy value."""
+    _raw, cap = _run_katana(monkeypatch, stdout=[b"https://target.example/a\n"])
+    assert "-jsluice" not in cap["command"]
+
+
+def test_jsluice_default_constant_is_false() -> None:
+    """The default is a named constant, so it cannot be flipped by an unrelated edit."""
+    assert katana_runner.JSLUICE_DEFAULT is False
+
+
+def test_jsluice_opt_in_adds_the_flag(monkeypatch) -> None:
+    """The CAPABILITY is retained: an explicit config re-enables it."""
+    _raw, cap = _run_katana(monkeypatch, stdout=[b""], config={"jsluice": True})
+    assert "-jsluice" in cap["command"]
+
+
+def test_jsluice_falsy_config_keeps_it_off(monkeypatch) -> None:
+    """An explicit False stays off (and cannot be read as 'key present => enable')."""
+    _raw, cap = _run_katana(monkeypatch, stdout=[b""], config={"jsluice": False})
+    assert "-jsluice" not in cap["command"]
+
+
+def test_js_crawl_stays_on_when_jsluice_is_off(monkeypatch) -> None:
+    """COVERAGE IS NOT TRADED AWAY. -js-crawl is what produced the measured 2465 URLs; only
+    the pathological parser is off by default."""
+    _raw, cap = _run_katana(monkeypatch, stdout=[b""])
+    cmd = cap["command"]
+    assert "-js-crawl" in cmd
+    assert "-jsluice" not in cmd
+
+
+def test_disabling_jsluice_changes_nothing_else_in_the_command(monkeypatch) -> None:
+    """The fix is EXACTLY one flag. Depth, scope, concurrency, parallelism, rate, response
+    size, domain pages and crawl-duration are all unchanged -- so this cannot be a silent
+    coverage reduction hiding behind a memory fix."""
+    _raw, off = _run_katana(monkeypatch, stdout=[b""])
+    _raw2, on = _run_katana(monkeypatch, stdout=[b""], config={"jsluice": True})
+    assert [c for c in on["command"] if c != "-jsluice"] == off["command"]
+
+
+def test_jsluice_state_is_recorded_in_the_effective_command(monkeypatch) -> None:
+    """REPRODUCIBILITY. orchestrator.py stores RawToolOutput.command as the effective
+    command; the flag that decides 3.7 GiB vs 73 MiB has to be visible there."""
+    raw_off, _ = _run_katana(monkeypatch, stdout=[b""])
+    raw_on, _ = _run_katana(monkeypatch, stdout=[b""], config={"jsluice": True})
+    assert "jsluice=False" in raw_off.command
+    assert "jsluice=True" in raw_on.command
+
+
+def test_jsluice_off_does_not_weaken_the_output_budgets(monkeypatch) -> None:
+    """The previously VERIFIED protections stay exactly as they were."""
+    raw, _ = _run_katana(monkeypatch, stdout=[b""])
+    assert katana_runner.MAX_URLS_PER_TARGET == 10_000
+    assert katana_runner.MAX_STDOUT_BYTES_PER_TARGET == 5 * 1024 * 1024
+    assert katana_runner.MAX_STDERR_BYTES == 1024 * 1024
+    assert "max_urls_per_target=10000" in raw.command
+    assert "max_stdout_bytes_per_target=5242880" in raw.command
+
+
+def test_jsluice_off_preserves_one_process_per_target(monkeypatch) -> None:
+    """Process isolation is untouched by this change."""
+    _raw, rec = _run_multi(monkeypatch, [f"https://h{i}.example" for i in range(5)])
+    assert len(rec.launches) == 5
+    assert rec.stdins == [f"https://h{i}.example" for i in range(5)]
+    for launch in rec.launches:
+        assert "-jsluice" not in launch["command"]
+
+# =========== 12. the -jsluice RSS watchdog: per-target containment, not worker recovery =====
+#
+# WHY THIS SECTION EXISTS. JSLUICE_DEFAULT = False keeps the runaway off the DEFAULT path, but
+# `jsluice=True` remains a supported opt-in, and production-equivalent runtime testing proved
+# what that opt-in costs: ~4082 MiB peak against a ~4096 MiB worker cgroup, memory.events
+# oom 0->2 / oom_kill 0->1, and Docker reporting OOMKilled=true. GOMEMLIMIT=1433 MiB did NOT
+# prevent it -- a soft heap ceiling cannot reclaim what is still reachable. The same binary
+# with jsluice=False peaked at ~75 MiB.
+#
+# The kernel's OOM killer chooses its own victim inside that SHARED cgroup, so the cost of one
+# opt-in target was a risk to the whole worker. The watchdog makes that cost land on the
+# target: the katana child is stopped at its own ceiling, through the existing
+# terminate_and_reap path, and classified `resource_limited` with reason `jsluice_rss`.
+#
+# DETERMINISTIC BY CONSTRUCTION. RSS is injected, not produced: no real katana, no real memory
+# pressure, and above all no dependence on the unit suite reproducing an actual 4 GiB OOM.
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+
+
+class _AliveStream:
+    """Serves its chunks, then blocks forever -- a process that is busy, not finished.
+
+    Returning EOF instead would let the pumps complete and race the watchdog, which is flaky
+    in the direction of a false PASS. This models the measured -jsluice shape: it allocated
+    for seconds while stdout stayed at one line.
+    """
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def read(self, _n: int = -1) -> bytes:
+        if self._chunks:
+            return self._chunks.pop(0)
+        await asyncio.Event().wait()
+        return b""  # pragma: no cover -- unreachable; only the watchdog ends this run
+
+
+class _WatchedProc:
+    """A katana child that emits a little stdout and then stays ALIVE and busy."""
+
+    def __init__(self, pid: int, stdout_chunks=(b"https://partial.example/1\n",)):
+        self.pid = pid
+        self.stdout = _AliveStream(list(stdout_chunks))
+        self.stderr = _AliveStream([])
+        self.stdin = _FakeStdin()
+        self.returncode = None
+        self.killed = 0
+        self.reaped = False
+
+    async def wait(self):
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
+
+    def kill(self):
+        self.killed += 1
+        self.returncode = -9
+
+    async def communicate(self):
+        self.reaped = True
+        return b"", b""
+
+
+class _HealthyProc(_FakeProc):
+    """A normal fake process that also carries a pid, so a watchdog could sample it."""
+
+    def __init__(self, pid: int, stdout=(b"https://ok.example/1\n",), returncode=0):
+        super().__init__(stdout=list(stdout), returncode=returncode)
+        self.pid = pid
+        self.killed = 0
+
+    def kill(self):
+        self.killed += 1
+        super().kill()
+
+
+def _arm(monkeypatch, rss_fn):
+    """Point the watchdog at an injected RSS source and sample fast.
+
+    The PRODUCTION interval is asserted separately, in
+    test_sampling_interval_is_sized_for_the_measured_growth_rate -- shrinking it here must not
+    be able to hide a change to the real one.
+    """
+    monkeypatch.setattr(base, "read_process_rss_bytes", rss_fn)
+    monkeypatch.setattr(base, "RSS_SAMPLE_INTERVAL_SECONDS", 0.001)
+
+
+def _run_watched(monkeypatch, rss_curve, *, config=None, targets=1,
+                 stdout_chunks=(b"https://partial.example/1\n",)):
+    """Drive the runner against stalling children with a scripted RSS curve.
+
+    `rss_curve` is the list of values successive samples return FOR EACH process (the last
+    value repeats). It is applied per PROCESS rather than per pid on purpose: web_targets()
+    expands one bare target into its http:// and https:// forms, so even a "one target" run
+    spawns two processes, and a curve keyed on a guessed pid would starve the second one --
+    which would hang on a stalling child rather than fail, i.e. fail in the worst direction.
+
+    A None value in the curve models a FAILED read: process gone, /proc unavailable,
+    unparsable file. The watchdog must never act on that.
+    """
+    procs: list = []
+    sampled: list[int] = []
+    counts: dict = {}
+
+    async def _fake_exec(*command, **kwargs):
+        proc = _WatchedProc(4242 + len(procs), stdout_chunks=list(stdout_chunks))
+        procs.append(proc)
+        return proc
+
+    def _fake_rss(pid: int):
+        sampled.append(pid)
+        # Only ever answers for a pid this run actually spawned. An unknown pid reads as "no
+        # information", exactly as a real failed /proc read would.
+        if not any(p.pid == pid for p in procs):
+            return None  # pragma: no cover -- the watchdog never samples a foreign pid
+        i = counts.get(pid, 0)
+        counts[pid] = i + 1
+        return rss_curve[min(i, len(rss_curve) - 1)]
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    _arm(monkeypatch, _fake_rss)
+
+    prior = _targets(*[f"https://h{i}.example" for i in range(targets)]) if targets > 1 else []
+    raw = asyncio.run(katana_runner.KatanaRunner().run(
+        "https://target.example", dict(config or {}), prior))
+    return raw, procs, sampled
+
+
+def _run_healthy(monkeypatch, rss_fn, *, config=None, targets=1):
+    """Drive the runner against children that FINISH normally, with RSS injected."""
+    procs: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        proc = _HealthyProc(5000 + len(procs))
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    _arm(monkeypatch, rss_fn)
+    prior = _targets(*[f"https://h{i}.example" for i in range(targets)]) if targets > 1 else []
+    raw = asyncio.run(katana_runner.KatanaRunner().run(
+        "https://target.example", dict(config or {}), prior))
+    return raw, procs
+
+
+# --- 12.1 the watchdog is armed ONLY for jsluice=True --------------------------------------
+
+def test_jsluice_false_does_not_start_the_rss_watchdog(monkeypatch) -> None:
+    """THE default path must be untouched: no watchdog task, not even a passive one.
+
+    Asserted by the ABSENCE of any RSS sample. With jsluice off, run_with_timeout is called
+    with max_rss_bytes=None, so no watchdog coroutine is created at all -- which is stronger
+    than a watchdog that runs and declines to act, and is what keeps the measured-safe 75 MiB
+    path byte-for-byte what it was.
+    """
+    sampled: list = []
+
+    def _fake_rss(pid: int):
+        sampled.append(pid)
+        return 1
+
+    _arm(monkeypatch, _fake_rss)
+    raw, _captured = _run_katana(monkeypatch, stdout=[b"https://a.example/1\n"], returncode=0)
+    assert sampled == [], "the watchdog sampled on the jsluice=False path"
+    assert "jsluice=False" in raw.command
+    assert "jsluice_rss_limit_enabled=False" in raw.command
+    assert "jsluice_max_rss_bytes=disarmed" in raw.command
+
+
+def test_jsluice_true_enables_the_rss_watchdog(monkeypatch) -> None:
+    """The opt-in arms it, against the exact child this runner spawned."""
+    raw, procs, sampled = _run_watched(
+        monkeypatch, [2 * MIB, 2 * GIB], config={"jsluice": True},
+    )
+    assert sampled, "the watchdog never sampled with jsluice=True"
+    assert set(sampled) <= {p.pid for p in procs}, "a pid we never spawned was sampled"
+    assert "jsluice_rss_limit_enabled=True" in raw.command
+    assert f"jsluice_max_rss_bytes={katana_runner.JSLUICE_MAX_RSS_BYTES}" in raw.command
+
+
+# --- 12.2 below the ceiling, nothing is touched --------------------------------------------
+
+def test_rss_below_the_ceiling_does_not_terminate_the_process(monkeypatch) -> None:
+    """A legitimate jsluice crawl must not be killed. It ends on its own terms, exit 0."""
+    raw, procs = _run_healthy(
+        monkeypatch, lambda pid: 200 * MIB, config={"jsluice": True},
+    )
+    assert "exit=resource_limited" not in raw.stderr
+    assert katana_runner.JSLUICE_RSS_LIMIT_REASON not in raw.stderr
+    assert "jsluice_rss_limit_tripped=False" in raw.command
+    assert raw.exit_code == 0
+    for proc in procs:
+        assert proc.killed == 0, "a healthy jsluice crawl was killed"
+        assert proc.returncode == 0
+
+
+def test_rss_exactly_at_the_ceiling_is_not_a_kill(monkeypatch) -> None:
+    """The bound is EXCEEDS, not reaches -- a process sitting exactly on its budget is
+    within it, the same rule the output budgets follow."""
+    raw, procs = _run_healthy(
+        monkeypatch,
+        lambda pid: katana_runner.JSLUICE_MAX_RSS_BYTES,
+        config={"jsluice": True},
+    )
+    assert "exit=resource_limited" not in raw.stderr
+    for proc in procs:
+        assert proc.killed == 0
+
+
+# --- 12.3 above the ceiling, that process and ONLY that process is stopped -----------------
+
+def test_rss_above_the_ceiling_terminates_the_katana_process(monkeypatch) -> None:
+    """THE fix: the runaway is stopped by this runner, before the cgroup notices."""
+    _raw, procs, _sampled = _run_watched(
+        monkeypatch,
+        # The measured curve, compressed: healthy, climbing, then past the ceiling.
+        [48 * MIB, 700 * MIB, 3 * GIB],
+        config={"jsluice": True},
+    )
+    assert procs[0].killed >= 1, "the runaway katana process was not terminated"
+
+
+def test_only_the_offending_katana_process_is_terminated(monkeypatch) -> None:
+    """Per-target containment. The other targets still run, untouched and unsignalled."""
+    procs: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        proc = _WatchedProc(4242) if not procs else _HealthyProc(4300 + len(procs))
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    _arm(monkeypatch, lambda pid: 3 * GIB if pid == 4242 else 50 * MIB)
+    raw = asyncio.run(katana_runner.KatanaRunner().run(
+        "https://target.example", {"jsluice": True},
+        _targets("https://a.example", "https://b.example", "https://c.example"),
+    ))
+
+    assert len(procs) == 3, "the runaway stopped the other targets from being attempted"
+    assert procs[0].killed >= 1
+    # The healthy ones exited on their OWN terms and were never signalled.
+    assert procs[1].killed == 0 and procs[2].killed == 0
+    assert procs[1].returncode == 0 and procs[2].returncode == 0
+    assert "https://ok.example/1" in raw.stdout
+
+
+def test_the_watchdog_only_ever_reads_its_own_childs_pid(monkeypatch) -> None:
+    """It must be INCAPABLE of selecting an unrelated victim.
+
+    The only pid it may read is the one it was handed. Nothing else in the container -- the
+    worker itself, a sibling katana, a Chromium screenshot instance -- is even observed, so
+    there is no pid it could act on but this one.
+    """
+    _raw, procs, sampled = _run_watched(
+        monkeypatch, [10 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    assert sampled, "nothing was sampled"
+    assert set(sampled) <= {p.pid for p in procs}
+    assert 4242 in set(sampled)
+
+
+# --- 12.4 the outcome: resource-limited, DISTINCT reason, never a timeout ------------------
+
+def test_rss_kill_is_recorded_with_the_jsluice_rss_reason(monkeypatch) -> None:
+    """The reason is `jsluice_rss`, distinct from the output budgets AND from a timeout."""
+    raw, _procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    assert katana_runner.JSLUICE_RSS_LIMIT_REASON == "jsluice_rss"
+    assert f"reason={katana_runner.JSLUICE_RSS_LIMIT_REASON}" in raw.stderr
+    assert "exit=resource_limited" in raw.stderr
+    assert "jsluice_rss_limit_tripped=True" in raw.command
+    assert f"jsluice_rss_reason={katana_runner.JSLUICE_RSS_LIMIT_REASON}" in raw.command
+
+
+def test_rss_kill_is_not_classified_as_a_timeout(monkeypatch) -> None:
+    """NOT a timeout. An operator told 'timed out' would raise a deadline that was never the
+    constraint, and would leave the memory runaway exactly where it was."""
+    raw, _procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    assert raw.timed_out is False
+    assert "timed out" not in raw.stderr
+
+
+def test_rss_kill_does_not_wait_for_the_per_target_deadline(monkeypatch) -> None:
+    """It fires on the SAMPLE, not on the clock.
+
+    The per-target deadline here is hundreds of seconds; this completes in milliseconds, which
+    is only possible if the watchdog -- not the deadline -- ended the run.
+    """
+    started = time.monotonic()
+    raw, _procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    elapsed = time.monotonic() - started
+    assert "exit=resource_limited" in raw.stderr
+    assert katana_runner.compute_per_target_timeout(None) > 100, "no deadline to outrun"
+    assert elapsed < 30, f"the run waited on a deadline rather than the watchdog ({elapsed}s)"
+
+
+def test_rss_kill_is_never_a_successful_completed_run(monkeypatch) -> None:
+    """A contained runaway is PARTIAL. It must never read as a clean crawl."""
+    raw, _procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    assert raw.exit_code != 0
+    assert "0 completed" in raw.stderr
+    assert classify_run(katana_runner.KatanaRunner(), raw, produced_findings=True) == "partial"
+
+
+def test_rss_kill_summary_names_the_memory_ceiling_not_an_output_budget(monkeypatch) -> None:
+    """The remedy differs: drop -jsluice for this target, do NOT raise an output cap."""
+    raw, _procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    assert "-jsluice memory ceiling" in raw.stderr
+    assert "NOT proven absent" in raw.stderr
+
+
+# --- 12.5 partial output survives, and the process is fully reaped -------------------------
+
+def test_partial_stdout_is_preserved_across_an_rss_kill(monkeypatch) -> None:
+    """The URLs crawled before the ceiling are kept and remain parseable downstream."""
+    raw, _procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 3 * GIB], config={"jsluice": True},
+        stdout_chunks=(b"https://partial.example/1\nhttps://partial.example/2\n",),
+    )
+    assert "https://partial.example/1" in raw.stdout
+    assert "https://partial.example/2" in raw.stdout
+    values = {f.value for f in katana_runner.KatanaRunner().parse(raw)}
+    assert "https://partial.example/1" in values
+    assert "https://partial.example/2" in values
+
+
+def test_the_rss_killed_process_is_fully_reaped(monkeypatch) -> None:
+    """No zombie, no orphan: termination goes through the existing terminate_and_reap."""
+    _raw, procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    assert procs[0].killed >= 1
+    assert procs[0].reaped, "the process was killed but never reaped"
+    assert procs[0].returncode is not None
+
+
+def test_peak_rss_is_recorded_for_reproducibility(monkeypatch) -> None:
+    """The provenance record carries the number the ceiling was compared against."""
+    raw, _procs, _sampled = _run_watched(
+        monkeypatch, [48 * MIB, 700 * MIB, 3 * GIB], config={"jsluice": True},
+    )
+    assert "peak_rss_bytes=" in raw.command
+    assert "peak_rss_bytes=unmeasured" not in raw.command
+    assert "peak RSS" in raw.stderr
+
+
+# --- 12.6 failure modes of the MONITOR ITSELF must be safe ---------------------------------
+
+def test_a_process_disappearing_mid_sample_is_handled_safely(monkeypatch) -> None:
+    """The child exits between the decision to sample and the read: None, not a crash."""
+    # The real read path against a pid that cannot exist -- not the injected one.
+    assert base.read_process_rss_bytes(2_147_483_646) is None
+
+    raw, procs = _run_healthy(monkeypatch, lambda pid: None, config={"jsluice": True})
+    assert raw.exit_code == 0, "a vanished process was treated as a failure"
+    assert "exit=resource_limited" not in raw.stderr
+    assert procs[0].killed == 0
+    assert "peak_rss_bytes=unmeasured" in raw.command
+
+
+def test_an_rss_read_failure_can_never_kill_anything(monkeypatch) -> None:
+    """A watchdog that killed on a failed read would be worse than the bug it guards against.
+
+    Every read fails for the whole run here. The process must be left entirely alone, and the
+    run must be indistinguishable from one where no guard was armed.
+    """
+    raw, procs = _run_healthy(monkeypatch, lambda pid: None, config={"jsluice": True})
+    assert procs[0].killed == 0
+    assert procs[0].returncode == 0
+    assert "exit=resource_limited" not in raw.stderr
+    assert raw.exit_code == 0
+
+
+def test_rss_reader_never_raises_on_an_unreadable_pid() -> None:
+    """Its contract is 'returns None, never raises', for every failure mode."""
+    for pid in (-1, 0, 2_147_483_646):
+        assert base.read_process_rss_bytes(pid) is None
+
+
+def test_rss_reader_parses_a_real_proc_status_shape(tmp_path, monkeypatch) -> None:
+    """The VmRSS line is parsed in kB and returned in bytes."""
+    status = tmp_path / "status"
+    status.write_text(
+        "Name:\tkatana\nState:\tR (running)\nVmPeak:\t 4194304 kB\nVmRSS:\t 1048576 kB\n"
+    )
+    real_open = open
+
+    def _fake_open(path, *a, **kw):
+        if str(path) == "/proc/424242/status":
+            return real_open(status, *a, **kw)
+        return real_open(path, *a, **kw)  # pragma: no cover
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert base.read_process_rss_bytes(424242) == 1048576 * 1024
+
+
+def test_rss_reader_returns_none_for_a_malformed_vmrss_line(tmp_path, monkeypatch) -> None:
+    """Garbage is 'no information', not an exception and above all not a kill."""
+    status = tmp_path / "status"
+    status.write_text("Name:\tkatana\nVmRSS:\tnot-a-number kB\n")
+    real_open = open
+
+    def _fake_open(path, *a, **kw):
+        if str(path) == "/proc/424243/status":
+            return real_open(status, *a, **kw)
+        return real_open(path, *a, **kw)  # pragma: no cover
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert base.read_process_rss_bytes(424243) is None
+
+
+def test_an_invalid_rss_ceiling_is_rejected_before_any_process_spawns(monkeypatch) -> None:
+    """A safety control validated like the others: 0 must not be read as 'unlimited'."""
+    spawned: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        spawned.append(command)
+        return _FakeProc(stdout=[b""], returncode=0)
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    with pytest.raises(katana_runner.KatanaBudgetError):
+        asyncio.run(katana_runner.KatanaRunner().run(
+            "https://target.example",
+            {"jsluice": True, "jsluice_max_rss_bytes": 0}, []))
+    assert spawned == []
+
+
+# --- 12.7 the ceiling and the interval are the MEASURED values -----------------------------
+
+def test_the_rss_ceiling_sits_far_below_the_worker_cgroup() -> None:
+    """1 GiB against a ~4096 MiB worker cgroup.
+
+    A ceiling near 4 GiB would trip at the same moment the kernel does -- i.e. it would be no
+    ceiling at all. This pins the HEADROOM, not just the number: the worker's Python process,
+    Redis/Celery state, other per-target buffers and kernel page accounting all live under the
+    same wall, so katana's share is not the wall.
+    """
+    assert katana_runner.JSLUICE_MAX_RSS_BYTES == 1024 * 1024 * 1024
+    worker_cgroup = 4096 * MIB
+    assert katana_runner.JSLUICE_MAX_RSS_BYTES <= worker_cgroup // 4
+    # And far enough ABOVE a healthy run (~75 MiB measured) not to truncate real crawls.
+    assert katana_runner.JSLUICE_MAX_RSS_BYTES >= 10 * 75 * MIB
+
+
+def test_sampling_interval_is_sized_for_the_measured_growth_rate() -> None:
+    """~660 MiB/s was measured (48 -> 3695 MiB in 5.5s).
+
+    The worst-case overshoot between the last sample below the ceiling and the one that trips
+    it is rate x interval, and it has to stay small against the headroom below the wall --
+    otherwise the ceiling is nominal and the kernel still wins the race.
+    """
+    interval = base.RSS_SAMPLE_INTERVAL_SECONDS
+    assert 0 < interval <= 0.5, "too coarse to catch a ~660 MiB/s runaway"
+    overshoot = 660 * MIB * interval
+    headroom = 4096 * MIB - katana_runner.JSLUICE_MAX_RSS_BYTES
+    assert overshoot < headroom / 4
+
+
+# --- 12.8 NOTHING ELSE MOVED ---------------------------------------------------------------
+
+def test_existing_url_and_stdout_budgets_are_unchanged_by_the_watchdog(monkeypatch) -> None:
+    """The 10,000 URL and 5 MiB limits are exactly what the earlier validation exercised."""
+    assert katana_runner.MAX_URLS_PER_TARGET == 10_000
+    assert katana_runner.MAX_STDOUT_BYTES_PER_TARGET == 5 * 1024 * 1024
+    for cfg in ({}, {"jsluice": True}):
+        raw, _captured = _run_katana(monkeypatch, stdout=[b""], config=cfg)
+        assert "max_urls_per_target=10000" in raw.command
+        assert "max_stdout_bytes_per_target=5242880" in raw.command
+
+
+def test_js_crawl_stays_enabled_with_the_watchdog_armed(monkeypatch) -> None:
+    """-js-crawl is the source of the measured coverage and is NOT what this change touches."""
+    for cfg in ({}, {"jsluice": True}):
+        _raw, captured = _run_katana(monkeypatch, stdout=[b""], config=cfg)
+        assert "-js-crawl" in captured["command"]
+
+
+def test_the_watchdog_introduces_no_argv_change_at_all(monkeypatch) -> None:
+    """THE invariant: argv still differs ONLY by -jsluice. The RSS guard is runner-side."""
+    _raw_off, off = _run_katana(monkeypatch, stdout=[b""])
+    _raw_on, on = _run_katana(monkeypatch, stdout=[b""], config={"jsluice": True})
+    assert [c for c in on["command"] if c != "-jsluice"] == off["command"]
+    assert on["command"].count("-jsluice") == 1
+    # And nothing named after the guard leaked into argv.
+    for arg in on["command"]:
+        assert "rss" not in arg.lower()
+
+
+def test_one_process_per_target_isolation_survives_the_watchdog(monkeypatch) -> None:
+    """Process isolation is the mechanism the watchdog plugs INTO, not one it replaces."""
+    urls = [f"https://h{i}.example" for i in range(4)]
+    procs: list = []
+
+    async def _fake_exec(*command, **kwargs):
+        proc = _HealthyProc(5000 + len(procs))
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(katana_runner.asyncio, "create_subprocess_exec", _fake_exec)
+    _arm(monkeypatch, lambda pid: 50 * MIB)
+    asyncio.run(katana_runner.KatanaRunner().run(
+        "https://target.example", {"jsluice": True}, _targets(*urls)))
+
+    assert len(procs) == 4, "one process per target no longer holds"
+    assert [p.stdin.written.decode() for p in procs] == urls
+
+
+def test_the_default_path_reports_no_rss_guard_in_provenance(monkeypatch) -> None:
+    """jsluice=False must still be describable as the untouched, measured-safe path."""
+    raw, _captured = _run_katana(monkeypatch, stdout=[b""])
+    assert "jsluice=False" in raw.command
+    assert "jsluice_rss_limit_enabled=False" in raw.command
+    assert "jsluice_rss_limit_tripped=False" in raw.command
+    assert "jsluice_rss_reason=none" in raw.command

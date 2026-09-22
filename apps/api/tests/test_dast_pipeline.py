@@ -144,7 +144,12 @@ def test_nuclei_dast_requires_active_testing_and_reuses_nuclei_parsing() -> None
     findings = NucleiDastRunner().parse_vulnerabilities(raw)
     assert len(findings) == 1
     assert findings[0].severity == "high"
-    assert findings[0].category == "CWE-89"
+    # Prompt 23 canonicalises CWE ids to the single lower-case `cwe-<id>` spelling that the
+    # ATT&CK and compliance catalogues are keyed by (taxonomy.canonical_cwe). This assertion
+    # still read "CWE-89" -- the tool's own spelling -- and so had been failing since that
+    # change landed; the scanner-native form is preserved separately in metadata below.
+    assert findings[0].category == "cwe-89"
+    assert findings[0].metadata["cwe_reported"] == "CWE-89"
 
 
 def test_registry_has_dast_pipeline_in_order() -> None:

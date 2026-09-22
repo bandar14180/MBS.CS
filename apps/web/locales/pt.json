@@ -1,5 +1,7 @@
 {
-  "common": { "language": "Idioma" },
+  "common": {
+    "language": "Idioma"
+  },
   "nav": {
     "services": "Serviços",
     "agents": "Agentes de IA",
@@ -22,22 +24,58 @@
   "services": {
     "title": "Segurança corporativa, automatizada",
     "subtitle": "Uma plataforma de avaliação completa impulsionada por IA — em web, API, nuvem e rede.",
-    "aiPentest": { "title": "Teste de intrusão com IA", "desc": "Agentes autônomos planejam, executam e validam avaliações de ponta a ponta." },
-    "web": { "title": "Segurança de aplicações web", "desc": "Detecte o OWASP Top 10 e falhas de lógica de negócio nas suas aplicações web." },
-    "api": { "title": "Avaliação de segurança de API", "desc": "Descubra e teste endpoints REST quanto a riscos de autenticação, exposição e injeção." },
-    "cloud": { "title": "Avaliação de segurança em nuvem", "desc": "Avalie contas de nuvem quanto a configurações incorretas e exposição na AWS." },
-    "network": { "title": "Teste de segurança de rede", "desc": "Descoberta de portas, serviços e versões com reconhecimento de rede aprofundado." },
-    "vuln": { "title": "Análise de vulnerabilidades", "desc": "A IA correlaciona, prioriza e deduplica descobertas pelo risco real de negócio." },
-    "reporting": { "title": "Relatórios de segurança", "desc": "Relatórios executivos e técnicos com CVSS, evidências e etapas de remediação." }
+    "aiPentest": {
+      "title": "Teste de intrusão com IA",
+      "desc": "Agentes autônomos planejam, executam e validam avaliações de ponta a ponta."
+    },
+    "web": {
+      "title": "Segurança de aplicações web",
+      "desc": "Detecte o OWASP Top 10 e falhas de lógica de negócio nas suas aplicações web."
+    },
+    "api": {
+      "title": "Avaliação de segurança de API",
+      "desc": "Descubra e teste endpoints REST quanto a riscos de autenticação, exposição e injeção."
+    },
+    "cloud": {
+      "title": "Avaliação de segurança em nuvem",
+      "desc": "Avalie contas de nuvem quanto a configurações incorretas e exposição na AWS."
+    },
+    "network": {
+      "title": "Teste de segurança de rede",
+      "desc": "Descoberta de portas, serviços e versões com reconhecimento de rede aprofundado."
+    },
+    "vuln": {
+      "title": "Análise de vulnerabilidades",
+      "desc": "A IA correlaciona, prioriza e deduplica descobertas pelo risco real de negócio."
+    },
+    "reporting": {
+      "title": "Relatórios de segurança",
+      "desc": "Relatórios executivos e técnicos com CVSS, evidências e etapas de remediação."
+    }
   },
   "agents": {
     "title": "Cinco agentes de IA autônomos. Um único pipeline.",
     "subtitle": "Cada avaliação percorre uma cadeia coordenada de agentes de IA especializados — da descoberta a um relatório pronto para a diretoria.",
-    "recon": { "title": "Agente de reconhecimento", "desc": "Descoberta de ativos, análise de domínio, detecção de tecnologia e mapeamento da superfície de ataque." },
-    "vulnAnalysis": { "title": "Agente de análise de vulnerabilidades", "desc": "Analisa fraquezas, identifica vulnerabilidades e as prioriza por risco." },
-    "validation": { "title": "Agente de validação de segurança", "desc": "Valida descobertas e reduz falsos positivos antes que cheguem a você." },
-    "risk": { "title": "Agente de avaliação de risco", "desc": "Calcula o risco e explica o impacto no negócio em linguagem clara." },
-    "report": { "title": "Agente de geração de relatórios", "desc": "Gera automaticamente relatórios de segurança profissionais alinhados aos frameworks." },
+    "recon": {
+      "title": "Agente de reconhecimento",
+      "desc": "Descoberta de ativos, análise de domínio, detecção de tecnologia e mapeamento da superfície de ataque."
+    },
+    "vulnAnalysis": {
+      "title": "Agente de análise de vulnerabilidades",
+      "desc": "Analisa fraquezas, identifica vulnerabilidades e as prioriza por risco."
+    },
+    "validation": {
+      "title": "Agente de validação de segurança",
+      "desc": "Valida descobertas e reduz falsos positivos antes que cheguem a você."
+    },
+    "risk": {
+      "title": "Agente de avaliação de risco",
+      "desc": "Calcula o risco e explica o impacto no negócio em linguagem clara."
+    },
+    "report": {
+      "title": "Agente de geração de relatórios",
+      "desc": "Gera automaticamente relatórios de segurança profissionais alinhados aos frameworks."
+    },
     "flow": {
       "target": "Alvo",
       "recon": "Reconhecimento",
@@ -51,10 +89,22 @@
   "trust": {
     "title": "Feito para empresas que não podem errar em segurança",
     "subtitle": "Segurança e confiança são projetadas no núcleo — não adicionadas depois.",
-    "isolation": { "title": "Isolamento no nível do banco de dados", "desc": "A segurança em nível de linha impõe isolamento rígido de inquilinos em cada registro." },
-    "authorization": { "title": "Autorização em primeiro lugar", "desc": "Nenhuma varredura é executada sem prova verificada de propriedade do alvo." },
-    "evidence": { "title": "Comprovado por evidências", "desc": "Cada descoberta é rastreada até evidências brutas armazenadas e protegidas por checksums." },
-    "frameworks": { "title": "Alinhado a frameworks", "desc": "As descobertas são mapeadas para controles OWASP, NIST, ISO 27001 e PCI DSS." }
+    "isolation": {
+      "title": "Isolamento no nível do banco de dados",
+      "desc": "A segurança em nível de linha impõe isolamento rígido de inquilinos em cada registro."
+    },
+    "authorization": {
+      "title": "Autorização em primeiro lugar",
+      "desc": "Nenhuma varredura é executada sem prova verificada de propriedade do alvo."
+    },
+    "evidence": {
+      "title": "Comprovado por evidências",
+      "desc": "Cada descoberta é rastreada até evidências brutas armazenadas e protegidas por checksums."
+    },
+    "frameworks": {
+      "title": "Alinhado a frameworks",
+      "desc": "As descobertas são mapeadas para controles OWASP, NIST, ISO 27001 e PCI DSS."
+    }
   },
   "cta": {
     "title": "Pronto para automatizar suas avaliações de segurança?",
@@ -137,7 +187,10 @@
     "back": "Projetos",
     "tabTargets": "Alvos",
     "tabScans": "Varreduras",
+    "tabAssets": "Ativos",
     "tabVulnerabilities": "Vulnerabilidades",
+    "tabRemediation": "Remediação",
+    "tabAssessments": "Avaliações",
     "tabReports": "Relatórios"
   },
   "targets": {
@@ -163,6 +216,12 @@
     "newScan": "Nova varredura",
     "target": "Alvo",
     "modules": "Módulos",
+    "selectAll": "Selecionar tudo",
+    "clearAll": "Limpar tudo",
+    "findsVulns": "detecta vulnerabilidades",
+    "toolUnavailable": "não instalado",
+    "toolUnavailableHint": "O binário `{binary}` não está no PATH do worker de varredura. Selecionar esta ferramenta registará uma execução falhada e não produzirá resultados.",
+    "vulnToolsNote": "Apenas o nuclei e o nuclei-dast podem reportar vulnerabilidades; as outras ferramentas inventariam ativos (subdomínios, portas, URLs). Uma varredura sem eles termina com uma lista de vulnerabilidades vazia porque nada foi testado — e não porque o alvo esteja limpo.",
     "active": "ativo",
     "activeNote": "Módulos ativos exigem um alvo com autorização de teste ativo.",
     "useAiPlanner": "Usar planejador de IA",
@@ -190,15 +249,23 @@
     "sNotApplicable": "Não aplicável a este tipo de alvo",
     "sNotRun": "Não executado (uma etapa anterior falhou)",
     "sSkippedUnauth": "Ignorado (não autorizado)",
-    "stageSubfinder": "Reconhecimento — Subdomínios",
-    "stageHttpx": "Hosts Ativos",
-    "stageNaabu": "Varredura de Portas",
-    "stageNmap": "Detecção de Serviços",
-    "stageNuclei": "Varredura de Vulnerabilidades",
     "fixDns": "O nome do host do alvo não pôde ser resolvido. Verifique se o domínio/host está escrito corretamente e é resolvível publicamente (tem registros DNS).",
     "fixTimeout": "A ferramenta expirou. O alvo pode estar lento, limitando a taxa ou filtrando o tráfego — tente novamente ou reduza o escopo.",
     "fixRefused": "O alvo recusou a conexão ou está inacessível a partir do scanner. Confirme que está online e acessível.",
-    "fixGeneric": "Revise o erro da ferramenta acima e a configuração do alvo, depois execute a varredura novamente."
+    "fixGeneric": "Revise o erro da ferramenta acima e a configuração do alvo, depois execute a varredura novamente.",
+    "sPartial": "Parcial — cobertura incompleta",
+    "stageSubfinder": "Reconhecimento — Subdomínios",
+    "stageAmass": "Reconhecimento — Superfície de Ataque",
+    "stageDnsx": "Resolução DNS",
+    "stageHttpx": "Hosts Ativos",
+    "stageWhatweb": "Impressão Tecnológica",
+    "stageNaabu": "Varredura de Portas",
+    "stageNmap": "Detecção de Serviços",
+    "stageKatana": "Descoberta de Conteúdo",
+    "stageFfuf": "Fuzzing de Diretórios",
+    "stageArjun": "Descoberta de Parâmetros",
+    "stageNuclei": "Varredura de Vulnerabilidades",
+    "stageNucleiDast": "Testes Web Ativos"
   },
   "vulns": {
     "severity": "Gravidade",

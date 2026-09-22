@@ -54,11 +54,64 @@ SEVERITY_COLORS = {
     "info": "#4b5563",
 }
 
+# --- Verification / confidence chip colours (Phase 4.1) -----------------------------------
+# A DELIBERATELY SEPARATE AXIS FROM SEVERITY.
+#
+# Verification answers "was this demonstrated?"; severity answers "how bad would it be?".
+# They are independent (verification.py never reads severity, CVSS or risk, and never alters
+# them), so painting verification in the SEVERITY palette would imply a relationship that does
+# not exist -- a red "Unverified" chip beside a red CRITICAL severity reads as one escalating
+# signal rather than two orthogonal facts.
+#
+# These are therefore blue-greys and a single confirmatory green: VERIFIED is the only state
+# that earns a positive colour, because it is the only one backed by two independent artefact
+# kinds. Partially verified and unverified are deliberately NEUTRAL -- an unverified finding is
+# not a false positive and must not be painted as "safe", nor as "dangerous".
+#
+# Keyed by verification.py's own state constants, so a new state cannot silently fall through
+# to a default (see render._verification_chip_colors, which fails to MUTED and is tested).
+#
+# Every value below is DISJOINT from SEVERITY_COLORS and from CONFIDENCE_COLORS, and none is
+# MUTED -- MUTED is reserved as the fail-safe for an unrecognised state, so a real state must
+# never coincide with it (that is what makes the "unknown never looks confirmatory" guarantee
+# observable). Both properties are asserted by test_report_assurance_chips.py.
+VERIFICATION_COLORS = {
+    "verified": "#15803d",            # green: corroborated from two directions
+    "partially_verified": "#1d4ed8",  # indigo: artefacts captured, not proof
+    "unverified": "#57534e",          # warm slate: a pattern match awaiting validation
+}
+VERIFICATION_BG = {
+    "verified": "#e6f2ea",
+    "partially_verified": "#e7f1f8",
+    "unverified": "#f3f4f6",
+}
+
+# Confidence is a THIRD axis: how much the signal is worth, independent of whether it was
+# proven. Rendered in a muted amber ramp so it is visually distinguishable from BOTH severity
+# (reds/oranges at full saturation) and verification (greens/blues) at a glance.
+CONFIDENCE_COLORS = {
+    "high": "#4d7c0f",    # olive
+    "medium": "#a16207",  # ochre
+    "low": "#92400e",     # deep amber -- distinct from severity medium (#b45309)
+}
+
 # Security-score band colours, keyed to render._score_band's existing labels. The BANDS
 # THEMSELVES are not defined here -- scoring semantics stay in scoring.py / _score_band.
+#
+# R-04. The 70-89 key read "Moderate" while _score_band has emitted "Fair" since the original
+# Reporting Engine (Step 10, 2026-07-27); this table arrived with the branding redesign
+# (2026-09-07) and mis-keyed that one band, so every score in 70-89 fell through to MUTED grey.
+# Latent only because score_band_color() has never had a call site -- it was wrong from birth.
+#
+# CORRECTED TOWARD "Fair", NOT by renaming the band, because "Fair" is the established
+# contract: it is what _score_band returns, what every rendered PDF has printed for over a
+# month, and what assessment.service freezes into the IMMUTABLE risk_assessments.score_band
+# snapshot column. Renaming the band would change a client-facing value that an issued
+# assessment promises never changes. The comment directly above states the intended direction
+# ("keyed to render._score_band's existing labels") -- this restores it.
 SCORE_BAND_COLORS = {
     "Strong": "#15803d",
-    "Moderate": "#b45309",
+    "Fair": "#b45309",
     "Weak": "#c2410c",
     "Critical": "#b91c1c",
 }
@@ -70,6 +123,24 @@ def severity_color(severity: str | None) -> str:
 
 def score_band_color(band: str | None) -> str:
     return SCORE_BAND_COLORS.get((band or "").strip(), MUTED)
+
+
+def verification_color(state: str | None) -> str:
+    """Ink colour for a verification chip. Unknown state -> MUTED, never a positive colour.
+
+    Fails toward the neutral grey for the same reason verification.py fails toward UNVERIFIED:
+    an unrecognised state must never be painted as if it had been demonstrated."""
+    return VERIFICATION_COLORS.get((state or "").strip().lower(), MUTED)
+
+
+def verification_bg(state: str | None) -> str:
+    """Chip fill for a verification state. Unknown -> the neutral band."""
+    return VERIFICATION_BG.get((state or "").strip().lower(), BAND)
+
+
+def confidence_color(level: str | None) -> str:
+    """Ink colour for a confidence chip. Unknown level -> MUTED."""
+    return CONFIDENCE_COLORS.get((level or "").strip().lower(), MUTED)
 
 
 def logo_drawing(size: float):

@@ -9,46 +9,51 @@ runner -- most consequentially ffuf, whose timeout is PER TARGET. A value <= 0 m
 timeout", same as unset.
 
 The tests drive the real `NucleiRunner.run()` with a stubbed `create_subprocess_exec`, and
-observe WHETHER `asyncio.wait_for` was used and with WHAT timeout -- so the no-timeout path
-(bare `communicate()`, no `wait_for`) is asserted directly rather than inferred.
+observe WHAT timeout value nuclei_runner passes to `run_with_timeout` (F2-05: the runner was
+migrated from a bare `asyncio.wait_for(proc.communicate(), ...)` idiom to the shared
+`run_with_timeout` helper so a timeout preserves partial output; the no-timeout contract
+below -- `timeout_seconds=None` reaching `run_with_timeout` -- is unchanged by that move,
+since `run_with_timeout` itself treats `None`/`<=0` as "no wall-clock cap").
 """
 import asyncio
 
 from apps.api.modules.scans.service import ALLOWED_TOOL_CONFIG_KEYS
 from apps.api.scanner_engine.tool_runners import nuclei_runner
+from apps.api.scanner_engine.tool_runners.base import TimedRun
 from apps.api.scanner_engine.tool_runners.nuclei_runner import NucleiRunner
 
-# Sentinel distinguishing "wait_for was never called" (the no-timeout path) from any real
-# timeout value that could be passed to it.
-_NO_WAIT_FOR = object()
+# Sentinel: no test here observes an actual "wait_for was never called" state any more
+# (run_with_timeout is always called; it internally decides whether to apply a deadline), so
+# this now just names "no timeout value was passed" for readability at call sites below.
+_NO_WAIT_FOR = None
 
 
 def _capture(monkeypatch) -> dict:
-    """Run NucleiRunner.run() against a stub subprocess and record how the tool was awaited:
-    `seen['timeout']` is the value passed to asyncio.wait_for, or _NO_WAIT_FOR if the runner
-    awaited proc.communicate() directly (the no-timeout path)."""
+    """Run NucleiRunner.run() against a stub subprocess and record the `timeout` value
+    nuclei_runner passed to `run_with_timeout` -- None means no wall-clock cap."""
     seen: dict = {"timeout": _NO_WAIT_FOR}
 
     class _Proc:
         returncode = 0
-
-        async def communicate(self, input=None):  # noqa: A002 -- matches asyncio's signature
-            return b"", b""
+        stdout = None
+        stderr = None
+        stdin = None
 
         def kill(self):
             pass
 
+        async def wait(self):
+            return 0
+
     async def _fake_exec(*_a, **_k):
         return _Proc()
 
-    real_wait_for = asyncio.wait_for
-
-    async def _spy_wait_for(awaitable, timeout):
+    async def _spy_run_with_timeout(proc, timeout, tool="", *, stdin=None):
         seen["timeout"] = timeout
-        return await real_wait_for(awaitable, timeout)
+        return TimedRun(stdout="", stderr="", timed_out=False, exit_code=0)
 
     monkeypatch.setattr(nuclei_runner.asyncio, "create_subprocess_exec", _fake_exec)
-    monkeypatch.setattr(nuclei_runner.asyncio, "wait_for", _spy_wait_for)
+    monkeypatch.setattr(nuclei_runner, "run_with_timeout", _spy_run_with_timeout)
     return seen
 
 
@@ -147,30 +152,18 @@ def test_orchestration_and_safety_keys_are_still_not_tunable():
 
 def test_cancellation_terminates_the_subprocess_and_re_raises(monkeypatch):
     """asyncio.CancelledError (scan revoke / warm shutdown) must reap the process and then
-    propagate -- unchanged by the no-timeout work."""
-    reaped: dict = {"called": False}
-
-    class _HangingProc:
-        returncode = None
-
-        async def communicate(self, input=None):  # noqa: A002
-            await asyncio.sleep(60)
-
-        def kill(self):
-            self.returncode = -9
+    propagate -- unchanged by the F2-05 migration to run_with_timeout, which itself
+    guarantees this (see test_tool_timeouts.test_cancellation_kills_process_and_propagates);
+    this test pins that NucleiRunner.run() still surfaces it end to end."""
+    from apps.api.tests.test_tool_timeouts import _FakeProc
 
     async def _fake_exec(*_a, **_k):
-        return _HangingProc()
-
-    async def _fake_reap(proc, tool="", **_k):
-        reaped["called"] = True
-        return b"", b""
+        return _FakeProc([(60, b"slow\n")])
 
     monkeypatch.setattr(nuclei_runner.asyncio, "create_subprocess_exec", _fake_exec)
-    monkeypatch.setattr(nuclei_runner, "terminate_and_reap", _fake_reap)
 
     async def _scenario():
-        # No timeout configured, so the runner awaits communicate() directly; cancel it.
+        # No timeout configured, so run_with_timeout awaits the pumps directly; cancel it.
         task = asyncio.ensure_future(NucleiRunner().run("example.com", {}, []))
         await asyncio.sleep(0.05)
         task.cancel()
@@ -180,23 +173,15 @@ def test_cancellation_terminates_the_subprocess_and_re_raises(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(_scenario())
-    assert reaped["called"], "terminate_and_reap must run on cancellation"
 
 
 def test_explicit_timeout_expiry_names_the_knob_and_the_value(monkeypatch):
     """When an EXPLICIT positive timeout expires, the tool run is reported with the knob to
     raise and the value that applied -- the old bare 'timed out' said neither."""
-    class _HangingProc:
-        returncode = None
-
-        async def communicate(self, input=None):  # noqa: A002
-            await asyncio.sleep(60)
-
-        def kill(self):
-            self.returncode = -9
+    from apps.api.tests.test_tool_timeouts import _FakeProc
 
     async def _fake_exec(*_a, **_k):
-        return _HangingProc()
+        return _FakeProc([(60, b"slow\n")])
 
     monkeypatch.setattr(nuclei_runner.asyncio, "create_subprocess_exec", _fake_exec)
 
@@ -205,3 +190,20 @@ def test_explicit_timeout_expiry_names_the_knob_and_the_value(monkeypatch):
     assert "timed out" in raw.stderr.lower()          # kept: existing callers match on this
     assert "0.2" in raw.stderr                        # the value that actually applied
     assert "nuclei_timeout_seconds" in raw.stderr     # the knob to raise
+
+
+def test_timeout_preserves_partial_output(monkeypatch):
+    """F2-05: nuclei is one of the 9 runners migrated to run_with_timeout specifically so a
+    timeout no longer discards output already produced -- this is the regression the whole
+    prompt exists to close for nuclei, called out by name as the most consequential case."""
+    from apps.api.tests.test_tool_timeouts import _FakeProc
+
+    async def _fake_exec(*_a, **_k):
+        return _FakeProc([(0, b'{"template-id":"x"}\n'), (10, b"never\n")])
+
+    monkeypatch.setattr(nuclei_runner.asyncio, "create_subprocess_exec", _fake_exec)
+
+    raw = asyncio.run(NucleiRunner().run("example.com", {"nuclei_timeout_seconds": 0.2}, []))
+    assert raw.exit_code == -1
+    assert '"template-id":"x"' in raw.stdout
+    assert "never" not in raw.stdout

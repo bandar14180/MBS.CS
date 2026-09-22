@@ -9,7 +9,7 @@ Real Postgres via a self-managed session (scans is RLS-exempt, like the worker p
 """
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,6 +24,7 @@ from apps.api.modules.scans.models import Scan
 from apps.api.modules.users.models import User
 from apps.api.modules.workspaces.models import Workspace
 from apps.api.scanner_engine.orchestrator import _claim_scan, _execution_stop_reason, _finalize_status
+from apps.api.core import tenancy
 
 NOW = datetime.now(timezone.utc)
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -43,6 +44,11 @@ async def _seed_scan(session, status, execution_token=None):
     ws = Workspace(name="sd-ws", owner_user_id=user.id)
     session.add(ws)
     await session.flush()
+    # Bind the just-created workspace before inserting rows into it -- the same step
+    # production takes in workspaces.service.create_workspace, and required by the INSERT
+    # guard in core/tenancy.py (an ORM flush INSERT bypasses the SELECT/UPDATE/DELETE
+    # filter, so tenant-scoped writes are validated separately and fail closed).
+    tenancy.bind_workspace(ws.id)
     project = Project(workspace_id=ws.id, name="sd-proj", created_by=user.id)
     session.add(project)
     await session.flush()
@@ -200,7 +206,11 @@ def test_backward_compatible_task_routing_and_disable_semantics():
     conf = celery_app.conf
     # Unchanged routing / queues (pre-1.5 behavior).
     assert conf.task_default_queue == "default"
-    assert conf.task_routes["scans.run_scan"] == {"queue": "scans"}
+    # MBS.SC Phase 5: the scan queue was RENAMED "scans" -> "scans.public" when private
+    # scanning gained its own per-site queues. The property this assertion protects is
+    # unchanged -- scans still route to a dedicated queue, away from `default` -- and the
+    # DEFAULT route is deliberately the PUBLIC queue, the one with the least authority.
+    assert conf.task_routes["scans.run_scan"] == {"queue": "scans.public"}
     # Unchanged task identity / DLQ.
     from apps.api.celery_app.tasks.scan_tasks import DLQ_KEY
 
@@ -593,7 +603,7 @@ def test_shutdown_signal_is_wired_and_celery_reliability_config_intact():
     assert conf.task_acks_late is True             # redelivery on worker loss
     assert conf.task_reject_on_worker_lost is True
     assert conf.worker_prefetch_multiplier == 1
-    assert conf.task_routes["scans.run_scan"] == {"queue": "scans"}   # routing untouched
+    assert conf.task_routes["scans.run_scan"] == {"queue": "scans.public"}  # MBS.SC rename
 
 
 # --- STEP 4: the complete shutdown -> requeue -> redelivery -> claim -> execute path -------
@@ -1068,7 +1078,7 @@ def test_revoked_executor_stops_before_launching_another_tool(monkeypatch):
             async with maker() as s:
                 scan = await _seed_scan(s, "queued")
                 await s.execute(
-                    text("UPDATE scans SET started_at = NULL, config = :c ::jsonb WHERE id = :i"),
+                    text("UPDATE scans SET started_at = NULL, config = :c WHERE id = :i"),
                     {"c": '{"requested_modules": ["stub_a", "stub_b", "stub_c"]}', "i": str(scan.id)},
                 )
                 await s.commit()
@@ -1178,6 +1188,10 @@ def test_relay_ages_a_requeued_scan_off_the_requeue_not_its_creation():
     grace period to die first."""
     from apps.api.celery_app import shutdown
 
+    # Phase 0 MySQL cutover: was `now() - make_interval(secs => :a)` / `now() - make_interval(secs
+    # => :secs)` (Postgres-only). MySQL has no make_interval(); the cutoff timestamp is computed
+    # in Python and bound directly, mirroring the same fix in the production relay query
+    # (apps.api.celery_app.tasks.scan_tasks._relay_queued).
     async def scenario():
         engine = _engine()
         maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -1187,8 +1201,8 @@ def test_relay_ages_a_requeued_scan_off_the_requeue_not_its_creation():
                 scan = await _seed_owned_running_scan(s, uuid.uuid4())
                 # Created LONG ago -- under the old created_at rule this alone made it eligible.
                 await s.execute(
-                    text("UPDATE scans SET created_at = now() - make_interval(secs => :a) WHERE id = :i"),
-                    {"a": relay_secs * 10, "i": str(scan.id)},
+                    text("UPDATE scans SET created_at = :c WHERE id = :i"),
+                    {"c": datetime.now(timezone.utc) - timedelta(seconds=relay_secs * 10), "i": str(scan.id)},
                 )
                 await s.commit()
             await shutdown.requeue_scan(str(scan.id))
@@ -1197,18 +1211,20 @@ def test_relay_ages_a_requeued_scan_off_the_requeue_not_its_creation():
                 return text(
                     "SELECT count(*) FROM scans WHERE id = :i AND status = 'queued' "
                     "AND celery_task_id IS NULL "
-                    "AND coalesce(queued_at, created_at) < now() - make_interval(secs => :secs)"
+                    "AND coalesce(queued_at, created_at) < :cutoff"
                 )
 
             async with maker() as v:
-                just_requeued = await v.scalar(_eligible_sql(), {"i": str(scan.id), "secs": relay_secs})
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=relay_secs)
+                just_requeued = await v.scalar(_eligible_sql(), {"i": str(scan.id), "cutoff": cutoff})
                 # ...and once the relay interval has elapsed since the REQUEUE, it is eligible.
                 await v.execute(
-                    text("UPDATE scans SET queued_at = now() - make_interval(secs => :a) WHERE id = :i"),
-                    {"a": relay_secs + 60, "i": str(scan.id)},
+                    text("UPDATE scans SET queued_at = :q WHERE id = :i"),
+                    {"q": datetime.now(timezone.utc) - timedelta(seconds=relay_secs + 60), "i": str(scan.id)},
                 )
                 await v.commit()
-                after_interval = await v.scalar(_eligible_sql(), {"i": str(scan.id), "secs": relay_secs})
+                cutoff2 = datetime.now(timezone.utc) - timedelta(seconds=relay_secs)
+                after_interval = await v.scalar(_eligible_sql(), {"i": str(scan.id), "cutoff": cutoff2})
             return just_requeued, after_interval
         finally:
             await engine.dispose()
@@ -1221,6 +1237,8 @@ def test_relay_ages_a_requeued_scan_off_the_requeue_not_its_creation():
 def test_relay_still_recovers_a_never_dispatched_queued_scan():
     """NO REGRESSION to the relay's original purpose: a scan that was committed 'queued' but
     never got a task id is still recovered once it ages past the interval."""
+    # Phase 0 MySQL cutover: make_interval() replaced with a Python-computed cutoff, same as
+    # the previous test -- see its comment for why.
     async def scenario():
         engine = _engine()
         maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -1230,28 +1248,28 @@ def test_relay_still_recovers_a_never_dispatched_queued_scan():
                 scan = await _seed_scan(s, "queued")
                 await s.execute(
                     text("UPDATE scans SET celery_task_id = NULL, started_at = NULL, "
-                         "queued_at = now() - make_interval(secs => :a) WHERE id = :i"),
-                    {"a": relay_secs + 60, "i": str(scan.id)},
+                         "queued_at = :q WHERE id = :i"),
+                    {"q": datetime.now(timezone.utc) - timedelta(seconds=relay_secs + 60), "i": str(scan.id)},
                 )
                 await s.commit()
                 fresh = await s.scalar(
                     text("SELECT count(*) FROM scans WHERE id = :i AND status = 'queued' "
                          "AND celery_task_id IS NULL "
-                         "AND coalesce(queued_at, created_at) < now() - make_interval(secs => :secs)"),
-                    {"i": str(scan.id), "secs": relay_secs},
+                         "AND coalesce(queued_at, created_at) < :cutoff"),
+                    {"i": str(scan.id), "cutoff": datetime.now(timezone.utc) - timedelta(seconds=relay_secs)},
                 )
                 # legacy rows (queued_at NULL, pre-migration) must still fall back to created_at
                 await s.execute(
                     text("UPDATE scans SET queued_at = NULL, "
-                         "created_at = now() - make_interval(secs => :a) WHERE id = :i"),
-                    {"a": relay_secs + 60, "i": str(scan.id)},
+                         "created_at = :c WHERE id = :i"),
+                    {"c": datetime.now(timezone.utc) - timedelta(seconds=relay_secs + 60), "i": str(scan.id)},
                 )
                 await s.commit()
                 legacy = await s.scalar(
                     text("SELECT count(*) FROM scans WHERE id = :i AND status = 'queued' "
                          "AND celery_task_id IS NULL "
-                         "AND coalesce(queued_at, created_at) < now() - make_interval(secs => :secs)"),
-                    {"i": str(scan.id), "secs": relay_secs},
+                         "AND coalesce(queued_at, created_at) < :cutoff"),
+                    {"i": str(scan.id), "cutoff": datetime.now(timezone.utc) - timedelta(seconds=relay_secs)},
                 )
             return fresh, legacy
         finally:
@@ -1299,7 +1317,7 @@ def test_revocation_between_the_check_and_the_launch_still_blocks_the_tool(monke
             async with maker() as s:
                 scan = await _seed_scan(s, "queued")
                 await s.execute(
-                    text("UPDATE scans SET started_at = NULL, config = :c ::jsonb WHERE id = :i"),
+                    text("UPDATE scans SET started_at = NULL, config = :c WHERE id = :i"),
                     {"c": '{"requested_modules": ["gate_a", "gate_b"]}', "i": str(scan.id)},
                 )
                 await s.commit()
@@ -1416,7 +1434,7 @@ def test_broker_visibility_timeout_exceeds_the_hard_task_time_limit():
     assert celery_app.conf.task_acks_late is True
     assert celery_app.conf.task_reject_on_worker_lost is True
     assert celery_app.conf.worker_prefetch_multiplier == 1
-    assert celery_app.conf.task_routes["scans.run_scan"] == {"queue": "scans"}
+    assert celery_app.conf.task_routes["scans.run_scan"] == {"queue": "scans.public"}
 
 
 def test_ownership_writes_cannot_be_called_without_a_token():
@@ -1439,83 +1457,34 @@ def test_ownership_writes_cannot_be_called_without_a_token():
 
 # --- P1-1 corrections: migration backfill + reaper revocation ------------------------------
 
-def test_queued_at_migration_backfills_instead_of_resetting_queue_age():
-    """MIGRATION SEMANTICS (regression for the `DEFAULT now()` backfill trap).
-
-    Adding `queued_at` directly as `DEFAULT now()` does NOT leave existing rows NULL: on
-    PostgreSQL 11+ the default is applied to every pre-existing row, which would reset the
-    relay clock of everything already sitting in the queue. The migration therefore does it
-    in three steps, and this test pins each of them:
-
-      1. ADD COLUMN with NO default  -> existing rows stay NULL (not stamped with now())
-      2. UPDATE ... = created_at     -> the real queue age is preserved
-      3. ALTER ... SET DEFAULT now() -> future inserts get the current time
-
-    Steps run against a TEMPORARY table so the real schema is untouched and no second
-    database is needed. LIMITATION: this pins the SQL semantics of the migration, not the
-    Alembic wiring; the assertions at the end check that the wiring actually landed on the
-    live (already-migrated) test database.
-    """
-    async def scenario():
-        engine = _engine()
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-        try:
-            async with maker() as s:
-                await s.execute(text(
-                    "CREATE TEMPORARY TABLE _mig_probe ("
-                    "  id serial PRIMARY KEY, created_at timestamptz NOT NULL) ON COMMIT DROP"
-                ))
-                await s.execute(text(
-                    "INSERT INTO _mig_probe (created_at) VALUES (now() - interval '2 hours')"
-                ))
-                # Step 1 -- exactly what the migration does first.
-                await s.execute(text("ALTER TABLE _mig_probe ADD COLUMN queued_at timestamptz"))
-                step1_null = await s.scalar(text("SELECT queued_at IS NULL FROM _mig_probe"))
-                # Step 2 -- the backfill.
-                await s.execute(text(
-                    "UPDATE _mig_probe SET queued_at = created_at WHERE queued_at IS NULL"
-                ))
-                step2 = (await s.execute(text(
-                    "SELECT queued_at = created_at, age(now(), queued_at) > interval '1 hour' "
-                    "FROM _mig_probe"
-                ))).first()
-                # Step 3 -- the default for future rows.
-                await s.execute(text(
-                    "ALTER TABLE _mig_probe ALTER COLUMN queued_at SET DEFAULT now()"
-                ))
-                await s.execute(text("INSERT INTO _mig_probe (created_at) VALUES (now())"))
-                step3_current = await s.scalar(text(
-                    "SELECT age(now(), queued_at) < interval '1 minute' "
-                    "FROM _mig_probe ORDER BY id DESC LIMIT 1"
-                ))
-                # ...and the counter-example this whole design exists to avoid.
-                await s.execute(text(
-                    "CREATE TEMPORARY TABLE _mig_trap (id serial PRIMARY KEY) ON COMMIT DROP"
-                ))
-                await s.execute(text("INSERT INTO _mig_trap DEFAULT VALUES"))
-                await s.execute(text(
-                    "ALTER TABLE _mig_trap ADD COLUMN queued_at timestamptz DEFAULT now()"
-                ))
-                trap_null = await s.scalar(text("SELECT queued_at IS NULL FROM _mig_trap"))
-                await s.rollback()
-            return step1_null, step2, step3_current, trap_null
-        finally:
-            await engine.dispose()
-
-    step1_null, (backfilled, age_preserved), step3_current, trap_null = asyncio.run(scenario())
-    assert step1_null is True, "step 1 must NOT stamp existing rows"
-    assert backfilled is True, "step 2 must set queued_at = created_at"
-    assert age_preserved is True, "the row's real 2h queue age must survive the migration"
-    assert step3_current is True, "step 3 must give new rows now()"
-    assert trap_null is False, (
-        "counter-example: ADD COLUMN ... DEFAULT now() backfills existing rows -- which is "
-        "exactly why the migration must not do that"
-    )
+# Phase 0 MySQL cutover: test_queued_at_migration_backfills_instead_of_resetting_queue_age
+# (formerly here) pinned a Postgres-11+-specific hazard -- `ALTER TABLE ADD COLUMN ...
+# DEFAULT now()` rewrites and stamps every EXISTING row on Postgres, which is why the original
+# `queued_at` migration did it in three steps (add nullable -> backfill from created_at -> set
+# default). That incremental migration no longer exists: this codebase's MySQL migration history
+# was squashed into one baseline (db/migrations/versions/417cf2df2299_mysql_baseline_schema.py)
+# that creates `queued_at` correctly from day one, so there is no add-column-with-a-volatile-
+# default step left to regression-test, on either database. Porting this test would mean
+# fabricating a migration scenario that doesn't correspond to anything this codebase actually
+# does anymore. test_queued_at_schema_default_and_new_scan_timestamp (below) is what still
+# matters going forward: it proves the LIVE schema has the right default/nullability and that a
+# freshly created scan is actually stamped, and continues to run on every DB backend.
 
 
 def test_queued_at_schema_default_and_new_scan_timestamp():
-    """The three-step migration actually landed on the live schema: the DB default is now(),
-    the column stays nullable, and a freshly created scan gets a current queued_at."""
+    """The live schema has `queued_at` set up correctly: a now()-equivalent default, still
+    nullable (never forced NOT NULL), and a freshly created scan gets a current queued_at.
+
+    Phase 0 MySQL cutover: was `age(now(), queued_at) < interval '1 minute'` (Postgres-only
+    functions) -> `TIMESTAMPDIFF(SECOND, queued_at, now()) < 60` (MySQL's portable elapsed-time
+    equivalent). The default-value assertion checks for `current_timestamp` (case-insensitive,
+    substring match so it doesn't care about a `(6)` precision suffix or trailing parens) instead
+    of Postgres's literal `now()` -- see the baseline migration's docstring
+    (417cf2df2299_mysql_baseline_schema.py) for why the schema's actual default is
+    `sa.text('CURRENT_TIMESTAMP(6)')`, not `sa.text('now()')`: the latter compiles fine as a
+    MySQL *query* expression but is rejected by MySQL's DDL grammar in a column's DEFAULT
+    clause -- a bug this test's own MariaDB run couldn't catch (MariaDB accepts it there), only a
+    real MySQL `alembic upgrade head` did."""
     async def scenario():
         engine = _engine()
         maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -1523,11 +1492,11 @@ def test_queued_at_schema_default_and_new_scan_timestamp():
             async with maker() as s:
                 col = (await s.execute(text(
                     "SELECT column_default, is_nullable FROM information_schema.columns "
-                    "WHERE table_name = 'scans' AND column_name = 'queued_at'"
+                    "WHERE table_schema = DATABASE() AND table_name = 'scans' AND column_name = 'queued_at'"
                 ))).first()
                 scan = await _seed_scan(s, "queued")
                 fresh = (await s.execute(text(
-                    "SELECT queued_at IS NOT NULL, age(now(), queued_at) < interval '1 minute' "
+                    "SELECT queued_at IS NOT NULL, TIMESTAMPDIFF(SECOND, queued_at, now()) < 60 "
                     "FROM scans WHERE id = :i"
                 ), {"i": str(scan.id)})).first()
             return col, fresh
@@ -1535,9 +1504,12 @@ def test_queued_at_schema_default_and_new_scan_timestamp():
             await engine.dispose()
 
     (default, nullable), (has_value, is_current) = asyncio.run(scenario())
-    assert default is not None and "now()" in default   # step 3 present in the real schema
+    assert default is not None and "current_timestamp" in default.lower()  # default present in the real schema
     assert nullable == "YES"                            # never made NOT NULL
-    assert has_value is True and is_current is True     # new scans are stamped on insert
+    # Phase 0 MySQL cutover: read back via raw text() SQL, MySQL hands back its native 0/1
+    # (an int) for a boolean expression, not a Python bool -- `is True` would fail on a
+    # truthy-but-correct `1`. See the identical fix in test_account_erasure.py.
+    assert has_value and is_current                      # new scans are stamped on insert
 
 
 def test_reaper_revokes_ownership_so_a_stale_executor_stays_silent(monkeypatch):
@@ -1581,7 +1553,7 @@ def test_reaper_revokes_ownership_so_a_stale_executor_stays_silent(monkeypatch):
     # executor keeps going and finally errors -- the exact ordering that used to double-report.
     async def _reap_then_fail(db, *a, **k):
         await db.execute(
-            text("UPDATE scans SET started_at = now() - interval '3 hours' WHERE id = :i"),
+            text("UPDATE scans SET started_at = now() - INTERVAL 3 HOUR WHERE id = :i"),
             {"i": str(scan_id)},
         )
         await db.commit()
@@ -1626,7 +1598,7 @@ def test_reaper_cannot_revoke_a_freshly_reclaimed_scan():
                 old_token = uuid.uuid4()
                 await _claim_scan(s, scan.id, old_token)
                 await s.execute(
-                    text("UPDATE scans SET started_at = now() - interval '3 hours' WHERE id = :i"),
+                    text("UPDATE scans SET started_at = now() - INTERVAL 3 HOUR WHERE id = :i"),
                     {"i": str(scan.id)},
                 )
                 await s.commit()

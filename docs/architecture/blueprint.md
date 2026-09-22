@@ -5,6 +5,37 @@ This document is the single source of truth for building MBS.SC in Claude Code. 
 
 ---
 
+> **⚠️ AUDIT-007 — TENANCY MECHANISM CHANGED. READ BEFORE TRUSTING ANY "RLS" STATEMENT BELOW.**
+>
+> This document describes **PostgreSQL row-level security** (`ENABLE`/`FORCE ROW LEVEL SECURITY`,
+> policies keyed on `current_setting('app.current_workspace_id')`) as the tenant-isolation
+> mechanism. **That is no longer how this system works.**
+>
+> At the Phase 0 MySQL cutover the database moved from PostgreSQL 16 to MySQL 8, which has **no
+> row-level security** (and MariaDB's request for it, MDEV-27301, is still open). Tenant
+> isolation is now enforced in the **application layer** by `apps/api/core/tenancy.py`: an ORM
+> event hook attaches a workspace predicate to every query against a tenant-scoped table, keyed
+> on a workspace bound per request/task in a `contextvars` context.
+>
+> Practical differences that matter when reading anything below:
+> * There are **no policies, no GUCs, no `current_setting`, and no `FORCE`** — and no DB role
+>   can "bypass" isolation, because it is not a database policy.
+> * "RLS-exempt" tables are now `tenancy.EXEMPT_TABLES` (`scans`, `api_keys`, `scan_schedules`);
+>   the reasoning for each is unchanged, only the mechanism.
+> * The filter hooks the **ORM only**. Raw SQL bypasses it entirely (hence
+>   `docs/architecture/raw-sql-inventory.yml` and its CI gate), and **aggregates**
+>   (`select(func.count())`) escape `with_loader_criteria` too — those must carry an explicit
+>   workspace predicate, or use `tenancy.workspace_criterion()`.
+>
+> **The step-by-step build log further down is a DATED HISTORICAL RECORD.** Its "RLS enabled +
+> forced" entries were accurate when written and are deliberately left intact — rewriting them
+> would falsify the project history. Read them as "tenant isolation was applied to this table",
+> and read `apps/api/core/tenancy.py` for how that is implemented today.
+
+---
+
+---
+
 ## 1. Product Framing (read this first)
 
 MBS.SC is **not** an autonomous "AI hacks things" product. It is an **orchestration and reasoning layer over deterministic, well-understood security tools**, with these hard rules baked into the architecture itself (not just policy):
@@ -194,7 +225,7 @@ mbs-sc/
 
 ## 5. Database Design
 
-Design principles: every finding must trace to evidence and a tool run; every privileged action must be auditable; multi-tenancy enforced via `workspace_id` on every tenant-owned table (not just at the app layer — add row-level security policies in Postgres as defense in depth).
+Design principles: every finding must trace to evidence and a tool run; every privileged action must be auditable; multi-tenancy enforced via `workspace_id` on every tenant-owned table. *(Originally: "add row-level security policies in Postgres as defense in depth". Post-MySQL-cutover this is inverted — the app layer IS the enforcement point; see `apps/api/core/tenancy.py` and the notice at the top.)*
 
 ### Core tables
 
@@ -475,7 +506,7 @@ DELETE /api-keys/{id}
 ## 9. Security Architecture
 
 - **AuthN:** JWT access tokens (short TTL, ~15 min) + rotating refresh tokens; MFA (TOTP) required for admin/owner roles at minimum, optional-but-encouraged for all.
-- **AuthZ:** RBAC enforced via permission checks at the route-dependency level in FastAPI (not scattered in business logic), backed by `role_permissions`. Add Postgres row-level security on `workspace_id` as defense in depth against an authz-check bug.
+- **AuthZ:** RBAC enforced via permission checks at the route-dependency level in FastAPI (not scattered in business logic), backed by `role_permissions`. Isolation on `workspace_id` is enforced by the application-layer tenancy filter (`apps/api/core/tenancy.py`) as defense in depth against an authz-check bug. *(Originally specified as Postgres RLS; see the notice at the top.)*
 - **Secrets:** environment secrets and per-target credentials (e.g. cloud IAM keys for cloud scans) encrypted at rest (KMS-backed), never logged, never returned in API responses after creation.
 - **Tool sandboxing:** every tool runner executes inside a locked-down container (no outbound access except to the declared target, dropped capabilities, resource/time limits) — this limits blast radius if a tool itself is exploited or misused.
 - **Rate limiting:** per-user and per-workspace, both on the API gateway and specifically on active-testing tool invocation (prevents a compromised account from mass-scanning).
@@ -568,7 +599,7 @@ Performance tuning, K8s migration if load warrants it (see §13), UI polish to e
 ## Decisions Locked (2026-07-23)
 
 1. **LLM provider/model:** Anthropic Claude, via the Anthropic API. `ai_agent/` is built directly against Claude (no provider-abstraction overhead) — planner, correlator, validator, remediation writer, and report writer all call Claude.
-2. **Multi-tenancy:** shared schema with `workspace_id` + Postgres row-level security, as assumed in §5. Revisit only if a specific enterprise buyer contractually requires DB-per-tenant isolation.
+2. **Multi-tenancy:** shared schema with `workspace_id` + the application-layer tenancy filter (`apps/api/core/tenancy.py`), as assumed in §5. *(Originally Postgres row-level security; see the notice at the top.)* Revisit only if a specific enterprise buyer contractually requires DB-per-tenant isolation.
 3. **On-prem/air-gapped:** deferred past launch. v1 ships S3-only for object storage; MinIO compatibility is kept in mind (same S3 API) so an air-gapped package remains a future upsell (§13) without a rewrite.
 4. **Cloud Security module (Phase 6) v1 scope:** AWS only. Azure/GCP support is a later-phase addition, not launch-blocking.
 

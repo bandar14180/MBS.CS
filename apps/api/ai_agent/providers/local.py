@@ -14,6 +14,12 @@ class LocalClient(OpenRouterClient):
     """
 
     provider_name = "local"
+    # Every caller through complete_json() needs valid JSON back, and a small self-hosted
+    # model (unlike a frontier model routed through OpenRouter) is much more likely to wrap
+    # it in prose or a markdown fence without this. Ollama's OpenAI-compatible endpoint
+    # honors `response_format: json_object` (verified against ollama/ollama:latest) --
+    # confined to this provider since we control exactly which server answers it.
+    _json_mode = True
 
     def __init__(
         self,

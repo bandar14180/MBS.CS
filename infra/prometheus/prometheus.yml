@@ -37,3 +37,25 @@ scrape_configs:
     metrics_path: /
     static_configs:
       - targets: ['worker:9100', 'worker-default:9100']
+
+  # MBS.SC PHASE 8 (P8-C): private-worker VPN health.
+  #
+  # Scraped from the SCANNER-MANAGER, not from the private workers. A private worker lives on
+  # its own `mbs-site-<slug>` network plus `mbs-dispatch`, and the only way to scrape it
+  # directly would be to put Prometheus inside the execution plane -- or, worse, inside every
+  # customer's site network. Instead the worker REPORTS its tunnel health over the existing
+  # authenticated /v1/heartbeat call, the manager persists it, and this job reads the
+  # projection. Prometheus therefore never touches the execution plane, and the private
+  # workers gain no port, credential, capability or network attachment.
+  #
+  # Token-gated exactly like mbs-api: same METRICS_MODE contract, same mounted secret, no new
+  # credential model. Feeds MbsPrivateTunnelDown / MbsTunnelHandshakeStale /
+  # MbsScannerWorkerHeartbeatStale -- whose expressions are UNCHANGED.
+  - job_name: mbs-scanner-manager
+    metrics_path: /metrics
+    http_headers:
+      X-Metrics-Token:
+        files:
+          - /run/secrets/metrics_token
+    static_configs:
+      - targets: ['scanner-manager:8100']

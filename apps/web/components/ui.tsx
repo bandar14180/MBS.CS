@@ -51,8 +51,20 @@ export function Card({ children, className = "" }: { children: React.ReactNode; 
   return <div className={`rounded-2xl border border-cyber-border/60 bg-cyber-panel/50 p-5 ${className}`}>{children}</div>;
 }
 
-export function Label({ children }: { children: React.ReactNode }) {
-  return <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-400">{children}</label>;
+// FE-9: accepts the native <label> attributes -- `htmlFor` above all -- so a label can be
+// programmatically associated with its control. Without that association a screen reader
+// announces the input as unlabelled, and clicking the text does not focus the field. Existing
+// call sites pass only `children` and are unaffected; `className` is merged rather than
+// replaced so the shared styling cannot be silently dropped.
+export function Label({ className = "", children, ...props }: React.LabelHTMLAttributes<HTMLLabelElement>) {
+  return (
+    <label
+      className={`mb-1 block text-xs font-medium uppercase tracking-wide text-slate-400 ${className}`}
+      {...props}
+    >
+      {children}
+    </label>
+  );
 }
 
 const SEVERITY_STYLES: Record<string, string> = {
@@ -71,10 +83,36 @@ const STATUS_STYLES: Record<string, string> = {
   accepted_risk: "bg-white/5 text-slate-400 border-cyber-border",
   completed: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
   completed_with_errors: "bg-amber-500/15 text-amber-300 border-amber-500/40",
+  // A tool run that exited non-zero but still produced usable output. Amber, matching
+  // `completed_with_errors`: the run it rolls up into is exactly that, and neither is a
+  // failure. Without this entry a `partial` badge fell back to the neutral default.
+  partial: "bg-amber-500/15 text-amber-300 border-amber-500/40",
   running: "bg-sky-500/15 text-sky-300 border-sky-500/40",
   queued: "bg-white/5 text-slate-300 border-cyber-border",
   failed: "bg-rose-500/15 text-rose-300 border-rose-500/40",
   verified: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+  cancelled: "bg-white/5 text-slate-400 border-cyber-border",
+  // --- remediation workflow statuses -------------------------------------------------------
+  // Colour encodes how much outstanding WORK a state represents, not severity: outstanding
+  // work warms toward amber, finished work is green, and a decision-not-to-fix (risk_accepted,
+  // rejected) is neutral so it never reads as "resolved".
+  proposed: "bg-white/5 text-slate-300 border-cyber-border",
+  in_progress: "bg-sky-500/15 text-sky-300 border-sky-500/40",
+  awaiting_verification: "bg-amber-400/15 text-amber-300 border-amber-400/40",
+  closed: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+  risk_accepted: "bg-white/5 text-slate-400 border-cyber-border",
+  rejected: "bg-white/5 text-slate-400 border-cyber-border",
+  // --- risk acceptance / assessment lifecycle -----------------------------------------------
+  active: "bg-sky-500/15 text-sky-300 border-sky-500/40",
+  expired: "bg-amber-400/15 text-amber-300 border-amber-400/40",
+  revoked: "bg-white/5 text-slate-400 border-cyber-border",
+  draft: "bg-white/5 text-slate-300 border-cyber-border",
+  issued: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+  passed: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+  // `accepted` is a remediation state (work accepted onto the plan). Deliberately NOT the same
+  // styling as `accepted_risk`, which is a decision NOT to fix -- conflating them in the UI
+  // would blur exactly the distinction the two statuses exist to draw.
+  accepted: "bg-indigo-500/15 text-indigo-300 border-indigo-500/40",
 };
 
 export function Badge({ kind, value }: { kind: "severity" | "status"; value: string }) {

@@ -27,10 +27,11 @@ import asyncio
 import uuid
 from types import SimpleNamespace
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.agent.models import AgentDecision, AgentStep, EngagementState
 from apps.api.modules.projects.models import Project, Target
@@ -120,9 +121,11 @@ async def _fake_nuclei_run(self, target_value, config, prior_findings):
 # --- helpers ------------------------------------------------------------------------
 
 async def _set_guc(session, ws_id):
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :wid, false)"), {"wid": str(ws_id)}
-    )
+    # Phase 0 MySQL cutover: was a Postgres `set_config` GUC call (session-level RLS binding).
+    # Replaced by tenancy.bind_workspace -- a plain Python ContextVar set, not DB-side at all
+    # (see apps.api.core.tenancy's module docstring). `session` is now unused but kept as a
+    # parameter so every call site in this file is unchanged.
+    tenancy.bind_workspace(ws_id)
 
 
 async def _seed(session):
@@ -299,7 +302,10 @@ def test_run_agent_driven_end_to_end(monkeypatch):
     assert "naabu" not in ran             # (2) lower-confidence candidate not selected
 
     # (5) Tool output became real evidence/state: a vulnerability was ingested.
-    assert len(r["vulns"]) == 1 and r["vulns"][0].category == "CWE-89"
+    # Category is the CANONICAL cwe key (taxonomy.canonical_cwe): nuclei reported "CWE-89"
+    # above and it is stored as "cwe-89", the single spelling the ATT&CK/compliance
+    # catalogues are keyed by. The id is preserved exactly; only the spelling is canonical.
+    assert len(r["vulns"]) == 1 and r["vulns"][0].category == "cwe-89"
     assert all(tr.status == "completed" for tr in r["tool_runs"])
     assert r["statuses"] == ["completed", "completed"]
 

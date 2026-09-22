@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from apps.api.core.config import get_settings
 from apps.api.modules.reports import render
 from apps.api.modules.reports.data import ReportData, VulnRow
 from apps.api.scanner_engine import screenshot
@@ -257,7 +258,12 @@ def _data(rows, score=50):
 
 
 def test_technical_report_embeds_the_screenshot():
-    rows = [_row("tpl", "https://example.com/a", shots=[("s3://bucket/a.png", "abc123def456")])]
+    # The URI must name the real EVIDENCE bucket, as every production writer does
+    # (evidence_store hardcodes settings.s3_bucket_evidence). Prompt 30 added a bucket
+    # allow-check at the fetch site, so a placeholder bucket name is no longer fetched --
+    # see test_evidence_artifact_boundary.py for why that read fails closed.
+    bucket = get_settings().s3_bucket_evidence
+    rows = [_row("tpl", "https://example.com/a", shots=[(f"s3://{bucket}/a.png", "abc123def456")])]
     provider = MagicMock()
     provider.get.return_value = _PNG
     with patch("apps.api.scanner_engine.storage_provider.get_storage_provider", return_value=provider):

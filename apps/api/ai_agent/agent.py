@@ -22,7 +22,8 @@ from dataclasses import dataclass, field
 
 from apps.api.ai_agent.prompts.agent import AGENT_PROMPT_VERSION, AGENT_SYSTEM, AGENT_USER_TEMPLATE
 from apps.api.ai_agent.providers import SupportsComplete, get_ai_client
-from apps.api.scanner_engine.safety import RulesOfEngagement, tier_at_most
+from apps.api.scanner_engine import capability_registry as cap_registry
+from apps.api.scanner_engine.safety import RulesOfEngagement
 from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
 
 # Ordinal for the qualitative expected_value / risk labels (tie-break in ranking).
@@ -144,22 +145,31 @@ class RedTeamAgent:
     def available_tools(
         self, *, target_type: str, active_testing_allowed: bool, roe: RulesOfEngagement, already_run: set[str]
     ) -> list[str]:
-        """The allowlist the agent may choose from RIGHT NOW: registered tools that
-        apply to the target, are within the engagement's safety ceiling, are
-        active-testing-gated by the verified scope, and haven't run yet. The agent
-        cannot pick anything outside this list."""
+        """The allowlist the agent may choose from RIGHT NOW. Walks the full
+        Registry -> Category (discovery/web/network) -> Capability -> Tool tree
+        (blueprint: "the AI asks for a capability; the registry decides the
+        implementation") -- for each capability under each category,
+        capability_registry.resolve_capability picks the best implementation
+        that applies to the target, is within the engagement's safety ceiling,
+        is active-testing-gated by the verified scope, and hasn't run yet.
+        Multiple capabilities can already have multiple real implementations
+        (subdomain_discovery: subfinder/amass/dnsx; web_service_discovery:
+        httpx/whatweb) -- adding another is just a new TOOL_REGISTRY entry
+        sharing that `capability` string, with no change here. The agent cannot
+        pick anything outside this list."""
         out: list[str] = []
-        for name, cls in sorted(TOOL_REGISTRY.items(), key=lambda kv: kv[1].phase):
-            if name in already_run:
-                continue
-            if cls.applicable_target_types is not None and target_type not in cls.applicable_target_types:
-                continue
-            if not tier_at_most(cls.safety_tier, roe.max_tier):
-                continue
-            if cls.requires_active_testing and not active_testing_allowed:
-                continue
-            out.append(name)
-        return out
+        for _category, caps_in_category in cap_registry.category_tree().items():
+            for capability in caps_in_category:
+                name = cap_registry.resolve_capability(
+                    capability,
+                    target_type=target_type,
+                    active_testing_allowed=active_testing_allowed,
+                    max_tier=roe.max_tier,
+                    already_run=frozenset(already_run),
+                )
+                if name is not None:
+                    out.append(name)
+        return sorted(out, key=lambda n: TOOL_REGISTRY[n].phase)
 
     def _parse_candidates(self, raw: dict, available: list[str], min_confidence: float = 0.0) -> list[CandidateAction]:
         """Turn the model's proposal into vetted CandidateActions. Accepts the
@@ -245,7 +255,10 @@ class RedTeamAgent:
             ))
 
         catalog = "\n".join(
-            f"- {n} (phase {TOOL_REGISTRY[n].kill_chain_phase}, {TOOL_REGISTRY[n].safety_tier})" for n in available
+            f"- {n} [category: {cap_registry.category_for_capability(TOOL_REGISTRY[n].capability)} | "
+            f"capability: {TOOL_REGISTRY[n].capability or 'unspecified'}] "
+            f"(phase {TOOL_REGISTRY[n].kill_chain_phase}, {TOOL_REGISTRY[n].safety_tier})"
+            for n in available
         )
         # AI-1 Steps 1-2: every field below is derived from the scanned target -> sanitize +
         # delimit so an injection payload in tool output cannot steer the decision. The tool

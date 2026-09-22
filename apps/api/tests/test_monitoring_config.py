@@ -96,7 +96,11 @@ def test_alert_expressions_reference_existing_metrics():
                    # AI-2.2A budget enforcement
                    "mbs_ai_budget_blocked_total",
                    # AI-2.5 observability SLOs
-                   "mbs_ai_latency_seconds", "mbs_ai_errors_total", "mbs_ai_failover_total"):
+                   "mbs_ai_latency_seconds", "mbs_ai_errors_total", "mbs_ai_failover_total",
+                   # Phase 8 hardening: lease-eligible worker capacity (scanner-manager
+                   # /metrics). Status-derived, so it stays meaningful when a suspended
+                   # fleet stops heartbeating and the liveness metrics go quiet.
+                   "mbs_scanner_workers_lease_eligible", "mbs_scanner_workers_registered"):
         assert metric in exprs
     assert 'up{job="mbs-api"}' in exprs and 'up{job="mbs-worker"}' in exprs
 
@@ -107,8 +111,14 @@ def test_prod_compose_prometheus_service():
         pytest.skip("infra/ not bind-mounted")
     cfg = yaml.safe_load(compose.read_text(encoding="utf-8"))
     prom = cfg["services"]["prometheus"]
-    assert prom["image"].startswith("prom/prometheus:")          # pinned, not :latest
-    assert prom["image"] != "prom/prometheus:latest"
+    # AUDIT-005 strengthened this: the image must be pinned by IMMUTABLE DIGEST, not merely
+    # by a non-latest tag. A tag can be repointed by the publisher at any time, so
+    # `prom/prometheus:v2.54.1` was still a moving reference. Was:
+    #   assert prom["image"].startswith("prom/prometheus:")   # pinned, not :latest
+    assert prom["image"].startswith("prom/prometheus@sha256:"), (
+        f"prometheus image must be digest-pinned, got {prom['image']!r}"
+    )
+    assert ":latest" not in prom["image"]
     # never public -- bound to localhost only
     assert any(str(p).startswith("127.0.0.1:9090") for p in prom["ports"])
     assert "metrics_token" in prom["secrets"]                    # token via secret, not inline
@@ -151,8 +161,11 @@ def test_prod_compose_alertmanager_service():
         pytest.skip("infra/ not present in this environment")
     cfg = yaml.safe_load(compose.read_text(encoding="utf-8"))
     am = cfg["services"]["alertmanager"]
-    assert am["image"].startswith("prom/alertmanager:")
-    assert am["image"] != "prom/alertmanager:latest"                       # pinned, not :latest
+    # AUDIT-005: immutable digest, not just a non-latest tag (see the prometheus test above).
+    assert am["image"].startswith("prom/alertmanager@sha256:"), (
+        f"alertmanager image must be digest-pinned, got {am['image']!r}"
+    )
+    assert ":latest" not in am["image"]
     assert any(str(p).startswith("127.0.0.1:9093") for p in am["ports"])   # never public
     assert "smtp_password" in am["secrets"]
     assert any("alertmanager.yml" in str(v) for v in am["volumes"])

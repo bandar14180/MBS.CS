@@ -1,9 +1,11 @@
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core.observability import record_verification_outcome
 from apps.api.modules.assets.models import Asset
 from apps.api.modules.attack.models import AttackMapping
 from apps.api.modules.compliance.models import ComplianceMapping
@@ -47,6 +49,104 @@ def _parse_fingerprint(fingerprint: str | None) -> tuple[str | None, str | None,
     return template_id, matcher_name, matched_at
 
 
+def _normalise_steps(steps) -> list[str]:
+    """Remediation steps as a list of non-empty strings, whatever shape the column holds.
+
+    `remediations.steps` is a JSON list column, but the value read back can legitimately be a
+    list, a single string (older rows written before the column was JSON), or None. Returning
+    one consistent shape is what lets the renderer emit bullets without type-testing, and is
+    the fix for the AttributeError that a list value used to raise there.
+
+    Order is preserved and entries are stripped; empties are dropped so a trailing "" in the
+    stored JSON does not render as an empty bullet. Nothing is rewritten or summarised."""
+    if steps is None:
+        return []
+    if isinstance(steps, str):
+        text = steps.strip()
+        return [text] if text else []
+    try:
+        items = list(steps)
+    except TypeError:
+        text = str(steps).strip()
+        return [text] if text else []
+    out: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+@dataclass(frozen=True)
+class EvidenceRecord:
+    """One stored evidence artifact, with the integrity metadata needed to audit it.
+
+    Phase 3.2. Every field is read VERBATIM from an `evidence` row; none is computed, inferred
+    or defaulted by the report. The columns have existed since the evidence store was built --
+    `checksum` (SHA-256 over the uploaded bytes, see scanner_engine.evidence_store) and
+    `created_at` (server CURRENT_TIMESTAMP(6) at capture) -- but the report only ever selected
+    `storage_uri`/`evidence_type`, and kept the checksum for screenshots alone. A reader could
+    therefore not tell WHEN an artifact was captured or verify it had not changed since.
+
+    Frozen because an evidence record is a statement about a past capture: nothing downstream
+    of the query should be able to edit it.
+
+    `checksum` is stored as bare hex with no algorithm prefix; `checksum_label()` renders it
+    with its algorithm named, so the report never implies an algorithm the data does not state.
+    A row whose checksum is absent is reported as unavailable rather than shown as verified."""
+
+    evidence_id: uuid.UUID | None
+    evidence_type: str
+    storage_uri: str
+    checksum: str | None
+    captured_at: datetime | None
+    tool_run_id: uuid.UUID | None = None
+
+    #: The algorithm scanner_engine.evidence_store and remediation.evidence_service both use.
+    #: Named here so the renderer never hard-codes it at a display site.
+    CHECKSUM_ALGORITHM = "SHA-256"
+
+    @property
+    def has_checksum(self) -> bool:
+        """A usable integrity value: present, and the right length for a hex SHA-256 digest.
+
+        Length-checked rather than trusted: a truncated or placeholder value must not be
+        presented as if it were a verifiable digest."""
+        value = (self.checksum or "").strip()
+        return len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
+
+    def checksum_label(self) -> str:
+        """Full digest, algorithm named -- or an explicit statement that none was recorded."""
+        if not self.has_checksum:
+            return "not recorded"
+        return f"{self.CHECKSUM_ALGORITHM}:{(self.checksum or '').strip().lower()}"
+
+    def checksum_short(self) -> str:
+        """First 16 hex chars, for tables where the full 64 would not fit. Still prefixed with
+        the algorithm so a truncated digest is never mistaken for a complete one."""
+        if not self.has_checksum:
+            return "not recorded"
+        return f"{self.CHECKSUM_ALGORITHM}:{(self.checksum or '').strip().lower()[:16]}…"
+
+    def captured_label(self) -> str:
+        """Capture timestamp in UTC, or an explicit absence. Never substitutes 'now'."""
+        if self.captured_at is None:
+            return "not recorded"
+        return f"{self.captured_at:%Y-%m-%d %H:%M:%S UTC}"
+
+    @property
+    def artifact_id(self) -> str:
+        """Stable, quotable id for ONE artifact, e.g. "EV-3F9A2C71".
+
+        Derived from the evidence row's DATABASE identity, exactly as VulnRow.finding_id is
+        derived from the vulnerability's -- so the same artifact carries the same id across
+        re-renders. The EV- prefix keeps it distinguishable from a finding's MBS- id while
+        staying in the identifier style the report already established; no new identity system
+        and nothing persisted."""
+        raw = str(self.evidence_id or "").replace("-", "").upper()
+        return f"EV-{raw[:8]}" if raw else "EV-UNKNOWN"
+
+
 @dataclass
 class VulnRow:
     id: uuid.UUID
@@ -73,6 +173,19 @@ class VulnRow:
     # before -- the renderer falls back to the untyped list. Presentation metadata only: it is
     # never read by scoring, classification or verification.
     evidence_items: list[tuple[str, str]] = field(default_factory=list)
+    # Phase 3.2: the SAME artifacts as `evidence_items`, carrying the integrity metadata that
+    # the evidence table has always stored but the report discarded -- SHA-256 checksum,
+    # capture timestamp, the evidence row's own id, and the producing tool run.
+    #
+    # A THIRD parallel list rather than a widened `evidence_items`, deliberately: that field's
+    # (type, uri) 2-tuple shape is asserted verbatim by existing tests and consumed by
+    # `_finding_groups`, so widening it would break callers for no benefit. Same discipline
+    # that added `evidence_items` alongside `evidence_uris`.
+    #
+    # Presentation/provenance only. Never read by scoring, classification or verification, and
+    # nothing here is computed by the report -- every value is read back from the row written
+    # at capture time (scanner_engine.evidence_store hashes the bytes it uploads).
+    evidence_records: list["EvidenceRecord"] = field(default_factory=list)
     # Where the finding was observed, recovered from the fingerprint (Phase 1: report clarity
     # only -- no new column, no schema change). Lets the report distinguish many findings that
     # share a title/severity/evidence but hit different URLs/params. Any may be None (older or
@@ -90,6 +203,13 @@ class VulnRow:
     # tool_run_id -- read-only join, no schema change). "N/A" when no linkage exists (older
     # rows). Shown in the Technical Report so an analyst can see e.g. nuclei-dast vs nuclei.
     tool_name: str = "N/A"
+    # The producing tool's VERSION (tool_runs.tool_version), read from the same tool_runs row
+    # as `tool_name`. None -- never a placeholder string -- when no linkage exists or the
+    # stored version is blank, so "version not recorded" stays distinguishable from a real
+    # version. Completes the Tool -> Tool Version link of the finding lineage chain at the
+    # report boundary; presentation/provenance only, never read by scoring, classification or
+    # verification, and never fabricated by the report.
+    tool_version: str | None = None
     # Nuclei classification metadata, when the caller has it. NEITHER is a column on
     # `vulnerabilities` (the runner's finding metadata is consumed by sync_attack_mappings and
     # then discarded), so gather_report_data leaves both None and classify_row recovers the CVE
@@ -119,10 +239,17 @@ class VulnRow:
     description: str | None = None
     # Remediation guidance produced by the pipeline (vulnerabilities remediations table), when
     # it exists. All three are rendered VERBATIM and are never generated, inferred or
-    # summarised by the report -- a finding without them shows "Not available in scan
-    # evidence." rather than invented advice.
+    # summarised by the report. A finding with NO pipeline remediation instead receives
+    # standard controls for its weakness class, rendered under an explicit label that says
+    # they are not derived from scan evidence (see narrative.GENERATED_CONTROLS_LABEL).
     remediation_summary: str | None = None
-    remediation_steps: str | None = None
+    # `remediations.steps` is a JSON **list** column (remediation_models.Remediation.steps),
+    # not text. It was previously typed `str | None` here and `.strip()`ed by the renderer,
+    # which raised AttributeError and failed the WHOLE technical report for any finding that
+    # actually had steps -- latent only because the table is empty on the current dataset.
+    # Typed and normalised as a list now; `_normalise_steps` accepts either shape so a legacy
+    # string value still renders.
+    remediation_steps: list[str] = field(default_factory=list)
     remediation_references: list[str] = field(default_factory=list)
 
     @property
@@ -165,6 +292,39 @@ class ReportData:
     # access_state, module}]. Only evidence-backed states appear (no invented
     # privilege escalation / lateral movement).
     attack_graph: dict = field(default_factory=dict)
+    # --- ASSESSMENT SCOPE (R-03) ----------------------------------------------------------
+    # What this report actually covers, so the document is auditable and a reader can tell a
+    # scan-scoped report from a project-wide one. EMPTY means project-wide -- the long-standing
+    # ReportCreate.scan_ids contract ("Optional; empty = whole project"), unchanged.
+    #
+    # Every entry is REAL data read from the `scans` rows the caller already authorised; nothing
+    # is invented. A scan with no started_at/completed_at simply contributes no timestamp rather
+    # than a fabricated one. Defaults to an empty list so every existing ReportData(...)
+    # construction site keeps working untouched.
+    #
+    # Shape per scan: {"id", "scan_type", "status", "target", "started_at", "completed_at"}.
+    scope_scans: list[dict] = field(default_factory=list)
+
+    def is_scan_scoped(self) -> bool:
+        """True when this report covers specific scans rather than the whole project."""
+        return bool(self.scope_scans)
+
+    def scope_window(self) -> tuple[datetime | None, datetime | None]:
+        """(earliest start, latest completion) across the scoped scans, or (None, None).
+
+        Derived from the scans' OWN timestamps; a missing timestamp contributes nothing, so an
+        in-flight or never-started scan cannot invent a window."""
+        starts: list[datetime] = [
+            s["started_at"] for s in self.scope_scans if s.get("started_at") is not None
+        ]
+        ends: list[datetime] = [
+            s["completed_at"] for s in self.scope_scans if s.get("completed_at") is not None
+        ]
+        return (min(starts) if starts else None, max(ends) if ends else None)
+
+    def scope_targets(self) -> list[str]:
+        """Distinct target values across the scoped scans, sorted. Empty when unknown."""
+        return sorted({str(s["target"]) for s in self.scope_scans if s.get("target")})
 
     def _currently_affecting(self):
         """The findings that justify a PRESENT-TENSE "is affected" claim.
@@ -201,8 +361,135 @@ class ReportData:
         without a matched_at (older/non-nuclei) don't count."""
         return len({v.matched_at for v in self._currently_affecting() if v.matched_at})
 
+    # --- ISSUE COUNTS (R-01) --------------------------------------------------------------
+    # A vulnerability ROW is one OCCURRENCE AT ONE LOCATION: per vulnerabilities/models.py the
+    # dedup identity is (project_id, fingerprint), and per nuclei_runner.py a fingerprint is
+    # `template_id|matcher|matched_at`. So `total_vulns`/`active_vulns`/`severity_counts`/the
+    # verification tally are all OCCURRENCE counts -- correct, and deliberately kept that way.
+    #
+    # But the score, Executive Key Risks, Technical Detailed Findings and the MITRE tally all
+    # count distinct ISSUES (scoring.issue_key). Both units are right; neither was labelled, so
+    # a reader who counted "7 active findings" against one rendered finding block could only
+    # conclude that six findings had been dropped.
+    #
+    # These three methods expose the missing ISSUE unit so every summary can state both. They
+    # are METHODS deriving from self.vulns -- exactly like affected_assets/affected_endpoint_count
+    # above -- rather than constructor fields, so all existing ReportData(...) construction
+    # sites keep working untouched and the two units can never be passed in disagreeing.
+    #
+    # Each uses the CANONICAL scoring.issue_key, unchanged; none re-derives identity, and none
+    # reads or alters severity, CVSS, risk, verification or the security score.
 
-async def _gather_attack_graph(db: AsyncSession, project_id: uuid.UUID) -> dict:
+    def total_issue_count(self) -> int:
+        """Distinct issues across ALL findings, any status.
+
+        The population `render._finding_groups` renders: the Technical Report's Detailed
+        Findings is the FULL record, so fixed/false-positive/accepted-risk issues each still
+        appear as a block. This is therefore the number that reconciles with the block count
+        in that section, and it pairs with `total_vulns` (its occurrence count)."""
+        return len({issue_key(v) for v in self.vulns})
+
+    def active_issue_count(self) -> int:
+        """Distinct issues among ACTIVE findings (status in ACTIVE_STATUSES).
+
+        The population `render._top_risk_groups` buckets, so this is the number that
+        reconciles with the Executive Report's Key Risks table, and it pairs with
+        `active_vulns` (its occurrence count). Deliberately NOT filtered by is_scorable:
+        Key Risks shows every active issue, including informational and detection-only ones,
+        so filtering here would under-report what that table actually lists."""
+        return len({issue_key(v) for v in self.vulns if v.status in _ACTIVE_STATUSES})
+
+    def scorable_issue_count(self) -> int:
+        """Distinct issues that actually move the security score.
+
+        Delegates to scoring.group_issues -- the score's OWN grouping -- rather than
+        re-deriving the rule, so this can never drift from the score it explains. It is the
+        same population the MITRE tally counts (active, not info, not a detection), which is
+        what lets the ATT&CK "Issues" column and this number agree by construction.
+
+        This is the issue-unit counterpart of render._score_impacting_count (the occurrence
+        count of the same population)."""
+        from apps.api.modules.reports.scoring import group_issues
+
+        return len(group_issues(self.vulns))
+
+    # --- COMPLIANCE COVERAGE (R-02) -------------------------------------------------------
+
+    def compliance_coverage(self) -> list[tuple[str, list[tuple[str, str, list[str]]]]]:
+        """Framework -> control -> the finding IDs that caused the control to appear.
+
+        THE POPULATION (this is the R-02 fix)
+        -------------------------------------
+        `scoring.is_scorable` -- the SAME predicate the Security Score, the MITRE tally
+        (attack.aggregation) and `_currently_affecting` already use. It composes THREE
+        independent exclusions: non-active status (fixed / false_positive / accepted_risk),
+        `info` severity, and a DETECTION classification.
+
+        Previously every surface that rendered compliance iterated `self.vulns` UNFILTERED, so
+        a finding the customer had already fixed -- or one dismissed as a FALSE POSITIVE, which
+        never existed -- still produced a PCI DSS / ISO 27001 control card. A project with
+        nothing active and a 100/100 score still claimed framework coverage, while the MITRE
+        section beside it correctly reported nothing. That is an affirmative misstatement in
+        precisely the context where a client is least forgiving.
+
+        `is_scorable` is deliberately NOT the same thing as "status is active": an ACTIVE
+        `info` finding and an ACTIVE technology detection are both is_active=True but
+        is_scorable=False. Using the scorable predicate keeps compliance describing the same
+        set of real, current weaknesses the score and ATT&CK describe, rather than a third,
+        divergent population.
+
+        WHAT IS NOT CHANGED
+        -------------------
+        The catalogue (compliance/catalog.py), the CWE -> control mapping semantics, the
+        stored `compliance_mappings` rows and every framework remain exactly as they were.
+        This filters WHICH FINDINGS are read at render time -- the same read-time-filter
+        discipline attack.aggregation uses for stale mappings -- and adds the contributing
+        finding IDs. It writes nothing and needs no backfill.
+
+        RETURN SHAPE
+        ------------
+        [(framework, [(control_id, description, [finding_id, ...]), ...]), ...], frameworks
+        sorted by key and controls sorted by id, so the rendering is deterministic. Finding IDs
+        are the report's EXISTING canonical identifier (VulnRow.finding_id -> "MBS-XXXXXXXX",
+        derived from the database id) -- no new identity system -- deduped and sorted, so a
+        control implicated by one issue at many locations lists that finding once."""
+        from apps.api.modules.reports.scoring import is_scorable
+
+        # framework -> control_id -> (description, {finding_id})
+        acc: dict[str, dict[str, tuple[str, set[str]]]] = {}
+        for v in self.vulns:
+            if not is_scorable(v):
+                continue
+            fid = v.finding_id
+            for framework, control_id, desc in v.compliance or []:
+                controls = acc.setdefault(framework, {})
+                prev_desc, ids = controls.get(control_id, ("", set()))
+                # Keep the first non-empty description: the catalogue gives one control the
+                # same text everywhere, so this only guards against a blank stored value.
+                controls[control_id] = (prev_desc or desc or "", ids | {fid})
+
+        return [
+            (
+                framework,
+                [
+                    (control_id, desc, sorted(ids))
+                    for control_id, (desc, ids) in sorted(acc[framework].items())
+                ],
+            )
+            for framework in sorted(acc)
+        ]
+
+    def compliance_frameworks(self) -> list[str]:
+        """Framework keys with at least one control mapped from a CURRENT finding, sorted.
+
+        Same population and same contract as compliance_coverage(), so the Executive summary
+        line and the Technical cards can never describe different sets of frameworks."""
+        return [framework for framework, _controls in self.compliance_coverage()]
+
+
+async def _gather_attack_graph(
+    db: AsyncSession, project_id: uuid.UUID, scan_ids: list[uuid.UUID] | None = None
+) -> dict:
     """Aggregate the persisted attack graph(s) from the project's autonomous
     engagements (M4.4.6). Reads the ACTUAL EngagementState.attack_graph -- never
     recomputes. Fail-soft: returns has_data=False if there is no engagement. Only
@@ -211,11 +498,18 @@ async def _gather_attack_graph(db: AsyncSession, project_id: uuid.UUID) -> dict:
     from apps.api.modules.agent.models import EngagementState
     from apps.api.modules.scans.models import Scan
 
-    engagements = list(
-        await db.scalars(
-            select(EngagementState).join(Scan, Scan.id == EngagementState.scan_id).where(Scan.project_id == project_id)
-        )
+    # R-03: the attack graph is a finding-derived section and must obey the SAME scan scope as
+    # everything else, or a scoped report would show an Executive summary from scans A/B beside
+    # an attack graph aggregated over every engagement in the project. It already joins Scan,
+    # so the scope is one extra predicate on that join -- no new relationship is introduced.
+    engagement_query = (
+        select(EngagementState).join(Scan, Scan.id == EngagementState.scan_id)
+        .where(Scan.project_id == project_id)
     )
+    if scan_ids:
+        engagement_query = engagement_query.where(Scan.id.in_(list(scan_ids)))
+
+    engagements = list(await db.scalars(engagement_query))
     node_counts: dict[str, int] = {}
     confirmed_access: list[dict] = []
     for eng in engagements:
@@ -240,14 +534,63 @@ async def _gather_attack_graph(db: AsyncSession, project_id: uuid.UUID) -> dict:
     }
 
 
-async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportData:
+async def gather_report_data(
+    db: AsyncSession, project_id: uuid.UUID, scan_ids: list[uuid.UUID] | None = None
+) -> ReportData:
+    """Build the report population for a project, optionally narrowed to specific scans.
+
+    SCAN SCOPE (R-03)
+    -----------------
+    `scan_ids=None` (or an empty list) means the WHOLE PROJECT -- the long-standing contract
+    stated verbatim on ReportCreate.scan_ids ("Optional; empty = whole project"). Preserved
+    exactly; only an explicit, non-empty list narrows anything.
+
+    The scope is applied HERE, on the single vulnerability query every other figure is derived
+    from, rather than at render time. That ordering is the requirement: classification,
+    verification, scoring, the severity tallies, MITRE, compliance, affected assets,
+    remediation and evidence all read `rows`/`vuln_ids` computed below, so scoping this one
+    query scopes every downstream section by construction -- there is no second filter to keep
+    in step and no way for one section to describe a different population than another.
+
+    THE SCAN -> FINDING RELATIONSHIP
+    --------------------------------
+    `Vulnerability.last_seen_scan_id` -- the CANONICAL "findings this scan produced" link,
+    already used by attack.service (the ATT&CK matrix and kill chain), remediation.verification,
+    scans.service and the orchestrator. It is written on EVERY ingest, both when a fingerprint
+    is new and when an existing one is re-detected (vulnerabilities.service.upsert), so it
+    always names the scan that most recently observed the finding.
+
+    Deliberately NOT `first_detected_scan_id`: a vulnerability row is deduped per
+    (project_id, fingerprint) and therefore OUTLIVES the scan that first saw it, so
+    first_detected names a historical event rather than membership. Scoping by it would omit a
+    finding that scan B re-detected merely because scan A saw it first -- the opposite of what
+    "report on scan B" means. The two columns together are a first/last RANGE, not a
+    membership set, and `last_seen_scan_id` is the one the rest of the codebase already treats
+    as "this scan's findings".
+
+    AUTHORIZATION
+    -------------
+    Not performed here. `scan_ids` must already have been validated by the caller against the
+    workspace AND project (reports.service.create_report uses scans.service.get_scan, the
+    canonical helper, which 404s on an unknown or out-of-scope scan). This function is an
+    internal data-layer call that also runs from trusted contexts; duplicating the check would
+    create a second authorization model, which the brief forbids. The `project_id` predicate
+    below is retained regardless, so even a hypothetical unvalidated scan id from another
+    project cannot pull that project's rows into this report."""
     project = await db.get(Project, project_id)
     project_name = project.name if project else str(project_id)
 
+    # Normalised once: None and [] are the same "no explicit scope" signal, and everything
+    # below tests this single value rather than re-deriving the emptiness rule.
+    scope_scan_ids = list(scan_ids or [])
+
+    vuln_query = select(Vulnerability).where(Vulnerability.project_id == project_id)
+    if scope_scan_ids:
+        vuln_query = vuln_query.where(Vulnerability.last_seen_scan_id.in_(scope_scan_ids))
+
     vulns = list(
         await db.scalars(
-            select(Vulnerability)
-            .where(Vulnerability.project_id == project_id)
+            vuln_query
             # Phase 0 MySQL cutover: nullslast() dropped -- see the identical comment in
             # apps/api/modules/vulnerabilities/service.py's list_vulnerabilities; MySQL/
             # MariaDB already put NULLs last on a plain DESC, and NULLS LAST syntax itself
@@ -264,12 +607,16 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     # P2-3: vulnerability_id -> [(evidence_type, storage_uri)] for NON-screenshot evidence.
     # Parallel to evidence_by_vuln so that list keeps its list[str] contract untouched.
     evidence_items_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
+    # Phase 3.2: vulnerability_id -> [EvidenceRecord] for EVERY artifact (screenshots too),
+    # carrying checksum/timestamp/ids. Parallel to the two lists above, which keep their exact
+    # shapes for existing consumers.
+    evidence_records_by_vuln: dict[uuid.UUID, list[EvidenceRecord]] = {}
     # vulnerability_id -> [(storage_uri, checksum)] for evidence_type='screenshot'.
     screenshot_by_vuln: dict[uuid.UUID, list[tuple[str, str]]] = {}
     # Remediation guidance, when the pipeline has generated any. Read-only: the report never
     # writes, derives or invents this text -- a vulnerability with no remediation row simply
     # renders "Not available in scan evidence." (the table is empty on the current dataset).
-    remediation_by_vuln: dict[uuid.UUID, tuple[str | None, str | None, list[str]]] = {}
+    remediation_by_vuln: dict[uuid.UUID, tuple[str | None, list[str], list[str]]] = {}
     attack_counts: dict[tuple[str, str, str], int] = {}
     # vulnerability_id -> {(tactic_name, technique_id, technique_name)}. Raw per-row mappings,
     # rolled up into attack_counts below once issue identity is available.
@@ -281,6 +628,19 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
     # vulnerability_id -> producing tool name (tool_runs.tool_name via the existing
     # VulnerabilityEvidence.tool_run_id FK; read-only join, no schema change).
     tool_name_by_vuln: dict[uuid.UUID, str] = {}
+    # vulnerability_id -> the producing tool's VERSION (tool_runs.tool_version), taken from the
+    # SAME tool_runs row the name is taken from, in the same pass, so the two can never
+    # describe different runs. Read-only; the column is NOT NULL and has always been written
+    # by both execution planes (orchestrator sets it from `runner.version`; scanner_manager
+    # derives it from TOOL_REGISTRY rather than trusting the worker -- see result_sink.py).
+    #
+    # WHY IT MATTERS FOR TRUTHFULNESS. "nuclei found this" is not a reproducible statement:
+    # the same template id can match under one tool release and not the next, so a finding
+    # attributed to a tool without its version cannot be re-run against the thing that
+    # produced it. The report already carried the tool; dropping the version broke the
+    # Tool -> Tool Version link of the lineage chain at the report boundary, even though the
+    # value was sitting in the row being joined.
+    tool_version_by_vuln: dict[uuid.UUID, str] = {}
     if vuln_ids:
         for r in await db.scalars(select(RiskScore).where(RiskScore.vulnerability_id.in_(vuln_ids))):
             risk_by_vuln[r.vulnerability_id] = r
@@ -309,7 +669,10 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
                     links = [links] if links.strip() else []
                 remediation_by_vuln[rem.vulnerability_id] = (
                     rem.summary,
-                    rem.steps,
+                    # Normalised to list[str] here, at the boundary, so every consumer sees one
+                    # shape. `rem.steps` is a JSON list column; passing it through raw is what
+                    # used to crash the renderer.
+                    _normalise_steps(rem.steps),
                     list(links or []),
                 )
         except Exception:
@@ -320,20 +683,46 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         # vulnerability_evidence -> evidence.storage_uri
         from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
 
+        # Phase 3.2: `id`, `created_at` and `tool_run_id` are now selected alongside the three
+        # columns this query already read. All four have existed since the evidence store was
+        # built; the report simply never loaded them, which is why no artifact could be dated
+        # or integrity-checked. Same single query -- no extra round trip, no schema change.
         evidence_rows = await db.execute(
             select(
                 VulnerabilityEvidence.vulnerability_id,
                 Evidence.storage_uri,
                 Evidence.evidence_type,
                 Evidence.checksum,
+                Evidence.id,
+                Evidence.created_at,
+                Evidence.tool_run_id,
             )
             .join(Evidence, Evidence.id == VulnerabilityEvidence.evidence_id)
             .where(VulnerabilityEvidence.vulnerability_id.in_(vuln_ids))
+            # Deterministic artifact ordering: oldest capture first, then by id so rows sharing
+            # a timestamp cannot reorder between renders of identical data.
+            .order_by(Evidence.created_at, Evidence.id)
         )
         # Screenshots are split out from the log/raw-output evidence so the Technical Report
         # can embed the image while still listing the textual artifacts. The checksum rides
         # along so the renderer can drop byte-identical duplicates without fetching them.
-        for vid, uri, etype, checksum in evidence_rows.all():
+        for vid, uri, etype, checksum, ev_id, created_at, tool_run_id in evidence_rows.all():
+            # Phase 3.2: EVERY artifact -- screenshots included -- gets a record carrying its
+            # integrity metadata. Built before the screenshot branch so the manifest is the
+            # complete inventory of what the evidence store holds for these findings, rather
+            # than repeating the split the display sections make for layout reasons.
+            record = EvidenceRecord(
+                evidence_id=ev_id,
+                evidence_type=etype or "unknown",
+                storage_uri=uri,
+                checksum=checksum,
+                captured_at=created_at,
+                tool_run_id=tool_run_id,
+            )
+            records = evidence_records_by_vuln.setdefault(vid, [])
+            if record not in records:
+                records.append(record)
+
             if etype == "screenshot":
                 shots = screenshot_by_vuln.setdefault(vid, [])
                 if (uri, checksum) not in shots:
@@ -365,15 +754,28 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         from apps.api.scanner_engine.models import ToolRun
 
         tool_rows = await db.execute(
-            select(VulnerabilityEvidence.vulnerability_id, ToolRun.tool_name, ToolRun.started_at)
+            select(
+                VulnerabilityEvidence.vulnerability_id,
+                ToolRun.tool_name,
+                ToolRun.tool_version,
+                ToolRun.started_at,
+            )
             .join(ToolRun, ToolRun.id == VulnerabilityEvidence.tool_run_id)
             .where(VulnerabilityEvidence.vulnerability_id.in_(vuln_ids))
         )
         _tool_seen: dict[uuid.UUID, object] = {}
-        for vid, tname, started in tool_rows.all():
+        for vid, tname, tversion, started in tool_rows.all():
             prev = _tool_seen.get(vid)
             if tname and (prev is None or (started is not None and started >= prev)):
                 tool_name_by_vuln[vid] = tname
+                # Name and version are taken from the SAME winning row, together, so the
+                # report can never pair one run's tool with another run's version. A blank
+                # version (historical rows written before the registry lookup, which stores
+                # "" rather than NULL) is left absent rather than substituted.
+                if tversion and str(tversion).strip():
+                    tool_version_by_vuln[vid] = str(tversion).strip()
+                else:
+                    tool_version_by_vuln.pop(vid, None)
                 _tool_seen[vid] = started
 
         # Resolve asset_id -> assets.value for the linked findings only.
@@ -411,7 +813,7 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             description=v.description,
             **dict(zip(
                 ("remediation_summary", "remediation_steps", "remediation_references"),
-                remediation_by_vuln.get(v.id, (None, None, [])),
+                remediation_by_vuln.get(v.id, (None, [], [])),
                 strict=True,
             )),
             final_risk_score=risk.final_risk_score if risk else None,
@@ -419,9 +821,11 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
             compliance=sorted(compliance_by_vuln.get(v.id, [])),
             evidence_uris=evidence_by_vuln.get(v.id, []),
             evidence_items=evidence_items_by_vuln.get(v.id, []),
+            evidence_records=evidence_records_by_vuln.get(v.id, []),
             screenshots=screenshot_by_vuln.get(v.id, []),
             asset_value=asset_value_by_id.get(v.asset_id) if v.asset_id else None,
             tool_name=tool_name_by_vuln.get(v.id, "N/A"),
+            tool_version=tool_version_by_vuln.get(v.id),
             **dict(zip(("template_id", "matcher_name", "matched_at"),
                        _parse_fingerprint(v.fingerprint), strict=True)),
         )
@@ -430,6 +834,12 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         # Set AFTER classification: verification reads it (a detection is never "verified
         # exploitation"). Purely derived; touches no stored value -- see verification.py.
         row.verification, row.confidence = classify_verification_row(row)
+        # Prompt 33: observe the verification MIX. Emitted here because this is the one place
+        # every reported finding passes through with its final state resolved. Counting only --
+        # the recorder cannot influence the value it observes, and both labels are closed
+        # vocabularies (verification.py's own states/bands), so no finding, target, project or
+        # tenant identity can reach the metrics endpoint.
+        record_verification_outcome(row.verification, row.confidence)
         rows.append(row)
         row_by_vuln_id[v.id] = row
 
@@ -469,7 +879,37 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         key=lambda x: (-x[3], x[0], x[1]),
     )
 
-    attack_graph = await _gather_attack_graph(db, project_id)
+    attack_graph = await _gather_attack_graph(db, project_id, scope_scan_ids)
+
+    # R-03 scope metadata. Read from the `scans` rows themselves -- the caller has already
+    # authorised every id against this workspace AND project -- so the Assessment Scope section
+    # states real recorded values and never fabricates a window or a target. The project_id
+    # predicate is repeated here as defence in depth: even an unvalidated id cannot pull a row
+    # belonging to another project into this report's metadata.
+    scope_scans: list[dict] = []
+    if scope_scan_ids:
+        from apps.api.modules.projects.models import Target
+        from apps.api.modules.scans.models import Scan
+
+        scope_rows = (
+            await db.execute(
+                select(Scan, Target.value)
+                .outerjoin(Target, Target.id == Scan.target_id)
+                .where(Scan.id.in_(scope_scan_ids), Scan.project_id == project_id)
+                .order_by(Scan.created_at)
+            )
+        ).all()
+        scope_scans = [
+            {
+                "id": scan.id,
+                "scan_type": scan.scan_type,
+                "status": scan.status,
+                "target": target_value,
+                "started_at": scan.started_at,
+                "completed_at": scan.completed_at,
+            }
+            for scan, target_value in scope_rows
+        ]
 
     return ReportData(
         project_name=project_name,
@@ -481,4 +921,5 @@ async def gather_report_data(db: AsyncSession, project_id: uuid.UUID) -> ReportD
         vulns=rows,
         attack_techniques=attack_techniques,
         attack_graph=attack_graph,
+        scope_scans=scope_scans,
     )

@@ -8,6 +8,7 @@ import pytest
 from apps.api.core.config import get_settings
 from apps.api.scanner_engine import net_guard
 from apps.api.scanner_engine.scope_guard import (
+    derived_scope_roots,
     extract_host,
     finding_in_scope,
     host_in_scope,
@@ -43,6 +44,22 @@ def test_host_in_scope_domain(host, expected):
 def test_host_in_scope_domain_target_with_scheme_port():
     # Target value normalized (scheme/port stripped) before matching.
     assert host_in_scope("domain", "https://example.com:443", "api.example.com") is True
+
+
+def test_host_in_scope_domain_ip_matches_resolved_address(monkeypatch):
+    # naabu/nmap findings carry a bare IP (SSRF pre-resolution -- net_guard.resolve_scan_host),
+    # never the original hostname. An IP that IS the domain's own resolved address must still
+    # count as in scope, or nmap is permanently starved of every host naabu just found.
+    monkeypatch.setattr(net_guard, "resolve_hostname", lambda h: ["203.0.113.9"])
+    assert host_in_scope("domain", "example.com", "203.0.113.9") is True
+    assert host_in_scope("domain", "example.com", "203.0.113.10") is False  # not a resolved address
+
+
+def test_host_in_scope_domain_ip_unresolvable_domain_fails_closed(monkeypatch):
+    def _boom(h):
+        raise OSError("unresolvable")
+    monkeypatch.setattr(net_guard, "resolve_hostname", _boom)
+    assert host_in_scope("domain", "example.com", "203.0.113.9") is False
 
 
 # --- host_in_scope: ip_range ---
@@ -128,6 +145,33 @@ def test_partition_separates_in_and_out_of_scope():
     in_scope, out = partition_in_scope("domain", "example.com", findings)
     assert [f.value for f in in_scope] == ["api.example.com", "http://example.com"]
     assert [f.value for f in out] == ["evil.attacker.com", ""]
+
+
+def test_partition_in_scope_ip_finding_matches_subdomain_resolution(monkeypatch):
+    # A naabu/nmap finding's host is a bare IP (pre-resolved before the tool runs). It must
+    # be recognized as in-scope when it matches a SUBDOMAIN already discovered in the same
+    # batch -- not just the apex domain -- since a subdomain commonly resolves to a
+    # different address than the apex (e.g. a CDN/host split between apex and www). This is
+    # exactly the split that starved nmap of every naabu finding.
+    def _resolve(h):
+        return {"example.com": ["203.0.113.1"], "www.example.com": ["203.0.113.9"]}[h]
+    monkeypatch.setattr(net_guard, "resolve_hostname", _resolve)
+    findings = [
+        _F("subdomain", "www.example.com"),
+        _F("port", "203.0.113.9:80", {"ip": "203.0.113.9"}),    # www's own IP -- must pass
+        _F("port", "198.51.100.5:80", {"ip": "198.51.100.5"}),  # unrelated IP -- must not
+    ]
+    in_scope, out = partition_in_scope("domain", "example.com", findings)
+    assert [f.value for f in in_scope] == ["www.example.com", "203.0.113.9:80"]
+    assert [f.value for f in out] == ["198.51.100.5:80"]
+
+
+def test_derived_scope_roots_domain_only(monkeypatch):
+    monkeypatch.setattr(net_guard, "resolve_hostname", lambda h: ["203.0.113.9"])
+    findings = [_F("subdomain", "www.example.com"), _F("subdomain", "evil.attacker.com")]
+    assert derived_scope_roots("domain", "example.com", findings) == frozenset({"www.example.com"})
+    # ip_range has no name-based root to derive from -- always empty.
+    assert derived_scope_roots("ip_range", "10.0.0.0/24", findings) == frozenset()
 
 
 def test_partition_ip_range():

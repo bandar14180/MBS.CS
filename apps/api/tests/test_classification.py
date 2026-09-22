@@ -136,22 +136,36 @@ def _tech_block_text(row):
         if t is not None:
             texts.append(str(t))
 
-    _walk(block)
+    # Phase 4.2: _finding_block returns a LIST (an atomic header group + flowing body) rather
+    # than one oversized KeepTogether that could never fit a page. Walk each top-level flowable.
+    for _flowable in (block if isinstance(block, list) else [block]):
+        _walk(_flowable)
     return "\n".join(texts)
 
+
+# The block's identity line now reads "<finding id> · VULNERABILITY · <weakness class>" rather
+# than the old "Type: VULNERABILITY" field -- the label moved out of the fact card and into the
+# heading during the report redesign. The CLASSIFICATION ITSELF is unchanged, which is what
+# these tests exist to pin, so they assert the group's classification value alongside the
+# rendered label instead of depending on the old field syntax.
 
 def test_technical_report_shows_tool_and_vulnerability_type():
     row = _row("unix-command-injection", "high", 9.8, "cwe-78", tool_name="nuclei-dast",
                final_risk_score=10.0)
+    (group,) = render._finding_groups([row])
+    assert group["classification"] == "vulnerability"
     text = _tech_block_text(row)
     assert "Tool: nuclei-dast" in text
-    assert "Type: VULNERABILITY" in text
+    assert "VULNERABILITY" in text
+    assert "DETECTION" not in text
 
 
 def test_technical_report_labels_a_detection():
     row = _row("waf-detect", "info", 0.0, "cwe-200", tool_name="nuclei")
+    (group,) = render._finding_groups([row])
+    assert group["classification"] == "detection"
     text = _tech_block_text(row)
-    assert "Type: DETECTION" in text
+    assert "DETECTION" in text
     assert "Tool: nuclei" in text
 
 

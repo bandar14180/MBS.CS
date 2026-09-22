@@ -187,3 +187,183 @@ groups:
         annotations:
           summary: "Alert email delivery failing"
           description: "{{ $value }} alert email(s) failed to send in the last hour -- check SMTP config/credentials (docs/runbooks/email-alerts.md)."
+
+  # ---------------------------------------------------------------------------------------
+  # MBS.SC -- scanner isolation, private sites and tunnels.
+  #
+  # None of these alerts carry a workspace, site or worker identifier: the metrics
+  # deliberately label only bounded, non-identifying values (see core/observability.py), so
+  # a dashboard or a paged alert cannot disclose which customer is affected or how their
+  # internal network is addressed. The operator correlates to a tenant through the
+  # access-controlled structured logs.
+  # ---------------------------------------------------------------------------------------
+  - name: mbs-scanner-security
+    rules:
+      # A tunnel that is down means private scans for that pool CANNOT run -- preflight
+      # refuses them (correctly). This is an availability alert for a security control that
+      # is failing closed, which is why it is a warning rather than a page: nothing unsafe
+      # is happening, but the customer's engagement is stalled.
+      - alert: MbsPrivateTunnelDown
+        expr: mbs_tunnel_up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Private scanner tunnel down (pool {{ $labels.pool_id }})"
+          description: "The tunnel for pool {{ $labels.pool_id }} has failed preflight for 5m. Private scans for this site are being refused (fail-closed). Check the worker container, the customer's WireGuard endpoint, and the handshake age."
+
+      # --- DEDICATED VPN EGRESS -------------------------------------------------------
+      # Separate series from mbs_tunnel_up, so these never dilute the private-tunnel alert
+      # above: the two failures have different causes, different blast radii and different
+      # operator responses.
+      #
+      # Availability, not a breach: the kill-switch means a down tunnel DROPS target
+      # traffic rather than letting it out directly, so scans are refused, not leaked.
+      - alert: MbsVpnEgressDown
+        expr: mbs_vpn_egress_up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Dedicated VPN egress down (pool {{ $labels.pool_id }})"
+          description: "The VPN egress path for pool {{ $labels.pool_id }} has failed preflight for 5m. Scans requiring VPN egress are being refused (fail-closed, kill-switch active). Check the worker container, the provider endpoint, and the handshake age."
+
+      # THE SERIOUS ONE. The tunnel is up and passing every routing check, but the
+      # OBSERVED exit IP is not the VPN's -- which means target traffic is (or was)
+      # leaving from an address it should not. This is the condition that cannot be
+      # inferred from tunnel health alone, and the reason exit-IP verification exists.
+      - alert: MbsVpnEgressExitIpUnverified
+        expr: mbs_vpn_egress_exit_ip_verified == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "VPN egress exit IP NOT verified (pool {{ $labels.pool_id }})"
+          description: "Pool {{ $labels.pool_id }} cannot prove its scanner traffic is leaving via the VPN exit IP. Scans are refused fail-closed, but investigate immediately: a tunnel that is up while traffic bypasses it means the policy routing or the kill-switch has been altered. Check `ip rule`, the dedicated routing table, and the MBS_VPN_EGRESS iptables chain."
+
+      # A scan cancelled mid-flight because egress stopped being verifiable. Rare and
+      # always worth reading: the scan was killed deliberately rather than allowed to
+      # continue over an unverified path.
+      - alert: MbsVpnEgressMidScanLoss
+        expr: increase(mbs_vpn_egress_midscan_loss_total[15m]) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scan cancelled by VPN egress watchdog ({{ $labels.reason }})"
+          description: "A running scan was cancelled because the VPN egress path became unverifiable mid-scan (reason {{ $labels.reason }}). This is the fail-closed path working as designed -- the scan did NOT silently continue over direct Internet -- but the underlying tunnel instability needs fixing."
+
+      # Sustained refusals mean the VPN pool is effectively out of service.
+      - alert: MbsVpnEgressScansBlocked
+        expr: increase(mbs_vpn_egress_blocked_total[15m]) > 5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "VPN egress blocking scans ({{ $labels.reason }})"
+          description: "More than 5 scans in 15m were refused because VPN egress could not be verified (reason {{ $labels.reason }}). The pool is failing closed correctly but is not doing useful work."
+
+      - alert: MbsVpnEgressHandshakeStale
+        expr: mbs_vpn_egress_handshake_age_seconds > 600
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "VPN egress handshake stale (pool {{ $labels.pool_id }})"
+          description: "The VPN egress tunnel for pool {{ $labels.pool_id }} has not completed a handshake in over 10 minutes; the provider peer is not responding."
+
+      # WireGuard rekeys roughly every 2 minutes while a session carries traffic, so a
+      # handshake older than 10 minutes means the peer is genuinely not responding.
+      - alert: MbsTunnelHandshakeStale
+        expr: mbs_tunnel_handshake_age_seconds > 600
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "WireGuard handshake stale (pool {{ $labels.pool_id }})"
+          description: "Last handshake was {{ $value | humanizeDuration }} ago. The customer peer is likely unreachable; private scans will be refused by preflight."
+
+      # A worker that stops checking in is either dead or has lost its route to the manager.
+      - alert: MbsScannerWorkerHeartbeatStale
+        expr: mbs_scanner_worker_heartbeat_age_seconds > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scanner worker heartbeat stale (pool {{ $labels.pool_id }})"
+          description: "No heartbeat for {{ $value | humanizeDuration }} -- the worker may be down or unable to reach the scanner-manager on mbs-dispatch."
+
+      # NO WORKER CAN TAKE WORK. The gap this closes: every alert above keys off LIVENESS,
+      # and a suspended worker cannot refresh `last_seen_at` (it is refused at
+      # authentication), so `mbs_scanner_worker_heartbeat_age_seconds` stops ageing -- or is
+      # never emitted at all -- precisely when the fleet is suspended. The staleness alert
+      # therefore goes QUIET at the worst moment. Verified live: both workers suspended
+      # 2026-09-13, zero alerts, scans accepted and left queued for four days.
+      #
+      # This keys off STATUS instead, so the suspended case cannot silence it. `registered
+      # > 0` scopes it to a pool that is supposed to have capacity -- a decommissioned or
+      # not-yet-populated pool (registered == 0) is not an incident and must not page.
+      #
+      # 15m, matching MbsScanQueueBacklog: a rolling worker restart legitimately empties a
+      # single-worker pool for a minute or two, and paging on that would train people to
+      # ignore this. A genuine suspension or outage lasts indefinitely, so the delay costs
+      # nothing real. Critical, not warning: with no eligible worker NOTHING scans, and the
+      # platform keeps accepting scans that will silently sit queued.
+      - alert: MbsNoLeaseEligibleWorkers
+        expr: (mbs_scanner_workers_lease_eligible == 0) and (mbs_scanner_workers_registered > 0)
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "No lease-eligible scanner workers (pool {{ $labels.pool_id }})"
+          description: "Pool {{ $labels.pool_id }} has registered workers but NONE may take new work for 15m -- every worker is suspended, revoked, draining or pending. Scans are still being accepted and will sit 'queued' indefinitely. Check `scanner_workers.status`; if the fleet was suspended by the P8-F stale reaper, recover it with `python -m apps.api.ops.reactivate_worker --worker-id <id> --reason '<why>'` once the worker is confirmed running."
+
+      # PARTIAL capacity loss -- distinct from the total outage above, and deliberately only
+      # a warning. Scanning still works; it is slower and has no redundancy. Separating the
+      # two means the critical alert keeps meaning "nothing is scanning".
+      - alert: MbsScannerPoolCapacityDegraded
+        expr: >
+          (mbs_scanner_workers_lease_eligible > 0)
+          and (mbs_scanner_workers_lease_eligible < mbs_scanner_workers_registered)
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scanner pool running below registered capacity (pool {{ $labels.pool_id }})"
+          description: "{{ $value }} of the registered workers in pool {{ $labels.pool_id }} may take work; the rest are suspended, revoked, draining or pending. Scanning continues with reduced capacity and no redundancy."
+
+      # THE SECURITY-SIGNIFICANT ONE. Sustained authorization failures mean something is
+      # repeatedly asking for work it is not entitled to: a misconfigured worker, a stale
+      # credential after a revocation, or a compromised worker probing the boundary. The
+      # boundary is holding (these are refusals), but the CAUSE needs a human.
+      - alert: MbsScannerAuthzFailureSpike
+        expr: sum(rate(mbs_scanner_authz_denied_total[5m])) > 0.2
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Sustained scanner authorization failures"
+          description: "The scanner-manager is refusing {{ $value | printf \"%.2f\" }} req/s. Reasons are on mbs_scanner_authz_denied_total{reason=...}. WORKER_REVOKED means a revoked worker is still trying; WORKER_WRONG_SITE/WORKER_WRONG_WORKSPACE means a worker is asking for another tenant's work -- investigate as a possible compromise."
+
+      # Blocked egress is the system working, but a spike means something is repeatedly
+      # trying to leave the permitted set -- most importantly, to reach the control plane.
+      - alert: MbsScannerEgressBlockedSpike
+        expr: sum(rate(mbs_scanner_egress_blocked_total{reason="EGRESS_CONTROL_PLANE_DENIED"}[5m])) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Scanner attempting to reach the control plane"
+          description: "A scanner is repeatedly attempting to connect to a control-plane service. The network segmentation and the egress guard are both refusing it, but a scanner has no legitimate reason to try -- treat as a possible compromise of the execution plane."
+
+      - alert: MbsPrivateScanBlocked
+        expr: sum(rate(mbs_private_scan_blocked_total[15m])) > 0.05
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Private scans are being refused"
+          description: "Private scans are being blocked before execution. Check mbs_private_scan_blocked_total{reason=...}: SITE_SUSPENDED/SITE_NOT_ACTIVE is a lifecycle state, TUNNEL_UNHEALTHY/ROUTE_MISSING is connectivity, TARGET_OUTSIDE_AUTHORIZED_CIDRS means a target is outside what the customer authorized."
+
+      - alert: MbsScannerWorkerRevoked
+        expr: increase(mbs_scanner_worker_revoked_total[1h]) > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "A scanner worker was revoked"
+          description: "{{ $value }} scanner worker(s) revoked in the last hour. Revocation is a deliberate emergency control -- confirm it was intended, and that the corresponding queue is drained."
+
+      - alert: MbsScannerQueueBacklog
+        expr: mbs_scanner_queue_depth > 50
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scanner queue backlog ({{ $labels.zone }})"
+          description: "{{ $value }} scans pending on the {{ $labels.zone }} queue for 30m. For the private zone this usually means that site's dedicated worker is down -- no other worker is permitted to drain it."

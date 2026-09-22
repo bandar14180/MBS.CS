@@ -199,9 +199,89 @@ def test_description_from_the_database_is_rendered_verbatim() -> None:
     assert "Detected potential OS command injection on Windows targets." in text
 
 
-def test_missing_description_falls_back_and_is_never_invented() -> None:
+def test_missing_description_never_invents_scanner_text() -> None:
+    """No `vulnerabilities.description` -> the report must not attribute prose to the scanner.
+
+    The block still carries a Vulnerability Description: a standard, class-based explanation of
+    the weakness (narrative.py), which is generic guidance and not a claim about this target.
+    What must never appear is invented text presented AS the scanning engine's own -- the
+    "Scanning engine description:" attribution is emitted only when the column is populated."""
     text = _pdf_text(render_technical(_data([_row(description=None)])))
-    assert "Not available in scan evidence" in text
+    assert "Vulnerability Description" in text
+    assert "Scanning engine description" not in text
+
+
+def test_present_description_is_attributed_to_the_scanner_verbatim() -> None:
+    text = _pdf_text(render_technical(_data([_row(description="Observed traversal on /etc.")])))
+    assert "Scanning engine description: Observed traversal on /etc." in text
+
+
+# --- MBS-authored descriptions for reviewed templates -------------------------------------
+# Where the scanner supplied no description, a reviewed template may contribute MBS-authored
+# prose (finding_descriptions.py). It is rendered under its OWN attribution. These pin that
+# the two provenances stay separate in the actual PDF, not merely in narrative.py.
+#
+# `_row`'s default template is "apache-path-traversal", which is NOT catalogued -- so the
+# existing "never invents scanner text" test above keeps testing what it always did.
+
+def _has_analyst_attribution(text: str) -> bool:
+    return "MBS analyst description" in text
+
+
+@pytest.mark.parametrize("template_id", ["reflected-xss", "blind-ssrf"])
+def test_catalogued_template_with_null_description_renders_the_mbs_description(template_id):
+    """A reviewed template + NULL vulnerabilities.description -> MBS prose, attributed to MBS."""
+    text = _pdf_text(render_technical(_data([
+        _row(template_id=template_id, description=None)
+    ])))
+    assert "Vulnerability Description" in text
+    assert _has_analyst_attribution(text), f"{template_id} rendered no MBS description"
+    # ... and it is NOT passed off as the engine's output.
+    assert "Scanning engine description" not in text
+
+
+@pytest.mark.parametrize("template_id", ["reflected-xss", "blind-ssrf"])
+def test_curated_description_is_never_labelled_as_a_scanner_description(template_id):
+    """THE PROVENANCE INVARIANT, asserted on the rendered document. A distinctive phrase from
+    the catalogue text must appear only after the MBS attribution, never after the engine's."""
+    text = _pdf_text(render_technical(_data([
+        _row(template_id=template_id, description=None)
+    ])))
+    assert "Scanning engine description" not in text
+    scanner_idx = text.find("Scanning engine description")
+    assert scanner_idx == -1
+    assert text.find("MBS analyst description") != -1
+
+
+@pytest.mark.parametrize("template_id", ["reflected-xss", "blind-ssrf"])
+def test_catalogued_template_with_a_scanner_description_prefers_the_scanner(template_id):
+    """The engine described this finding, so the engine's words are what the reader gets; the
+    catalogue must not also appear, which would double up on the same subsection."""
+    text = _pdf_text(render_technical(_data([
+        _row(template_id=template_id, description="Engine matched the condition.")
+    ])))
+    assert "Scanning engine description: Engine matched the condition." in text
+    assert not _has_analyst_attribution(text)
+
+
+def test_uncatalogued_template_with_null_description_still_renders_normally():
+    """No review, no MBS prose, no fabricated text -- and the block still renders."""
+    pdf = render_technical(_data([_row(template_id="something-opaque", description=None)]))
+    assert pdf[:4] == b"%PDF"
+    text = _pdf_text(pdf)
+    assert "Vulnerability Description" in text
+    assert "Scanning engine description" not in text
+    assert not _has_analyst_attribution(text)
+
+
+def test_existing_scanner_description_behaviour_is_unchanged_for_uncatalogued_templates():
+    """Verbatim scanner attribution on the default (uncatalogued) template, exactly as before
+    this catalogue existed."""
+    text = _pdf_text(render_technical(_data([
+        _row(description="Detected a path traversal condition.")
+    ])))
+    assert "Scanning engine description: Detected a path traversal condition." in text
+    assert not _has_analyst_attribution(text)
 
 
 def test_long_urls_do_not_break_rendering() -> None:
@@ -346,20 +426,28 @@ def test_finding_card_exposes_the_requested_fields() -> None:
         assert label in text, f"missing field: {label}"
 
 
-def test_recommendation_absent_when_no_remediation_data_exists() -> None:
-    """No remediation text in the data -> the report must not invent one."""
+def test_generated_controls_are_labelled_as_not_evidence_derived() -> None:
+    """No pipeline remediation -> standard class controls, under an unambiguous label.
+
+    The report must never let generated guidance read as remediation the assessment produced,
+    so the label states in-line that it is not derived from scan evidence."""
     row = _row(description="d")
     assert row.remediation_summary is None
     assert row.remediation_references == []
     text = _pdf_text(render_technical(_data([row])))
-    assert "Recommendation" not in text
+    assert "Recommended controls (standard guidance for this weakness class" in text
+    assert "not derived from scan evidence" in text
+    # And it must NOT be presented as the pipeline's own remediation.
+    assert "Remediation (from the assessment pipeline)" not in text
 
 
-def test_recommendation_rendered_verbatim_when_present() -> None:
+def test_pipeline_remediation_rendered_verbatim_and_attributed() -> None:
     row = _row(description="d")
     row.remediation_summary = "Upgrade the affected component to a supported release."
     row.remediation_references = ["https://example.com/advisory"]
     text = _pdf_text(render_technical(_data([row])))
-    assert "Recommendation" in text
+    assert "Remediation (from the assessment pipeline)" in text
     assert "Upgrade the affected component to a supported release." in text
     assert "https://example.com/advisory" in text
+    # Pipeline guidance exists -> the generated fallback must not also appear.
+    assert "not derived from scan evidence" not in text

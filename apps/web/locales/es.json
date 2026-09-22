@@ -1,5 +1,7 @@
 {
-  "common": { "language": "Idioma" },
+  "common": {
+    "language": "Idioma"
+  },
   "nav": {
     "services": "Servicios",
     "agents": "Agentes de IA",
@@ -22,22 +24,58 @@
   "services": {
     "title": "Seguridad empresarial, automatizada",
     "subtitle": "Una plataforma de evaluación de espectro completo impulsada por IA — en web, API, nube y red.",
-    "aiPentest": { "title": "Pruebas de penetración con IA", "desc": "Agentes autónomos planifican, ejecutan y validan las evaluaciones de extremo a extremo." },
-    "web": { "title": "Seguridad de aplicaciones web", "desc": "Detecta el OWASP Top 10 y fallos de lógica de negocio en tus aplicaciones web." },
-    "api": { "title": "Evaluación de seguridad de API", "desc": "Descubre y prueba endpoints REST en busca de riesgos de autenticación, exposición e inyección." },
-    "cloud": { "title": "Evaluación de seguridad en la nube", "desc": "Evalúa cuentas de nube en busca de configuraciones incorrectas y exposición en AWS." },
-    "network": { "title": "Pruebas de seguridad de red", "desc": "Descubrimiento de puertos, servicios y versiones con reconocimiento de red profundo." },
-    "vuln": { "title": "Análisis de vulnerabilidades", "desc": "La IA correlaciona, prioriza y deduplica hallazgos según el riesgo real de negocio." },
-    "reporting": { "title": "Informes de seguridad", "desc": "Informes ejecutivos y técnicos con CVSS, evidencia y pasos de remediación." }
+    "aiPentest": {
+      "title": "Pruebas de penetración con IA",
+      "desc": "Agentes autónomos planifican, ejecutan y validan las evaluaciones de extremo a extremo."
+    },
+    "web": {
+      "title": "Seguridad de aplicaciones web",
+      "desc": "Detecta el OWASP Top 10 y fallos de lógica de negocio en tus aplicaciones web."
+    },
+    "api": {
+      "title": "Evaluación de seguridad de API",
+      "desc": "Descubre y prueba endpoints REST en busca de riesgos de autenticación, exposición e inyección."
+    },
+    "cloud": {
+      "title": "Evaluación de seguridad en la nube",
+      "desc": "Evalúa cuentas de nube en busca de configuraciones incorrectas y exposición en AWS."
+    },
+    "network": {
+      "title": "Pruebas de seguridad de red",
+      "desc": "Descubrimiento de puertos, servicios y versiones con reconocimiento de red profundo."
+    },
+    "vuln": {
+      "title": "Análisis de vulnerabilidades",
+      "desc": "La IA correlaciona, prioriza y deduplica hallazgos según el riesgo real de negocio."
+    },
+    "reporting": {
+      "title": "Informes de seguridad",
+      "desc": "Informes ejecutivos y técnicos con CVSS, evidencia y pasos de remediación."
+    }
   },
   "agents": {
     "title": "Cinco agentes de IA autónomos. Un solo pipeline.",
     "subtitle": "Cada evaluación recorre una cadena coordinada de agentes de IA especializados — desde el descubrimiento hasta un informe listo para la junta.",
-    "recon": { "title": "Agente de reconocimiento", "desc": "Descubrimiento de activos, análisis de dominios, detección de tecnología y mapeo de la superficie de ataque." },
-    "vulnAnalysis": { "title": "Agente de análisis de vulnerabilidades", "desc": "Analiza debilidades, identifica vulnerabilidades y las prioriza por riesgo." },
-    "validation": { "title": "Agente de validación de seguridad", "desc": "Valida los hallazgos y reduce los falsos positivos antes de que lleguen a ti." },
-    "risk": { "title": "Agente de evaluación de riesgos", "desc": "Calcula el riesgo y explica el impacto de negocio en lenguaje claro." },
-    "report": { "title": "Agente de generación de informes", "desc": "Genera automáticamente informes de seguridad profesionales alineados con los marcos." },
+    "recon": {
+      "title": "Agente de reconocimiento",
+      "desc": "Descubrimiento de activos, análisis de dominios, detección de tecnología y mapeo de la superficie de ataque."
+    },
+    "vulnAnalysis": {
+      "title": "Agente de análisis de vulnerabilidades",
+      "desc": "Analiza debilidades, identifica vulnerabilidades y las prioriza por riesgo."
+    },
+    "validation": {
+      "title": "Agente de validación de seguridad",
+      "desc": "Valida los hallazgos y reduce los falsos positivos antes de que lleguen a ti."
+    },
+    "risk": {
+      "title": "Agente de evaluación de riesgos",
+      "desc": "Calcula el riesgo y explica el impacto de negocio en lenguaje claro."
+    },
+    "report": {
+      "title": "Agente de generación de informes",
+      "desc": "Genera automáticamente informes de seguridad profesionales alineados con los marcos."
+    },
     "flow": {
       "target": "Objetivo",
       "recon": "Reconocimiento",
@@ -51,10 +89,22 @@
   "trust": {
     "title": "Diseñado para empresas que no pueden equivocarse en seguridad",
     "subtitle": "La seguridad y la confianza están diseñadas en el núcleo — no añadidas después.",
-    "isolation": { "title": "Aislamiento a nivel de base de datos", "desc": "La seguridad a nivel de fila impone un aislamiento estricto de inquilinos en cada registro." },
-    "authorization": { "title": "La autorización primero", "desc": "Ningún escaneo se ejecuta sin prueba verificada de propiedad del objetivo." },
-    "evidence": { "title": "Respaldado por evidencia", "desc": "Cada hallazgo se rastrea hasta evidencia bruta almacenada y protegida con sumas de verificación." },
-    "frameworks": { "title": "Alineado con marcos", "desc": "Los hallazgos se asignan a controles de OWASP, NIST, ISO 27001 y PCI DSS." }
+    "isolation": {
+      "title": "Aislamiento a nivel de base de datos",
+      "desc": "La seguridad a nivel de fila impone un aislamiento estricto de inquilinos en cada registro."
+    },
+    "authorization": {
+      "title": "La autorización primero",
+      "desc": "Ningún escaneo se ejecuta sin prueba verificada de propiedad del objetivo."
+    },
+    "evidence": {
+      "title": "Respaldado por evidencia",
+      "desc": "Cada hallazgo se rastrea hasta evidencia bruta almacenada y protegida con sumas de verificación."
+    },
+    "frameworks": {
+      "title": "Alineado con marcos",
+      "desc": "Los hallazgos se asignan a controles de OWASP, NIST, ISO 27001 y PCI DSS."
+    }
   },
   "cta": {
     "title": "¿Listo para automatizar tus evaluaciones de seguridad?",
@@ -137,7 +187,10 @@
     "back": "Proyectos",
     "tabTargets": "Objetivos",
     "tabScans": "Análisis",
+    "tabAssets": "Activos",
     "tabVulnerabilities": "Vulnerabilidades",
+    "tabRemediation": "Remediación",
+    "tabAssessments": "Evaluaciones",
     "tabReports": "Informes"
   },
   "targets": {
@@ -163,6 +216,12 @@
     "newScan": "Nuevo análisis",
     "target": "Objetivo",
     "modules": "Módulos",
+    "selectAll": "Seleccionar todo",
+    "clearAll": "Borrar todo",
+    "findsVulns": "detecta vulnerabilidades",
+    "toolUnavailable": "no instalado",
+    "toolUnavailableHint": "El binario `{binary}` no está en el PATH del worker de escaneo. Seleccionar esta herramienta registrará una ejecución fallida y no producirá hallazgos.",
+    "vulnToolsNote": "Solo nuclei y nuclei-dast pueden reportar vulnerabilidades; las demás herramientas inventarían activos (subdominios, puertos, URL). Un escaneo sin ellas termina con una lista de vulnerabilidades vacía porque nada se probó — no porque el objetivo esté limpio.",
     "active": "activo",
     "activeNote": "Los módulos activos requieren un objetivo con autorización de prueba activa.",
     "useAiPlanner": "Usar planificador de IA",
@@ -190,15 +249,23 @@
     "sNotApplicable": "No aplicable a este tipo de objetivo",
     "sNotRun": "No ejecutado (una etapa anterior falló)",
     "sSkippedUnauth": "Omitido (no autorizado)",
-    "stageSubfinder": "Reconocimiento — Subdominios",
-    "stageHttpx": "Hosts Activos",
-    "stageNaabu": "Escaneo de Puertos",
-    "stageNmap": "Detección de Servicios",
-    "stageNuclei": "Escaneo de Vulnerabilidades",
     "fixDns": "No se pudo resolver el nombre de host del objetivo. Comprueba que el dominio/host esté bien escrito y sea resoluble públicamente (con registros DNS).",
     "fixTimeout": "La herramienta agotó el tiempo. El objetivo puede estar lento, limitando la tasa o filtrando el tráfico — reintenta o reduce el alcance.",
     "fixRefused": "El objetivo rechazó la conexión o es inalcanzable desde el escáner. Confirma que esté en línea y accesible.",
-    "fixGeneric": "Revisa el error de la herramienta anterior y la configuración del objetivo, luego vuelve a ejecutar el análisis."
+    "fixGeneric": "Revisa el error de la herramienta anterior y la configuración del objetivo, luego vuelve a ejecutar el análisis.",
+    "sPartial": "Parcial — cobertura incompleta",
+    "stageSubfinder": "Reconocimiento — Subdominios",
+    "stageAmass": "Reconocimiento — Superficie de Ataque",
+    "stageDnsx": "Resolución DNS",
+    "stageHttpx": "Hosts Activos",
+    "stageWhatweb": "Huella Tecnológica",
+    "stageNaabu": "Escaneo de Puertos",
+    "stageNmap": "Detección de Servicios",
+    "stageKatana": "Descubrimiento de Contenido",
+    "stageFfuf": "Fuzzing de Directorios",
+    "stageArjun": "Descubrimiento de Parámetros",
+    "stageNuclei": "Escaneo de Vulnerabilidades",
+    "stageNucleiDast": "Pruebas Web Activas"
   },
   "vulns": {
     "severity": "Gravedad",

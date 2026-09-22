@@ -1,0 +1,257 @@
+# MBS.SC PHASE 7 -- WIREGUARD VERIFICATION LAB
+#
+# WHAT THIS IS
+# ------------
+# A disposable, self-contained lab that instantiates the EXISTING private-site architecture
+# (infra/docker-compose.private-site.yml) against SIMULATED customer networks, so the Phase 7
+# security properties can be exercised with real packets instead of only unit tests.
+#
+# It is a LAB, not a deployment. It is never applied alongside the production overlay, it
+# creates its own networks, and every address in it is RFC1918 space owned by this lab.
+#
+# WHAT IS SIMULATED vs REAL
+# -------------------------
+#   SIMULATED: the two "customer" networks and their hosts. `customer-a-gw` plays the role of
+#              the customer's WireGuard endpoint; `customer-a-target` and `customer-b-target`
+#              play in-network hosts.
+#   REAL:      the WireGuard tunnel itself (kernel WireGuard, real handshake, real routes),
+#              the worker image (infra/docker/Dockerfile.worker), the worker code
+#              (apps.api.scanner_worker.main), the scanner-manager, and every authorization
+#              check in between. Nothing in the enforcement path is stubbed.
+#
+# TOPOLOGY
+# --------
+#   customer-a-net  10.90.0.0/24   customer-a-gw (WG server) + customer-a-target
+#   customer-b-net  10.91.0.0/24   customer-b-target                (must be UNREACHABLE)
+#   tunnel subnet   10.99.0.0/24   worker 10.99.0.2  <-> gw 10.99.0.1
+#
+#   AUTHORIZED CIDR for site A: 10.90.0.0/24   (and ONLY that)
+#   UNAUTHORIZED:               10.91.0.0/24   (customer B), plus everything else
+#
+# The worker deliberately has NO route to customer-a-net except through the tunnel: it is not
+# attached to customer-a-net at all, so reachability there PROVES the tunnel carried it.
+#
+# TEARDOWN
+#   docker compose -f infra/lab/phase7/docker-compose.lab.yml down -v
+
+networks:
+  # "Customer A's internal network." The worker is NOT a member -- it must arrive via WireGuard.
+  lab-customer-a:
+    name: lab-customer-a
+    ipam:
+      config:
+        - subnet: 10.90.0.0/24
+  # "Customer B's internal network." Nothing in this lab bridges A and B.
+  lab-customer-b:
+    name: lab-customer-b
+    ipam:
+      config:
+        - subnet: 10.91.0.0/24
+  # The path the worker uses to REACH the customer gateway's WireGuard endpoint. Stands in for
+  # the public internet: in production the endpoint is reached over the worker's egress network.
+  lab-transit:
+    name: lab-transit
+    ipam:
+      config:
+        - subnet: 10.92.0.0/24
+  # The EXISTING dispatch network from the main stack -- joined, never redefined, so the
+  # lab worker reaches the real scanner-manager exactly as a production private worker does.
+  # `external: true` means this compose file can neither create nor alter it.
+  mbs-dispatch:
+    external: true
+    name: infra_mbs-dispatch
+
+services:
+  # -------------------------------------------------------------------------------------
+  # CUSTOMER A -- WireGuard endpoint (the "customer side" of the tunnel).
+  # -------------------------------------------------------------------------------------
+  # Plays the role the CUSTOMER operates in production. It holds its own private key, accepts
+  # the worker as a peer, and routes the tunnel into customer-a-net.
+  customer-a-gw:
+    image: alpine:3.20
+    container_name: lab-customer-a-gw
+    cap_add: [NET_ADMIN]
+    sysctls:
+      # The gateway IS a router (that is its job); the WORKER is not, and has forwarding off.
+      net.ipv4.ip_forward: "1"
+    networks:
+      lab-transit:
+        ipv4_address: 10.92.0.10
+      lab-customer-a:
+        ipv4_address: 10.90.0.10
+    volumes:
+      - ./gw-entrypoint.sh:/entrypoint.sh:ro
+      - ./gw-wg0.conf:/etc/wireguard/wg0.conf:ro
+    command: ["sh", "/entrypoint.sh"]
+
+  # CUSTOMER A -- an in-network host inside the AUTHORIZED CIDR (10.90.0.0/24).
+  # This is the target the private worker must be able to reach THROUGH the tunnel.
+  customer-a-target:
+    image: python:3.12-alpine
+    container_name: lab-customer-a-target
+    networks:
+      lab-customer-a:
+        ipv4_address: 10.90.0.20
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /srv && cd /srv
+        printf '%s' '<html><head><title>Customer A Internal</title></head><body><h1>CUSTOMER-A-INTERNAL-ASSET</h1></body></html>' > index.html
+        # Port 80: httpx probes 80/443 by default, and the scanner passes the target through
+        # without a port. On 8080 the scan ran correctly and simply found nothing -- a
+        # vacuous pass that proves nothing about the tunnel.
+        exec python -m http.server 80 --bind 0.0.0.0
+
+  # CUSTOMER A -- the site's DNS resolver, INSIDE the customer network.
+  # Private names must resolve through the customer's own resolver, reached over the tunnel --
+  # never through a public resolver (that is what scanner_engine/site_dns.py enforces, and why
+  # the rendered wg0.conf deliberately omits wg-quick's DNS=). Serving 10.90.0.0/24 only.
+  customer-a-dns:
+    image: 4km3/dnsmasq:2.90-r3
+    container_name: lab-customer-a-dns
+    cap_add: [NET_ADMIN]
+    networks:
+      lab-customer-a:
+        ipv4_address: 10.90.0.53
+    command:
+      - --no-daemon
+      - --log-queries
+      # The only record this lab needs: the in-network asset.
+      - --address=/app.customer-a.internal/10.90.0.20
+      # No upstream: a name this resolver does not know gets no answer, rather than being
+      # forwarded out of the customer network.
+      - --no-resolv
+
+  # CUSTOMER B -- an in-network host on a DIFFERENT customer's network (10.91.0.0/24).
+  # Nothing authorizes this address for site A, and no route to it exists on the worker.
+  # Reaching it would be a cross-tenant isolation failure.
+  customer-b-target:
+    image: python:3.12-alpine
+    container_name: lab-customer-b-target
+    networks:
+      lab-customer-b:
+        ipv4_address: 10.91.0.20
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /srv && cd /srv
+        printf '%s' '<html><body><h1>CUSTOMER-B-INTERNAL-ASSET</h1></body></html>' > index.html
+        exec python -m http.server 80 --bind 0.0.0.0
+
+  # -------------------------------------------------------------------------------------
+  # THE MBS PRIVATE WORKER -- the actual subject of Phase 7.
+  # -------------------------------------------------------------------------------------
+  # This is the REAL worker image running the REAL entrypoint. Its configuration mirrors
+  # infra/docker-compose.private-site.yml field for field; only the identifiers and the lab
+  # networks differ. Nothing about the security posture is relaxed for the lab:
+  #   * scanner env file only -- no control-plane credentials
+  #   * cap_drop ALL + cap_add NET_ADMIN (the one capability WireGuard needs)
+  #   * no-new-privileges, non-root, read_only rootfs
+  #   * ip_forward=0 -- a tunnel ENDPOINT, never a router
+  #   * private key on tmpfs, delivered as a FILE (never an env value)
+  #   * NOT attached to mbs-core: no MySQL, no Redis, no MinIO, no API
+  #   * NOT attached to lab-customer-a: the ONLY path to 10.90.0.0/24 is the tunnel
+  worker-site-lab-a:
+    build:
+      context: ../../..
+      dockerfile: infra/docker/Dockerfile.worker
+    image: infra-worker
+    container_name: lab-worker-site-a
+    restart: "no"
+    command: ["python", "-m", "apps.api.scanner_worker.main"]
+    env_file:
+      - ../../../.env.scanner
+    environment:
+      ENVIRONMENT: production
+      SCANNER_EXECUTION_PLANE: "true"
+      SCANNER_MANAGER_URL: http://scanner-manager:8100
+      SCANNER_WORKER_ID: worker-site-lab-a
+      SCANNER_POOL_ID: private-lab-a
+      SCANNER_SITE_ID: "${LAB_SITE_ID}"
+      SCANNER_WORKER_TOKEN_FILE: /run/secrets/lab_worker_token
+      SCANNER_WIREGUARD_INTERFACE: wg0
+      SCANNER_WIREGUARD_ADDRESS: 10.99.0.2/32
+      SCANNER_WIREGUARD_PRIVATE_KEY_FILE: /run/secrets/lab_wg_private_key
+      # THE OUTER SAFETY BOUNDARY (net_guard's KEY 1). Private scanning needs BOTH keys:
+      # this global ceiling AND the per-scan policy derived from the site's persisted
+      # authorization. With this unset the first E2E run was refused with
+      #   "Address 10.90.0.20 is not permitted: ... blocked by SSRF policy"
+      # even though the site authorized it -- which is the two-key rule working correctly.
+      # Scoped to EXACTLY the site's authorized CIDR, so the ceiling is never wider than the
+      # grant. In production this is the on-prem engagement setting described in core/config.
+      SCAN_ALLOW_PRIVATE_TARGETS: "true"
+      SCAN_ALLOWED_CIDRS: '["10.90.0.0/24"]'
+    networks:
+      # transit -> reach the customer's WireGuard endpoint (stands in for the internet).
+      # mbs-dispatch -> reach the scanner-manager, and NOTHING else on the control plane.
+      - lab-transit
+      - mbs-dispatch
+    secrets:
+      - lab_worker_token
+      - lab_wg_private_key
+    # ------------------------------------------------------------------------------------
+    # P7-1: THE SECURITY POSTURE BELOW IS COPIED VERBATIM FROM THE PRODUCTION TEMPLATE.
+    # ------------------------------------------------------------------------------------
+    # Every key in this block is byte-identical to `worker-site-SITE_SLUG` in
+    # infra/docker-compose.private-site.yml -- entrypoint, cap_drop, cap_add, security_opt,
+    # read_only, tmpfs, sysctls, and the deliberate ABSENCE of a `user:` key.
+    #
+    # That is the point of the lab: it must prove the SHIPPED configuration works, not a
+    # relaxed variant of it. An earlier revision of this file ran the worker as `user: "0:0"`
+    # to work around P7-1; that proved the tunnel architecture but said nothing about whether
+    # the production manifest could start. The template is now fixed, so the lab runs the
+    # real thing.
+    #
+    # `test_phase7_private_connectivity.py::test_lab_worker_matches_the_production_security_posture`
+    # asserts this equivalence, so the two cannot drift apart silently.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        command -v setpriv >/dev/null 2>&1 || {
+          echo "FATAL: setpriv (util-linux) is missing from this image. The private worker
+        must drop from root to uid 10001 while retaining ambient CAP_NET_ADMIN, and setpriv is
+        what performs that drop. It is pinned in infra/docker/Dockerfile.worker; a base-image
+        change has removed it." >&2
+          exit 1
+        }
+        exec setpriv \
+          --reuid=10001 --regid=10001 --clear-groups \
+          --inh-caps=+net_admin --ambient-caps=+net_admin \
+          -- "$@"
+      - --
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      # uid/gid 10001 because the worker drops to that user before tunnel_setup writes
+      # its ephemeral 0600 key file here. mode=0700 is retained, so the directory stays
+      # private to the scanner user and is still RAM-only -- the key never reaches a
+      # persistent layer. Without the uid= option the tmpfs is root-owned and the dropped
+      # worker cannot create the file (observed: PermissionError on /run/wireguard).
+      - /run/wireguard:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001,size=1m
+      - /tmp:rw,noexec,nosuid,size=1g
+      - /run/prometheus-multiproc:rw,nosuid,mode=1777,size=64m
+    # `user: "0:0"` = the SETUP phase only; the entrypoint drops to 10001:10001 before the
+    # worker runs. Required because the image's default USER is appuser, which would leave
+    # the entrypoint with no capabilities to hand down. See the production template.
+    user: "0:0"
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    depends_on:
+      - customer-a-gw
+
+secrets:
+  lab_worker_token:
+    file: ./secrets/worker_token.txt
+  lab_wg_private_key:
+    file: ./secrets/wg_private.key

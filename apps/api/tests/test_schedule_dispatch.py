@@ -27,6 +27,17 @@ def _patch_delay(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(scan_tasks.run_scan_task, "delay",
                         lambda sid, **kw: (calls.append(sid), _FakeResult())[1])
+
+    # MBS.SC Phase 5: create_scan now dispatches via apply_async(args=[...], queue=...) so
+    # a private scan can be routed to its own per-site queue. Record the scan id out of
+    # `args` so these assertions keep working, and keep `delay` patched above for the
+    # other call sites (DLQ replay, the queued-relay) that still use it.
+    def _fake_apply_async(args=None, kwargs=None, **opts):
+        if args:
+            calls.append(args[0])
+        return _FakeResult()
+
+    monkeypatch.setattr(scan_tasks.run_scan_task, "apply_async", _fake_apply_async)
     return calls
 
 
@@ -81,13 +92,17 @@ async def _scan_count(project_id: str) -> int:
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with maker() as s:
-            return await s.scalar(select(func.count()).select_from(Scan).where(Scan.project_id == uuid.UUID(project_id)))
+            # `scalar()` is typed Optional; COUNT(*) always returns a row, so coalesce for the
+            # declared int return type.
+            return await s.scalar(
+                select(func.count()).select_from(Scan).where(Scan.project_id == uuid.UUID(project_id))
+            ) or 0
     finally:
         await engine.dispose()
 
 
 def _make_due(sid: str):
-    asyncio.run(_exec("UPDATE scan_schedules SET next_run_at = now() - interval '1 minute' WHERE id = :i",
+    asyncio.run(_exec("UPDATE scan_schedules SET next_run_at = now() - INTERVAL 1 MINUTE WHERE id = :i",
                      i=uuid.UUID(sid)))
 
 
@@ -150,7 +165,7 @@ def test_disabled_and_not_due_are_skipped(client, monkeypatch):
     assert asyncio.run(_scan_count(project)) == 0
 
     # disabled AND due -> still skipped (enabled filter)
-    asyncio.run(_exec("UPDATE scan_schedules SET enabled = false, next_run_at = now() - interval '1 minute' WHERE id = :i",
+    asyncio.run(_exec("UPDATE scan_schedules SET enabled = false, next_run_at = now() - INTERVAL 1 MINUTE WHERE id = :i",
                      i=uuid.UUID(sid)))
     asyncio.run(_run_due())
     assert asyncio.run(_scan_count(project)) == 0

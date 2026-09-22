@@ -62,6 +62,15 @@ async def require_verified_target(
     creation (HTTP request) and again at execution time (orchestrator, right
     before a tool actually runs) since authorization can be revoked in between.
     """
+    from apps.api.core.config import get_settings
+
+    # Unconditional short-circuit: this must override an EXISTING scope too, not just fill in
+    # a missing/unverified/expired one -- a target manually verified earlier with "allow active
+    # testing" left unchecked (the checkbox's default) would otherwise still block nuclei/etc.
+    # even with the escape hatch on, which defeats the point of it for local development.
+    if get_settings().dev_auto_authorize_targets:
+        return await _dev_auto_authorize(db, target_id)
+
     try:
         scope = await get_current_scope(db, workspace_id, project_id, target_id)
     except HTTPException as exc:
@@ -71,12 +80,40 @@ async def require_verified_target(
             )
         raise
 
+    expired = scope.expires_at is not None and scope.expires_at < datetime.now(timezone.utc)
+
     if not scope.verified:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This target's authorization scope is not verified")
 
-    if scope.expires_at is not None and scope.expires_at < datetime.now(timezone.utc):
+    if expired:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This target's authorization scope has expired")
 
+    return scope
+
+
+async def _dev_auto_authorize(db: AsyncSession, target_id: uuid.UUID) -> AuthorizationScope:
+    """DEV_AUTO_AUTHORIZE_TARGETS escape hatch (local development only; refused at startup
+    in production -- see Settings.validate_production). Creates, or updates, a verified,
+    active-testing-allowed authorization scope for `target_id` on the fly -- see the flag's
+    docstring in core/config.py. Reuses the latest existing row (if any) rather than always
+    inserting a new one, so re-running a dev scan doesn't pile up scope history."""
+    scope = await db.scalar(
+        select(AuthorizationScope)
+        .where(AuthorizationScope.target_id == target_id)
+        .order_by(AuthorizationScope.created_at.desc())
+        .limit(1)
+    )
+    if scope is None:
+        scope = AuthorizationScope(
+            target_id=target_id, proof_type="dev_auto", proof_reference="DEV_AUTO_AUTHORIZE_TARGETS"
+        )
+        db.add(scope)
+    scope.verified = True
+    scope.verified_at = datetime.now(timezone.utc)
+    scope.active_testing_allowed = True
+    scope.expires_at = None
+    await db.commit()
+    await db.refresh(scope)
     return scope
 
 

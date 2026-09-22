@@ -32,6 +32,59 @@ def test_scan_capabilities_endpoint(client: TestClient) -> None:
     assert "subfinder" in caps["domain"]["scanners"]
 
 
+def test_scan_tool_config_allowlisted_key_accepted(client: TestClient, no_celery_dispatch) -> None:
+    # A known runner knob (timeout_seconds) is accepted and merged into scan.config.
+    owner = _register(client, "Owner")
+    headers = _auth(owner)
+    workspace_id, project_id, target_id = _make_target(client, headers)
+    _verify_target(client, headers, workspace_id, project_id, target_id)
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans",
+        headers=headers,
+        json={
+            "target_id": target_id, "scan_type": "network", "requested_modules": ["naabu"],
+            "tool_config": {"timeout_seconds": 900},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["config"]["timeout_seconds"] == 900
+
+
+def test_scan_tool_config_unknown_key_rejected(client: TestClient, no_celery_dispatch) -> None:
+    owner = _register(client, "Owner")
+    headers = _auth(owner)
+    workspace_id, project_id, target_id = _make_target(client, headers)
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans",
+        headers=headers,
+        json={
+            "target_id": target_id, "scan_type": "network", "requested_modules": ["naabu"],
+            "tool_config": {"not_a_real_knob": 1},
+        },
+    )
+    assert resp.status_code == 400
+    assert "not_a_real_knob" in resp.json()["detail"]
+
+
+def test_scan_tool_config_cannot_override_orchestration_keys(client: TestClient, no_celery_dispatch) -> None:
+    # tool_config is restricted to ALLOWED_TOOL_CONFIG_KEYS -- an orchestration/safety key
+    # like use_agent isn't even in that allowlist, so it's rejected outright (never silently
+    # merged in a way that could shadow the typed ScanCreate field).
+    owner = _register(client, "Owner")
+    headers = _auth(owner)
+    workspace_id, project_id, target_id = _make_target(client, headers)
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans",
+        headers=headers,
+        json={
+            "target_id": target_id, "scan_type": "network", "requested_modules": ["naabu"],
+            "use_agent": False,
+            "tool_config": {"use_agent": True},
+        },
+    )
+    assert resp.status_code == 400
+
+
 def test_private_ip_target_rejected_at_creation(client: TestClient) -> None:
     # SSRF guard wired into target creation: a private CIDR is refused with 400.
     owner = _register(client, "Owner")
@@ -116,6 +169,49 @@ def test_scan_blocked_on_unverified_target(client: TestClient, no_celery_dispatc
         json={"target_id": target_id, "scan_type": "network", "requested_modules": ["naabu"]},
     )
     assert resp.status_code == 403
+
+
+def test_dev_auto_authorize_targets_skips_manual_verification(
+    client: TestClient, no_celery_dispatch, monkeypatch
+) -> None:
+    # With the dev-only escape hatch on, a target with NO submitted authorization scope at
+    # all must still be allowed to run -- including an active-testing module (nuclei) that
+    # would otherwise be blocked -- without ever calling the submit-proof/verify endpoints.
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "dev_auto_authorize_targets", True)
+
+    owner = _register(client, "Owner")
+    workspace_id, project_id, target_id = _make_target(client, _auth(owner))
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans",
+        headers=_auth(owner),
+        json={"target_id": target_id, "scan_type": "network", "requested_modules": ["nuclei"]},
+    )
+    assert resp.status_code == 202, resp.text
+
+
+def test_dev_auto_authorize_targets_overrides_existing_restrictive_scope(
+    client: TestClient, no_celery_dispatch, monkeypatch
+) -> None:
+    # Regression: a target verified EARLIER with "allow active testing" left unchecked (the
+    # UI checkbox's default) must still get nuclei allowed once the escape hatch is on -- the
+    # bypass must override an existing restrictive scope, not just fill in a missing one.
+    from apps.api.core.config import get_settings
+
+    owner = _register(client, "Owner")
+    workspace_id, project_id, target_id = _make_target(client, _auth(owner))
+    _verify_target(client, _auth(owner), workspace_id, project_id, target_id)  # active_testing_allowed=False
+
+    monkeypatch.setattr(get_settings(), "dev_auto_authorize_targets", True)
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_id}/projects/{project_id}/scans",
+        headers=_auth(owner),
+        json={"target_id": target_id, "scan_type": "network", "requested_modules": ["nuclei"]},
+    )
+    assert resp.status_code == 202, resp.text
 
 
 def test_scan_rejects_unknown_module(client: TestClient, no_celery_dispatch) -> None:

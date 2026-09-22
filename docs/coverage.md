@@ -22,7 +22,7 @@ python -m pytest apps/api/tests \
 ```
 
 Notes:
-- Requires a running Postgres + Redis (the suite uses a real DB for RLS). The dev
+- Requires a running MySQL + Redis (the suite uses a real DB for tenancy tests). The dev
   containers already provide these; from the host, point `DATABASE_URL`/`REDIS_URL` at them.
 - Plain `pytest apps/api/tests -q` still works and is **not** slowed by coverage — the
   `--cov` flags are opt-in per run (coverage is not forced in `addopts`).
@@ -47,7 +47,7 @@ the tests themselves, thin CLI shims (`apps/api/dr/__main__.py`, `apps/api/dr/cl
 
 ## CI behavior
 The `tests` job (`.github/workflows/ci.yml`):
-1. Spins up Postgres + Redis services, installs deps, applies migrations.
+1. Spins up MySQL + Redis services, installs deps, applies migrations.
 2. Runs `pytest apps/api/tests` with `--cov` + `--cov-fail-under=${COVERAGE_FAIL_UNDER}`.
 3. **Fails the build if total coverage < threshold.**
 4. Uploads `coverage.xml` + `htmlcov/` as the **`coverage`** artifact (`if: always()`, so the

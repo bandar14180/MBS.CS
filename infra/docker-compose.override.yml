@@ -10,11 +10,37 @@
 # Compose auto-merges this file for a bare `docker compose up`; an explicit `-f` list must
 # name it (see README), and the production invocation deliberately does not:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# MBS.SC -- DEV-ONLY HOST ACCESS TO THE SEGMENTED PLANES.
+#
+# The base file marks `mbs-core` and `mbs-dispatch` `internal: true`, which is what stops the
+# control plane reaching (and being reached from) the outside world in production. Docker
+# CANNOT publish a host port for a container attached only to internal networks, so with the
+# base file alone `localhost:3307` (MySQL), `localhost:6379` (Redis) and `localhost:9000`
+# (MinIO) stop working -- which breaks local development AND the test suite, both of which
+# connect from the host. Verified directly: the ports silently disappeared from `docker ps`
+# and the suite hung on connection attempts.
+#
+# The fix belongs HERE, not in the base file, for exactly the same reason the port
+# publications do: this file is auto-merged for a bare `docker compose up` and is
+# deliberately NOT part of the production invocation. `mbs-devhost` is a plain (non-internal)
+# bridge that exists only in the dev merge; attaching the datastores to it restores host
+# publication locally while production keeps them strictly internal.
+networks:
+  mbs-devhost:
+    driver: bridge
+
 services:
   api:
     # Single-worker hot-reload for local iteration (base image default is
     # multi-worker, no reload).
     command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # Clears the base file's `unconfigured` stack-mode sentinel. The API refuses to boot on
+    # the sentinel (apps/api/core/stack_mode.py), so this line is what makes a development
+    # stack startable -- and, because it lives in the SAME file as the `../apps/api` bind
+    # mount below, an -f list that drops the mount also drops this and fails loudly instead
+    # of silently serving the image's baked-in copy of the code. See the base file for why.
+    environment:
+      MBS_STACK_MODE: development
     # Direct host access to the API (http://localhost:8000, /docs) for local iteration.
     # This publication lives HERE rather than in the base file: compose APPENDS `ports`
     # across `-f` files instead of replacing them, so a base publication could not be
@@ -29,29 +55,156 @@ services:
       - ../db:/srv/db
 
   worker:
+    environment:
+      MBS_STACK_MODE: development
+    # MEMORY BOUNDARY for the scanner execution plane (dev only; production sizing is a
+    # separate decision). WHY THIS EXISTS: this service runs the scanner tool binaries, and
+    # an unbounded one could take the whole Docker Desktop/WSL2 VM down with it. Measured
+    # directly: during a katana crawl (-js-crawl -jsluice, concurrency 10) this cgroup
+    # peaked at 5877 MiB on a 7979 MiB VM. The VM then entered GLOBAL direct reclaim
+    # (pgscan_direct 25.4e9 vs pgscan_kswapd 11.3e9, 9.4M major faults, swap 84% consumed),
+    # which stalls EVERY container, not just this one -- /proc/pressure/memory recorded 5352
+    # cumulative seconds with all tasks stalled. The API's uvicorn event loop simply stopped
+    # being scheduled for minutes at a time (observed: a 6m25s total gap in its access log,
+    # then ~2750 lines flushed in 5s as the backlog drained), so nginx hit its 60s
+    # proxy_read_timeout and returned 504 on ordinary cheap reads (/scans, /tool-runs,
+    # /notifications/unread-count). The 504s were a SYMPTOM of VM-wide memory exhaustion;
+    # this bound is the fix, and it deliberately trades scanner headroom for control-plane
+    # survival -- a starved API is a worse failure than a degraded scan.
+    #
+    # NO SCANNER CAPABILITY IS REMOVED by this: katana still runs with -js-crawl and
+    # -jsluice, and all 11 tool binaries plus the Playwright Chromium used for screenshot
+    # evidence remain installed and enabled. Only the memory CEILING changes.
+    #
+    # mem_limit (cgroup v2 `memory.max`) is the hard wall. memswap_limit must equal
+    # mem_limit to mean "no swap for this cgroup": Docker defines memswap_limit as
+    # memory+swap COMBINED, so 2g/2g yields a swap allowance of exactly zero. That is
+    # intentional -- letting this cgroup swap is what fed the VM-wide thrashing above.
+    #
+    # mem_reservation is a SOFT floor, and it is worth being precise about what it does and
+    # does not do here, because the obvious reading is wrong. Docker maps it to cgroup v2
+    # `memory.low` (VERIFIED on this host: memory.low = 1572864000, while memory.high stays
+    # `max`) -- that is RECLAIM PROTECTION, not a throttle. Memory below it is protected from
+    # reclaim on a best-effort basis when the VM is under pressure; it does NOT slow this
+    # cgroup down as it approaches mem_limit, and it does NOT soften the OOM kill at the
+    # wall. Docker exposes no mem_limit-adjacent knob for cgroup v2 `memory.high`, so a true
+    # pre-kill throttle would need an explicit cgroup write outside Compose -- deliberately
+    # not done here, since it is neither required for the VM-starvation fix nor expressible
+    # in this file. The value is set because it usefully biases the kernel toward reclaiming
+    # from the OTHER (unbounded) containers before this one's working set during a VM-wide
+    # squeeze; treat the hard wall below as the real mechanism.
+    #
+    # WHY AN OOM KILL HERE IS SAFE (verified against this codebase before choosing 2g):
+    #   * A killed TOOL SUBPROCESS (SIGKILL -> non-zero, non-benign exit) is classified by
+    #     tool_runners/base.py::classify_run as `partial` when it produced usable output,
+    #     else `failed` -- never as success. orchestrator.py then records that tool_run
+    #     with its error_message and COMMITS, and the pipeline continues to the next tool
+    #     ("a crash/timeout in the runner is a failed tool run, NOT a failed scan").
+    #   * If the cgroup OOM killer takes PID 1 instead, `restart: unless-stopped` (base
+    #     file) brings the worker back, and the scan it abandoned is terminalized by
+    #     orchestrator.py::reap_orphaned_scans, which keys on the ~30s
+    #     scans.last_heartbeat_at liveness signal and revokes the execution token.
+    # Either way the outcome is a visibly degraded scan, not silent data corruption.
+    # SIZING, measured against the real pipeline rather than assumed. 2g was the first
+    # attempt and it was too small: it contained the VM-freeze problem correctly, but katana
+    # (-js-crawl -jsluice on a large WordPress target) was OOM-killed inside it on every run
+    # -- exit -9 at 17s, then 37-69s as the runner was tuned -- so scans only ever produced a
+    # partial crawl. Before any limit existed this cgroup peaked at 5877 MiB and katana
+    # finished cleanly (exit 0, 493s, 500 assets), so the real requirement sits between the
+    # two. 4g covers the measured crawl with headroom for the worker's Python process and a
+    # Playwright/Chromium screenshot instance, while still being far below the 7792 MiB VM --
+    # which is the whole point: the isolation property (a scanner cannot exhaust the VM and
+    # starve the API control plane) is preserved, only the ceiling moved.
+    mem_limit: 4g
+    memswap_limit: 4g
+    mem_reservation: 2g
     volumes:
       - ../apps/api:/srv/apps/api
 
   beat:
+    environment:
+      MBS_STACK_MODE: development
+    volumes:
+      - ../apps/api:/srv/apps/api
+
+  # `worker-default` runs REAL application logic on the default queue -- schedules.enqueue_due,
+  # scans.reap_orphans, backup.run, retention.purge -- from code baked into its image. It was
+  # the only code-bearing service without a dev bind mount, so a developer editing any of those
+  # paths saw no effect until the next `--build`: the same silent staleness that produced
+  # months-old report output from the API. Mounted here for parity with `worker` and `beat`;
+  # dev-only, so production continues to run the audited image.
+  worker-default:
     volumes:
       - ../apps/api:/srv/apps/api
 
   # B1: host access to the datastores and the web dev server, for local development ONLY.
-  # psql/redis-cli/the MinIO console and http://localhost:3000 all keep working exactly as
-  # before; none of these publications reach the production merge.
-  postgres:
+  # the mysql CLI/redis-cli/the MinIO console and http://localhost:3000 all keep working
+  # exactly as before; none of these publications reach the production merge.
+  mysql:
     ports:
-      - "5432:5432"
+      # Host 3307 -> container 3306: this machine already has a native MySQL server bound to
+      # the host's 3306, so the compose service is published on 3307 instead to avoid a port
+      # conflict. In-network access (api/worker/etc. via `mysql:3306`) is unaffected either way.
+      - "3307:3306"
+    networks:
+      - mbs-core
+      - mbs-devhost
 
   redis:
     ports:
       - "6379:6379"
+    networks:
+      - mbs-core
+      - mbs-devhost
 
   minio:
     ports:
       - "9000:9000"
       - "9001:9001"
+    networks:
+      - mbs-core
+      - mbs-devhost
 
   web:
     ports:
       - "3000:3000"
+    # DEVELOPMENT web server. These three settings are dev-only and live HERE, not in the
+    # shared docker-compose.yml, precisely because this file is auto-merged for a bare
+    # `docker compose up` but is EXCLUDED from the production `-f` list. When they lived in
+    # the shared file, production inherited them and ran `next dev` against a bind-mounted
+    # host source tree.
+    build:
+      # Dockerfile.web is multi-stage. Its final `runtime` stage is the production image and
+      # deliberately contains no sources and no dev tooling, so it cannot host a hot-reloading
+      # server. `builder` has the full dependency set and the source tree.
+      target: builder
+    command: ["npm", "run", "dev"]
+    environment:
+      # The `builder` stage sets ENV NODE_ENV=production (Dockerfile.web) so that
+      # `RUN npm run build` produces an optimised PRODUCTION bundle -- correct for the image.
+      # But this dev stack reuses that same stage to host `next dev`, and the value is baked
+      # into the image, so the dev server inherited NODE_ENV=production. Next then loads the
+      # Edge runtime in its production configuration, which forbids `eval`, and middleware.ts
+      # (the F-08 CSP layer) died with:
+      #     EvalError: Code generation from strings disallowed for this context
+      # -> every route returned HTTP 500.
+      #
+      # Overriding it here restores the correct mode for a development server. This is
+      # dev-only and cannot affect production: docker-compose.prod.yml is a separate `-f`
+      # list that never includes this file, and the production `runtime` stage sets
+      # NODE_ENV=production itself.
+      NODE_ENV: development
+    volumes:
+      - ../apps/web:/srv
+      - web_node_modules:/srv/node_modules
+      # FE-6: keep Next.js's build output OFF the host bind-mount. `next dev`/`next build`
+      # write thousands of files into `.next`, and on a Windows bind-mount those writes fail
+      # with EACCES part-way through (observed: `next build` aborting at collect-build-traces,
+      # leaving a half-written cache that made the dev server return HTTP 500 with
+      # "Cannot find module .next/server/webpack-runtime.js"). A named volume mounted at the
+      # same path masks the host directory exactly as web_node_modules does for node_modules.
+      - web_next:/srv/.next
+
+  ollama:
+    ports:
+      - "11434:11434"

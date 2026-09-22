@@ -5,10 +5,20 @@ fastapi==0.141.1
 starlette==1.4.1
 uvicorn[standard]==0.30.6
 pydantic-settings==2.5.2
+# Was only a transitive dep of pydantic-settings (its env_file=".env" support). Pinned
+# directly now that core/config.py's _dotenv_snapshot() imports it itself, to compose
+# DATABASE_URL from discrete DB_HOST/DB_USER/... vars that live only in .env (see that
+# function's docstring).
+python-dotenv==1.2.2
 email-validator==2.2.0
 sqlalchemy[asyncio]==2.0.35
-asyncpg==0.29.0
-psycopg2-binary==2.9.9
+# Phase 0 MySQL cutover: asyncpg/psycopg2-binary (Postgres) -> aiomysql (async, used by the
+# app's async engine) + PyMySQL (aiomysql's sync-protocol dependency; also used directly by
+# Alembic's sync engine in db/migrations/env.py). The `cryptography` package already pinned
+# below (for MFA/Fernet) doubles as the dependency MySQL 8's default caching_sha2_password
+# auth plugin needs.
+aiomysql==0.3.2
+pymysql==1.2.0
 alembic==1.13.2
 celery==5.4.0
 redis==5.0.8

@@ -1,3 +1,11 @@
+# AUDIT-005 -- SUPPLY CHAIN: every `uses:` below is pinned to an IMMUTABLE COMMIT SHA, with
+# the human-readable tag kept in the trailing comment. A tag like `@v4` is a moving
+# pointer the action's owner can repoint at any commit at any time, so a tag-pinned
+# workflow executes whatever code that pointer names on the day it runs -- with this
+# repo's secrets and its full checkout. That is the tj-actions/changed-files class of
+# compromise. To update an action: read the diff for the new tag, resolve it with
+#   gh api repos/<owner>/<repo>/git/ref/tags/<tag> --jq .object.sha
+# (dereference an annotated tag via git/tags/<sha>), then replace BOTH sha and comment.
 name: CI
 
 on:
@@ -6,19 +14,24 @@ on:
   pull_request:
 
 jobs:
-  # Unit/integration tests against a real Postgres (RLS needs it) + Redis.
+  # Unit/integration tests against a real MySQL + Redis.
+  #
+  # Phase 0 MySQL cutover: this used to be a `postgres:16-alpine` service (its RLS was what
+  # workspace isolation depended on). Postgres support has been fully removed -- workspace
+  # isolation is now app-layer (apps.api.core.tenancy) -- so this is a straight service swap.
   tests:
     runs-on: ubuntu-latest
     services:
-      postgres:
-        image: postgres:16-alpine
+      mysql:
+        image: mysql:8.0
         env:
-          POSTGRES_USER: mbs
-          POSTGRES_PASSWORD: mbs
-          POSTGRES_DB: mbs
-        ports: ["5432:5432"]
+          MYSQL_USER: mbs
+          MYSQL_PASSWORD: mbs
+          MYSQL_DATABASE: mbs
+          MYSQL_ROOT_PASSWORD: mbs
+        ports: ["3306:3306"]
         options: >-
-          --health-cmd "pg_isready -U mbs -d mbs"
+          --health-cmd "mysqladmin ping -h localhost -u mbs -pmbs"
           --health-interval 5s --health-timeout 5s --health-retries 10
       redis:
         image: redis:7-alpine
@@ -27,9 +40,9 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      DATABASE_URL: postgresql+asyncpg://mbs:mbs@localhost:5432/mbs
+      DATABASE_URL: mysql+aiomysql://mbs:mbs@127.0.0.1:3306/mbs
       # The test suite's autouse fixture wipes every table before each test. This runner's
-      # Postgres is a disposable service container, so explicitly authorize the wipe. Locally
+      # MySQL is a disposable service container, so explicitly authorize the wipe. Locally
       # the suite refuses to run against a non-`*_test` database unless this is set (conftest.py).
       MBS_ALLOW_DB_WIPE: "1"
       REDIS_URL: redis://localhost:6379/0
@@ -44,8 +57,8 @@ jobs:
       # pyproject.toml [tool.coverage.report].fail_under). Lower ONLY intentionally.
       COVERAGE_FAIL_UNDER: "80"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Start MinIO (object storage)
@@ -63,6 +76,39 @@ jobs:
           echo "MinIO did not become healthy" >&2
           docker logs minio || true
           exit 1
+      - name: Set MySQL session isolation level (READ COMMITTED)
+        # NOT cosmetic. MySQL defaults to REPEATABLE READ; this codebase's atomic-claim /
+        # cooperative-shutdown machinery is written assuming Postgres's READ COMMITTED
+        # default -- see the identical comment in infra/docker-compose.yml's mysql service
+        # and apps/api/core/db.py's `_mysql_isolation_level`. The app sets this per-engine
+        # for its OWN connections, but many tests open ad-hoc engines directly against
+        # DATABASE_URL, so the server-wide default must be set here too (GitHub Actions
+        # service containers have no equivalent of docker-compose's `command:` override).
+        run: mysql -h 127.0.0.1 -u root -pmbs -e "SET GLOBAL transaction_isolation='READ-COMMITTED';"
+      - name: Grant the app user its disposable scratch-database prefixes
+        # AUDIT-002 / DR. Two suites build REAL databases into a specific state rather than
+        # mocking one: test_schema_version_gate.py migrates scratch DBs to a revision behind /
+        # at / ahead of head to prove the schema gate, and the DR drill restores a backup into
+        # a scratch database. Both create databases named with a reserved disposable prefix.
+        # The `mbs` user's grant is per-database, so without this it can CREATE a database and
+        # is then denied access to it -- and both suites SKIP. A silent skip on a fail-closed
+        # startup gate is exactly the failure this whole check exists to prevent, so the grant
+        # is part of the harness. The prefixes are reserved for throwaway databases; nothing
+        # real is ever named `mbs_sv_*` or `mbs_drtest_*`.
+        run: |
+          mysql -h 127.0.0.1 -u root -pmbs -e "
+            GRANT ALL PRIVILEGES ON \`mbs_sv_%\`.* TO 'mbs'@'%';
+            GRANT ALL PRIVILEGES ON \`mbs_drtest_%\`.* TO 'mbs'@'%';
+            FLUSH PRIVILEGES;"
+      - name: Install MySQL client tools (mysqldump/mysql)
+        # Required by apps/api/tests/test_dr_mysql_integration.py, which runs the REAL
+        # mysqldump/mysql binaries rather than a fake runner. Those tests SKIP when the
+        # binaries are absent -- and a silent skip is precisely how a total DR-backup
+        # failure (TLS verification against MySQL's self-signed cert) shipped green before,
+        # since every other DR test injects a fake. Installing them here keeps that
+        # coverage real. `mysql-client` also provides the `mysql` CLI the isolation-level
+        # step above already depends on.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mysql-client
       - name: Install dependencies
         run: pip install --no-cache-dir -r apps/api/requirements.txt
       - name: Apply migrations
@@ -80,7 +126,7 @@ jobs:
           --cov-fail-under=${COVERAGE_FAIL_UNDER}
       - name: Upload coverage artifacts
         if: ${{ always() }}   # keep the report even when the gate fails, to aid triage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage
           path: |
@@ -94,14 +140,70 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Install lint tooling
         run: pip install --no-cache-dir -r apps/api/requirements-dev.txt
       - name: Ruff lint (blocking)
-        run: ruff check apps/api --output-format=github
+        # AUDIT-013: `scripts` added to the lint scope. It was previously excluded entirely --
+        # despite holding scripts/raw_sql_inventory.py, which IS the raw-SQL security gate. A
+        # syntax error or undefined name in the gate itself would have shipped unnoticed.
+        run: ruff check apps/api scripts --output-format=github
+      - name: mypy type check (blocking)
+        # AUDIT-013: CI had NO Python type checker at all. Ruff's selected ruleset catches
+        # undefined names and unused imports; it cannot catch a wrong argument type, a
+        # None-unsafe attribute access, or a call with the wrong arity. Configuration and the
+        # rationale for its calibration live in pyproject.toml [tool.mypy] -- deliberately not
+        # `--strict` (which reports annotation debt, not defects) but with check_untyped_defs
+        # on, so function bodies are actually analysed. It found a real bug on introduction:
+        # ExportedEngagementState.approval_state was typed `str | None` against a non-nullable
+        # JSON `dict` column, which made GDPR tenant export raise ValidationError.
+        run: mypy
+
+  # FE-3: frontend validation gate (BLOCKING). Until this existed, apps/web was never
+  # compiled, type-checked, linted or tested by CI -- a type error or a broken build could
+  # merge unnoticed, because the only frontend coverage was a set of Python text-contract
+  # guards in the backend suite (they check that strings/enums have not drifted; they cannot
+  # catch a type error or a build failure).
+  #
+  # Every step is blocking, ordered cheapest-first so a failure is reported fast and named
+  # precisely: install -> typecheck -> lint -> test -> build. `next build` type-checks again
+  # internally, but the dedicated tsc step fails in seconds and points at the exact file.
+  #
+  # Deterministic for PRs: `npm ci` installs strictly from package-lock.json (never resolves
+  # a newer version), the Node version is pinned to the same major the web image runs (20),
+  # and every script is non-interactive -- `next lint` prompts interactively when ESLint is
+  # unconfigured, which is why .eslintrc.json is committed alongside this job.
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          # Cache keyed on the lockfile; `cache-dependency-path` is required because the
+          # project is not at the repository root.
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install dependencies (locked)
+        # `npm ci` fails outright if package.json and package-lock.json disagree, so a
+        # hand-edited dependency can never silently pass CI.
+        run: npm ci
+      - name: TypeScript type-check (blocking)
+        run: npm run typecheck
+      - name: ESLint (blocking, zero warnings)
+        # --max-warnings=0 lives in the script, so a warning fails the job too: "lint passed"
+        # must not be able to mean "lint found things and shrugged".
+        run: npm run lint
+      - name: Frontend tests (blocking)
+        run: npm test
+      - name: Production build (blocking)
+        run: npm run build
 
   # Supply-chain security (Phase 1.8): GATED dependency vulnerability audit + SBOM.
   # Blocking, but an auditable allowlist (.security/pip-audit-ignore.txt) keeps a
@@ -109,12 +211,21 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Install security tooling
         run: pip install --no-cache-dir -r apps/api/requirements-dev.txt
+      - name: Raw-SQL inventory gate (blocking)
+        # Raw SQL bypasses the ORM workspace filter in apps/api/core/tenancy.py, so the
+        # inventory in docs/architecture/raw-sql-inventory.yml IS the control for those
+        # statements. This scanner rediscovers every production raw-SQL site from the AST and
+        # fails when one is unregistered, or when a registered entry no longer exists -- so a
+        # new statement cannot land unreviewed and the inventory cannot drift silently (it
+        # previously claimed 9 sites while the tree held 26). Stdlib only: it runs before any
+        # project dependency matters, and it needs no database or network.
+        run: python scripts/raw_sql_inventory.py --check
       - name: Dependency vulnerability audit (gated, with allowlist)
         # Build --ignore-vuln args from the allowlist file (skip blanks/comments), then
         # audit the runtime requirements. Non-zero exit fails the job.
@@ -136,7 +247,7 @@ jobs:
         run: python -m cyclonedx_py requirements apps/api/requirements.txt --of JSON -o sbom.cdx.json
       - name: Upload supply-chain artifacts
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: supply-chain
           path: |
@@ -151,11 +262,11 @@ jobs:
   image-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build api image
         run: docker build -f infra/docker/Dockerfile.api -t mbs-api:ci .
       - name: Trivy scan (gate on CRITICAL, fixed only)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: mbs-api:ci
           format: table
@@ -165,7 +276,7 @@ jobs:
           exit-code: "1"          # fail the job on a CRITICAL, fixed vuln
       - name: Trivy report (HIGH+CRITICAL, informational)
         if: ${{ always() }}
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: mbs-api:ci
           format: json
@@ -175,30 +286,67 @@ jobs:
           exit-code: "0"          # report only -- HIGH does not block at this stage
       - name: Upload image-scan report
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: image-scan
           path: trivy-api-report.json
           if-no-files-found: warn
 
-  # Worker image scan -- INFORMATIONAL only (large/slow build, already flaky like
-  # scan-doctor); reports HIGH/CRITICAL but never blocks CI.
+  # Worker image scan -- BLOCKING (F-03).
+  #
+  # WHAT THIS USED TO BE: `continue-on-error: true` PLUS Trivy `exit-code: "0"` -- two
+  # independent neutralizers, so the job was green no matter what it found. The heavy
+  # build and the flakiness of `scan-doctor` were the stated reasons, but they were applied
+  # to a VULNERABILITY GATE rather than to the liveness diagnostic that actually needs
+  # network. The result was the security gate sitting on the WRONG image: the api image
+  # (503MB, no OS packages) blocked on CRITICAL, while this image -- 2.35GB, carrying nmap,
+  # whatweb, dirb, mysql-client, Chromium + ~20 X11 libraries and eight Go scanner binaries,
+  # and run by THREE production services (worker, worker-default, beat) that execute scans
+  # against customer infrastructure and hold DB/Redis/MinIO credentials -- blocked on
+  # nothing. A real scan at the time of the fix found 19 CRITICAL findings in it.
+  #
+  # SEVERITY POLICY -- deliberately CRITICAL, matching the api gate above rather than this
+  # job's old HIGH,CRITICAL report scope. Consistency was the goal (one project-wide meaning
+  # for "blocks CI"), and HIGH is not a defensible blocking bar for THIS image: the eight
+  # scanner binaries statically link their whole Go dependency tree, so every Go stdlib
+  # advisory lands eight times over and would wedge CI on issues no version bump can clear.
+  # HIGH is still surfaced by the informational report step below, so nothing is hidden --
+  # the difference is only whether it stops the pipeline.
+  #
+  # --ignore-unfixed is kept (same as the api gate): an advisory with no upstream fix is not
+  # actionable in CI, and failing on it would train people to disable the gate.
   image-scan-worker:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build worker image
         run: docker build -f infra/docker/Dockerfile.worker -t mbs-worker:ci .
-      - name: Trivy scan (worker, report only)
-        uses: aquasecurity/trivy-action@v0.36.0
+      - name: Trivy scan (gate on CRITICAL, fixed only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: mbs-worker:ci
           format: table
-          severity: HIGH,CRITICAL
+          severity: CRITICAL
           ignore-unfixed: true
           trivyignores: .trivyignore
-          exit-code: "0"
+          exit-code: "1"          # fail the job on a CRITICAL, fixed vuln
+      - name: Trivy report (HIGH+CRITICAL, informational)
+        if: ${{ always() }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: mbs-worker:ci
+          format: json
+          output: trivy-worker-report.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"          # report only -- HIGH does not block at this stage
+      - name: Upload worker image-scan report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-scan-worker
+          path: trivy-worker-report.json
+          if-no-files-found: warn
 
   # Secret scanning (Phase 1.8): a pinned gitleaks CLI does a deterministic FILESYSTEM
   # scan (--no-git) of the checked-out tree with the project allowlist (.gitleaks.toml) --
@@ -209,7 +357,7 @@ jobs:
     env:
       GITLEAKS_VERSION: "8.18.4"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install gitleaks (pinned CLI)
         run: |
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tgz
@@ -228,19 +376,46 @@ jobs:
           --exit-code 1
       - name: Upload gitleaks report
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: secret-scan
           path: gitleaks-report.json
           if-no-files-found: warn
 
-  # Scan Doctor: verify the real tool binaries run. Needs network + the worker
-  # image, so it's a separate job and non-blocking (network can be flaky in CI).
+  # Scan Doctor, split into two jobs (F-03).
+  #
+  # The doctor has two passes that answer different questions and have different failure
+  # modes, and collapsing them into one non-blocking job meant the DETERMINISTIC half was
+  # thrown away along with the flaky half:
+  #
+  #   PREFLIGHT  -- are the tool binaries on PATH and are their non-binary prerequisites
+  #                 (nuclei templates, ffuf wordlist) present? Milliseconds, NO NETWORK.
+  #                 Verified with `docker run --network none`: all 12 registered tools PASS,
+  #                 exit 0. Deterministic, so it BLOCKS -- a build that silently dropped a
+  #                 tool (or an F-02 digest bump that installed nothing) now fails CI.
+  #   EXECUTION  -- do the binaries actually run against a live target and does their output
+  #                 still parse? Minutes, needs egress to scanme.nmap.org. Genuinely flaky in
+  #                 CI, so this one stays non-blocking.
+  #
+  # Note what did NOT happen here: the flakiness of the execution pass is no longer a reason
+  # for anything else to be non-blocking. The vulnerability gate above is unconditional.
+  scan-doctor-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build worker image
+        run: docker build -f infra/docker/Dockerfile.worker -t mbs-worker .
+      - name: Run scan doctor (preflight, offline, BLOCKING)
+        # --network none proves the check needs no egress: if this ever starts failing for
+        # network reasons, that is a real regression in the check, not CI flakiness.
+        run: docker run --rm --network none mbs-worker python -m apps.api.scanner_engine.doctor --preflight-only
+
+  # Live-execution diagnostic: needs external egress, so non-blocking BY DESIGN.
   scan-doctor:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build worker image
         run: docker build -f infra/docker/Dockerfile.worker -t mbs-worker .
       - name: Run scan doctor

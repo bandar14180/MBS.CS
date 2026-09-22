@@ -23,6 +23,74 @@ MARGIN_T = 22
 MARGIN_B = 20
 
 
+def numbered_canvas_factory():
+    """A Canvas subclass that paints "Page N of M" with the REAL final total.
+
+    WHY A CUSTOM CANVAS IS NECESSARY
+    --------------------------------
+    Page furniture is painted by a per-page callback, and at that moment ReportLab has not yet
+    laid out the remaining pages -- so the total is genuinely unknowable there. Estimating it
+    would be exactly the fragile workaround the brief forbids.
+
+    The standard ReportLab solution, used here: `showPage` does NOT emit a page. Instead each
+    page's drawing state is captured in `_saved_page_states`. At `save()` time every page is
+    known, so the real total is set on the canvas and each captured page is replayed through
+    the normal furniture path -- which reads `mbs_total_content_pages` and prints "of M".
+    Nothing is estimated and no page is painted twice.
+
+    The total is CONTENT pages (the unnumbered cover excluded), matching the numbering the
+    footer already used, so "Page 4 of 16" counts the same pages a reader is looking at.
+
+    Built as a factory because reportlab is imported inside the render functions, so the base
+    class cannot be subclassed at module import time -- the same reason _SectionHeading is a
+    factory."""
+    from reportlab.pdfgen import canvas as _canvas
+
+    class NumberedCanvas(_canvas.Canvas):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._saved_page_states: list[dict] = []
+
+        def showPage(self):
+            # Capture instead of emitting: the page is replayed in save() once M is known.
+            self._saved_page_states.append(dict(self.__dict__))
+            self._startPage()
+
+        def save(self):
+            from reportlab.lib import colors
+            from reportlab.lib.units import mm
+
+            states = self._saved_page_states
+            # The cover is page 1 and carries no number, so the content total is one fewer.
+            # max(1, ...) keeps a hypothetical cover-only document from printing "of 0".
+            total = max(1, len(states) - 1)
+            self.mbs_total_content_pages = total
+
+            for index, state in enumerate(states):
+                self.__dict__.update(state)
+                # index 0 is the cover, which is deliberately unnumbered (PageFurniture.cover
+                # paints no chrome). Every later page gets its number HERE rather than in the
+                # per-page callback, because only now is the total known.
+                if index > 0:
+                    try:
+                        w, _h = self._pagesize
+                        foot_y = (MARGIN_B - 8) * mm
+                        self.saveState()
+                        self.setFillColor(colors.HexColor(B.MUTED))
+                        self.setFont("Helvetica", 7.5)
+                        self.drawRightString(
+                            w - MARGIN_R * mm, foot_y + 1.5 * mm,
+                            f"Page {index} of {total}",
+                        )
+                        self.restoreState()
+                    except Exception:
+                        pass  # chrome must never cost the reader the report
+                super().showPage()
+            super().save()
+
+    return NumberedCanvas
+
+
 class PageFurniture:
     """Callable page decorator. One instance per rendered document.
 
@@ -98,8 +166,20 @@ class PageFurniture:
 
         # Page number. `doc.page` counts PDF pages; the cover is page 1 and is unnumbered, so
         # content numbering is offset by one and never shows "Page 0".
-        number = max(1, doc.page - 1)
-        canvas.setFont("Helvetica", 7.5)
-        canvas.drawRightString(w - MARGIN_R * mm, foot_y + 1.5 * mm, f"Page {number}")
+        #
+        # Phase 4.4: "Page N of M". The TOTAL cannot be known while a page is being painted --
+        # ReportLab is still laying out later pages -- so the number is NOT drawn here any
+        # more. `NumberedCanvas.save()` paints it once every page exists and the real total is
+        # known (see that class), which is why this method deliberately leaves the footer's
+        # right-hand side empty.
+        #
+        # FALLBACK: if a report is ever built through a plain Canvas (no deferred phase), that
+        # canvas has no `mbs_total_content_pages`, and the page would otherwise carry no number
+        # at all. Draw the previous "Page N" form in exactly that case, so a document is never
+        # worse off than before this change.
+        if not hasattr(canvas, "_saved_page_states"):
+            number = max(1, doc.page - 1)
+            canvas.setFont("Helvetica", 7.5)
+            canvas.drawRightString(w - MARGIN_R * mm, foot_y + 1.5 * mm, f"Page {number}")
 
         canvas.restoreState()

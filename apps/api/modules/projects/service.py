@@ -1,3 +1,4 @@
+import ipaddress
 import uuid
 
 from fastapi import HTTPException, status
@@ -71,24 +72,105 @@ async def create_target(
     target_type: str,
     value: str,
     criticality: str = "medium",
+    site_id: uuid.UUID | None = None,
 ) -> Target:
+    """Create a target, deriving its execution context SERVER-SIDE (MBS.SC P7-2).
+
+    `site_id` is an IDENTIFIER REQUIRING AUTHORIZATION, not a grant. The chain below runs
+    in a deliberate order -- authenticate (already done by the router's
+    `require_permission`), resolve the workspace, prove the PROJECT is in it, prove the
+    SITE is in it, and only then let the site influence anything:
+
+        workspace -> project ownership -> site ownership -> zone -> CIDRs -> target
+
+    `network_zone` is NEVER accepted from the caller; it is derived here (site => private,
+    no site => public). That is what stops a client declaring its own execution context.
+    """
     await get_project(db, workspace_id, project_id)  # 404s if project isn't in this workspace
+
+    # P7-2 -- SITE AUTHORIZATION, BEFORE the site may influence anything at all.
+    #
+    # `get_site_for_workspace` proves the site EXISTS and belongs to THIS workspace, and
+    # raises without disclosing the owning workspace on a cross-tenant attempt. Reusing it
+    # (rather than a second lookup here) keeps one authority for site ownership, shared
+    # with the scan path and the manager.
+    site = None
+    network_zone = "public"
+    scan_policy = None
+    if site_id is not None:
+        from apps.api.modules.private_sites import service as private_sites_service
+
+        try:
+            site = await private_sites_service.get_site_for_workspace(db, site_id, workspace_id)
+            # A target may only be attached to a site that is actually scannable and that
+            # authorizes at least one CIDR -- the same conditions the scan path enforces, so
+            # a target cannot be created now and fail authorization later.
+            private_sites_service.assert_site_scannable(site)
+            # Derived, never supplied: the policy comes from the PERSISTED site row.
+            scan_policy = await private_sites_service.build_scan_network_policy(
+                db, workspace_id=workspace_id, scan_id=None,
+                network_zone="private", site_id=site.id,
+            )
+        except private_sites_service.PrivateSiteNotAuthorized as exc:
+            # 403 with the stable reason only. `exc.message` never names the owning
+            # workspace (see get_site_for_workspace), so this cannot leak cross-tenant
+            # metadata.
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, f"{exc.reason}: {exc.message}"
+            ) from exc
+        network_zone = "private"
 
     # SSRF guard: refuse a target that is (or resolves to) a private/reserved/
     # metadata address unless the on-prem allowlist explicitly permits it. The
     # authoritative re-check happens again at scan time (DNS-rebinding defense).
+    #
+    # P7-2: a PRIVATE target is validated against its own site's policy, so an address
+    # inside the site's authorized CIDRs is accepted while everything else still is not.
+    # The policy was derived from persisted state above -- passing it here widens nothing
+    # the site had not already been granted.
     from apps.api.scanner_engine.net_guard import TargetNotAllowed, validate_target_value
 
     try:
-        validate_target_value(target_type, value)
+        validate_target_value(target_type, value, policy=scan_policy)
     except TargetNotAllowed as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+    # A private target must additionally fall INSIDE its site's authorized CIDRs. This is
+    # the check that stops tenant A attaching tenant B's address to its own site: the
+    # comparison is against THIS site's list, and a site belongs to exactly one workspace.
+    if site is not None and target_type in ("domain", "ip_range"):
+        from apps.api.modules.private_sites import service as private_sites_service
+
+        # Parsed from the RAW value, deliberately NOT through `_host_from_value`: that
+        # helper treats "/" as a URL path separator, so it rewrites "10.0.0.0/8" to
+        # "10.0.0.0" and the range's BREADTH becomes invisible. A straddling range is
+        # exactly what this check exists to catch, so the prefix length must survive.
+        try:
+            net = ipaddress.ip_network(value.strip(), strict=False)
+        except ValueError:
+            net = None
+        if net is not None:
+            # Both edges, so a range that merely straddles an authorized CIDR is refused.
+            try:
+                for edge in (net.network_address, net.broadcast_address):
+                    private_sites_service.assert_address_within_site(site, str(edge))
+            except private_sites_service.PrivateSiteNotAuthorized as exc:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN, f"{exc.reason}: {exc.message}"
+                ) from exc
+        # A hostname is deliberately NOT resolved here: private-name resolution is the
+        # worker's job through the site's own resolver, and the scan-time check
+        # (resolve_and_validate) is authoritative. Observed, not fixed -- see P7-3.
 
     from apps.api.modules.billing import service as billing
 
     await billing.enforce_target_quota(db, workspace_id)
     target = Target(
-        project_id=project_id, type=target_type, value=value, added_by=added_by, criticality=criticality
+        project_id=project_id, type=target_type, value=value, added_by=added_by,
+        criticality=criticality,
+        # Both derived above; neither was taken from the request body.
+        network_zone=network_zone,
+        site_id=site.id if site is not None else None,
     )
     db.add(target)
     await db.commit()

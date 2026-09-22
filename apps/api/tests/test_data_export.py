@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 
 _PW = "correct horse battery staple"
@@ -52,9 +53,7 @@ async def _seed_activity(workspace_id: str, user_id: str) -> dict:
     ids = {k: str(uuid.uuid4()) for k in ("project", "target", "scan", "report", "audit")}
     try:
         async with eng.begin() as c:
-            await c.execute(
-                text("SELECT set_config('app.current_workspace_id', :w, true)"), {"w": workspace_id}
-            )
+            tenancy.bind_workspace(workspace_id)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             await c.execute(
                 text("INSERT INTO projects (id, workspace_id, name, status, created_by, created_at) "
                      "VALUES (:id,:w,'Proj','active',:u, now())"),
@@ -68,13 +67,13 @@ async def _seed_activity(workspace_id: str, user_id: str) -> dict:
             await c.execute(
                 text("INSERT INTO scans (id, workspace_id, project_id, target_id, initiated_by, "
                      "scan_type, status, config, created_at) "
-                     "VALUES (:id,:w,:p,:t,:u,'recon','completed','{}'::jsonb, now())"),
+                     "VALUES (:id,:w,:p,:t,:u,'recon','completed','{}', now())"),
                 {"id": ids["scan"], "w": workspace_id, "p": ids["project"], "t": ids["target"], "u": user_id},
             )
             await c.execute(
                 text("INSERT INTO reports (id, project_id, type, format, storage_uri, scan_ids, "
                      "generated_by, generated_at) "
-                     "VALUES (:id,:p,'technical','pdf',:uri,'[]'::jsonb,:u, now())"),
+                     "VALUES (:id,:p,'technical','pdf',:uri,'[]',:u, now())"),
                 {"id": ids["report"], "p": ids["project"], "uri": _SECRET_STORAGE_URI, "u": user_id},
             )
             await c.execute(

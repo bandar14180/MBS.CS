@@ -2,7 +2,7 @@
 
 Deliberately kept in the DR package (NOT core/observability.py) so the observability
 subsystem stays untouched. Prometheus is optional-at-import: absent -> every recorder is a
-no-op. ALL labels are strictly low-cardinality -- only `component` in {postgres, objects,
+no-op. ALL labels are strictly low-cardinality -- only `component` in {mysql, objects,
 full}. NEVER hostname / filename / workspace_id / scan_id.
 """
 import logging
@@ -33,7 +33,7 @@ if _PROM:
     DRILL_SUCCESS = Counter("mbs_dr_drill_success_total", "DR restore drills that passed")
     DRILL_FAILED = Counter("mbs_dr_drill_failed_total", "DR restore drills that failed")
 
-_ALLOWED = {"postgres", "objects", "full"}
+_ALLOWED = {"mysql", "objects", "full"}
 
 
 def _comp(component: str) -> str:

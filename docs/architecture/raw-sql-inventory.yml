@@ -1,0 +1,173 @@
+# Raw-SQL inventory -- the authoritative register of production raw SQL.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# apps/api/core/tenancy.py auto-filters every ORM query by workspace. Raw SQL bypasses that
+# filter completely, so for these statements THIS INVENTORY IS THE CONTROL. It previously
+# lived as a prose table in mysql-migration-phase0.md that claimed "9 sites" while the tree
+# actually held 26 -- silent drift, exactly as that document predicted it would.
+#
+# `scripts/raw_sql_inventory.py --check` discovers the real sites from the AST and compares
+# them against this file. CI runs it (the `raw-sql-inventory` job). A new raw statement, or a
+# registered one that moved, FAILS the build until it is reviewed and registered here.
+#
+# CLASSIFICATIONS
+#   TENANT_SCOPED  -- touches a table in tenancy._DIRECT_TABLES/_VIA_TABLES. MUST carry its
+#                     own workspace predicate, or be provably scoped by another key; the
+#                     reason must say which.
+#   SYSTEM_SCOPED  -- touches a tenancy.EXEMPT_TABLES table (scans, api_keys, scan_schedules).
+#                     Keyed by a trusted internal id before the workspace is known.
+#   GLOBAL         -- workspaces / liveness probes. Cross-tenant by design.
+#   INFRASTRUCTURE -- no application table at all (SELECT 1 health checks).
+#
+# LINE NUMBERS ARE THE IDENTIFIER, AND THAT IS DELIBERATE.
+# A stable hash of the statement would survive refactors, but it would also let a statement be
+# EDITED in place without review. Line numbers make any movement or edit surface as drift; the
+# cost is a one-line inventory update when code shifts, which is the intended prompt to re-read
+# the statement. The gate names the exact file:line in its failure output.
+#
+# TO REGISTER A NEW SITE: prefer the ORM. If raw SQL is genuinely required, give any
+# tenant-scoped statement an explicit workspace predicate, then add its line below with a
+# classification and a one-line reason.
+
+apps/api/celery_app/shutdown.py:
+  - 117    # SYSTEM_SCOPED  scans -- cooperative-shutdown requeue by scan id + execution token
+
+apps/api/celery_app/tasks/risk_tasks.py:
+  - 53     # GLOBAL         workspaces -- enumerates tenants to drive the per-tenant loop
+
+apps/api/celery_app/tasks/scan_tasks.py:
+  - 375    # SYSTEM_SCOPED  scans -- queued-relay: finds queued scans with no celery task.
+           # MBS.SC re-read: now also SELECTs s.config so the relay can re-derive the scan's
+           # QUEUE and re-dispatch a stranded PRIVATE scan to its own per-site queue instead
+           # of the public one. Still the deliberate cross-tenant lifecycle sweep it was --
+           # it JOINs workspaces only to exclude a deleting tenant, reads no tenant-owned
+           # table, and changes no tenant data. (Line moved from 339 -- unrelated changes
+           # earlier in the file shifted it; same statement, re-reviewed unchanged.)
+  - 405    # SYSTEM_SCOPED  scans -- atomic re-dispatch claim, keyed by scan id. (Line moved
+           # from 369 for the same reason as above.)
+
+apps/api/core/db.py:
+  - 156    # INFRASTRUCTURE SELECT 1 connectivity probe -- no application table
+
+apps/api/core/observability.py:
+  - 558    # INFRASTRUCTURE SELECT 1 dependency-health probe on a raw PyMySQL cursor -- no
+           # application table, no user input. Uses the sync DBAPI directly (not the async ORM
+           # engine) because the health endpoint must answer without an event loop.
+
+apps/api/core/schema_version.py:
+  - 138    # INFRASTRUCTURE information_schema probe for the alembic_version TABLE's existence --
+           # catalog metadata only, no application table, no user input. AUDIT-002 schema gate.
+  - 145    # GLOBAL         alembic_version -- reads the single migration-revision row. A
+           # platform/schema record with no tenant dimension at all; comparing it to the
+           # application's migration head is the whole point of the startup/readiness gate.
+
+apps/api/core/startup_checks.py:
+  - 85     # INFRASTRUCTURE SELECT 1 connectivity probe -- no application table
+
+apps/api/dr/service.py:
+  - 506    # INFRASTRUCTURE information_schema table COUNT against the SCRATCH restore target --
+           # asserts the restored database is non-empty. Reads catalog metadata only, never an
+           # application table, and the DSN is the drill's scratch DB, never production.
+  - 509    # INFRASTRUCTURE information_schema presence check for the four core tables on the
+           # SCRATCH restore target. Static literal IN-list, no interpolation, catalog-only.
+
+apps/api/main.py:
+  - 205    # INFRASTRUCTURE SELECT 1 readiness probe -- no application table. (Line moved from
+           # 186 -- unrelated changes earlier in the file shifted it; same statement.)
+
+apps/api/modules/remediation/verification.py:
+  - 197    # TENANT_SCOPED  verification_requests -- ATOMIC CLAIM keyed by a trusted, internally
+           # generated request id; the status='pending' predicate IS the claim token, mirroring
+           # orchestrator._claim_scan. Scoped by that id, not by workspace, and the caller binds
+           # the workspace before any subsequent ORM work. Documented in the function docstring.
+           # (Line moved from 149 -- Prompt 13 Finding #3's coverage-check code was added
+           # earlier in the same function; same statement, re-reviewed unchanged.)
+
+apps/api/modules/scanner_workers/service.py:
+  - 497    # SYSTEM_SCOPED  scanner_workers -- atomic reactivation transition, keyed by
+           # worker_id (a trusted internal identifier) + source state 'suspended'; mirrors the
+           # scans-table atomic-claim pattern used throughout this codebase.
+  - 559    # SYSTEM_SCOPED  scanner_workers -- atomic drain transition, keyed by worker_id +
+           # source state 'active'.
+  - 699    # SYSTEM_SCOPED  scanner_workers -- read-only pre-selection for the heartbeat reaper's
+           # audit trail; IDENTICAL predicate to the UPDATE immediately below it, and read-only,
+           # so it cannot itself affect which rows are reaped.
+  - 712    # SYSTEM_SCOPED  scanner_workers -- heartbeat-timeout reaper: atomic 'active' ->
+           # 'suspended' transition for every worker whose last heartbeat is stale. Cross-tenant
+           # by design (a stale worker's tenant is irrelevant to the liveness sweep), one-
+           # directional (only 'active' is a source state), and never touches a revoked row.
+
+apps/api/modules/schedules/service.py:
+  - 183    # SYSTEM_SCOPED  scan_schedules -- atomic due-claim; beat iterates all tenants by design
+  - 217    # SYSTEM_SCOPED  scan_schedules -- records last_scan_id on a row already claimed
+  - 227    # SYSTEM_SCOPED  scan_schedules -- records last_error on a row already claimed
+
+apps/api/modules/scans/service.py:
+  - 317    # SYSTEM_SCOPED  scans -- cancel_scan's fenced conditional UPDATE (mirrors
+           # orchestrator._finalize_status). Keyed by scan.id, already resolved via
+           # get_scan(db, workspace_id, project_id, scan_id) -- a workspace+project-scoped
+           # lookup -- immediately before this statement; the raw UPDATE applies only the
+           # atomic terminal-state fencing on top of that already-authorized row. Referenced
+           # by the same name ("F2-03") in pyproject.toml's mypy override comment for this
+           # function.
+
+apps/api/modules/users/service.py:
+  - 255    # TENANT_SCOPED  audit_events -- GDPR actor anonymisation. Filtered on actor_user_id,
+           # which is INHERENTLY workspace-scoped: an audit row records the workspace the actor
+           # acted in, and a user only acts in workspaces they belong to. Verified empirically
+           # (0 rows where an actor is not a member of that row's workspace). Erasure must span
+           # every workspace the user acted in, so a workspace predicate would be wrong here.
+           # AUDIT-008: this now executes exactly ONCE, outside any workspace binding. It was
+           # previously re-issued identically once per membership -- the per-workspace
+           # bind_workspace() loop never scoped raw SQL (the ORM filter does not see it), so
+           # iterations 2..N were no-ops. Running it once also covers workspaces whose
+           # membership row was already removed, which the old loop MISSED.
+
+apps/api/retention/repo.py:
+  - 78     # GLOBAL         workspaces -- enumerates tenants to drive the per-tenant purge loop
+           # (line moved from 77 by Prompt 13 Finding #8's addition earlier in the file)
+  - 121    # TENANT_SCOPED  generic purge CTE -- binds :wid via _WORKSPACE_FILTER (KeyError on an
+           # unregistered table = fail closed) (line moved from 120)
+  - 135    # TENANT_SCOPED  generic purge CTE (batched) -- binds :wid via _WORKSPACE_FILTER
+           # (line moved from 134)
+  - 148    # TENANT_SCOPED  DELETE by id list already produced by a :wid-filtered SELECT (line
+           # moved from 147)
+  - 165    # SYSTEM_SCOPED  scans ranking CTE -- filtered by :wid in _SCAN_RANK (line moved
+           # from 164)
+  - 200    # TENANT_SCOPED  tool_runs by scan_id list already produced by a :wid-filtered SELECT
+           # (line moved from 199)
+  - 219    # TENANT_SCOPED  evidence storage_uri by tool_run_id list already :wid-filtered (line
+           # moved from 218)
+  - 252    # TENANT_SCOPED  mark_reports_with_purged_scans (Prompt 13, Finding #8) -- SELECT
+           # candidate reports.id/scan_ids, joined to `reports` via `projects.workspace_id =
+           # :wid`, exactly the same join shape as the reports-storage-uri lookup below. Runs
+           # BEFORE delete_scans, in the same transaction, so a report can never be flagged
+           # from a scan_ids list belonging to a different workspace even in principle.
+  - 276    # TENANT_SCOPED  mark_reports_with_purged_scans (Prompt 13, Finding #8) -- UPDATE by
+           # report id list already produced by the :wid-filtered SELECT immediately above;
+           # same "DELETE/UPDATE by an already-filtered id list" pattern used throughout this
+           # file (e.g. the tool_runs/evidence/scans lookups below).
+  - 288    # SYSTEM_SCOPED  scans DELETE by id list already produced by a :wid-filtered SELECT
+           # (line moved from 230)
+  - 301    # TENANT_SCOPED  reports storage_uri by report id list already :wid-filtered (line
+           # moved from 243)
+
+apps/api/scanner_engine/orchestrator.py:
+  - 86     # SYSTEM_SCOPED  scans -- ATOMIC CLAIM; status predicate is the claim token
+  - 170    # SYSTEM_SCOPED  scans -- failure finalisation by scan id
+  - 267    # SYSTEM_SCOPED  tool_runs + scans -- TOOL-RUN ORPHAN RECONCILIATION (incident
+           # 615d0e0b). Repairs tool_runs left 'running' under an already-terminal scan: a
+           # state nothing can leave legitimately, because the scan that would have reported
+           # the result is over. Cross-tenant by the SAME justification as the scan orphan
+           # reaper above -- such rows are stranded by worker/transaction failures, which
+           # respect no workspace boundary, so a per-tenant sweep would leave most of them
+           # forever. Reads no tenant-owned table and discloses nothing: the JOIN to `scans`
+           # is a LIFECYCLE predicate (parent terminal + past the grace period), not a
+           # tenancy one, and the only columns written are status/completed_at/
+           # error_message. Atomic conditional UPDATE whose source state is 'running', which
+           # is what makes it idempotent and safe to run concurrently with itself, with scan
+           # finalisation and with the reaper. Not reachable from any request path.
+  - 309    # SYSTEM_SCOPED  scans -- completion fenced by id + execution_token
+  - 355    # SYSTEM_SCOPED  scans -- reads status/token by trusted internal scan id
+  - 1403   # SYSTEM_SCOPED  scans -- heartbeat UPDATE by scan id

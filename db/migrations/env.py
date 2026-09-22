@@ -22,7 +22,11 @@ target_metadata = Base.metadata
 
 db_url = os.environ.get("DATABASE_URL")
 if db_url:
-    config.set_main_option("sqlalchemy.url", db_url.replace("+asyncpg", ""))
+    # Phase 0 MySQL cutover: Alembic's `run_migrations_online` uses a plain SYNC engine, so the
+    # async driver tag (aiomysql) must come off; PyMySQL is the sync driver already in
+    # requirements.txt for exactly this purpose (see apps/api/core/observability.py's
+    # `_probe_mysql`, which uses it directly for the same sync-vs-async reason).
+    config.set_main_option("sqlalchemy.url", db_url.replace("+aiomysql", "+pymysql"))
 
 
 def run_migrations_offline() -> None:

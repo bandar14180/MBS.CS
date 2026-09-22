@@ -18,13 +18,13 @@
 - **Professional reports** — executive & technical PDFs (CVSS, evidence, remediation, compliance coverage).
 - **Continuous security** — recurring **scheduled scans** (Celery beat) + in-app **notifications/alerts** on completion and new critical findings.
 - **Commercial SaaS** — Free / Professional / Enterprise **plans with usage limits** (402 enforcement), per-workspace usage dashboard.
-- **Enterprise** — shared-schema multi-tenancy with **Postgres row-level security (FORCE)** on every tenant table, RBAC (owner/admin/member), authorization-scope ownership gate, an **append-only audit log**, and **workspace API keys** for programmatic access.
+- **Enterprise** — shared-schema multi-tenancy with an **application-layer workspace filter** (`apps/api/core/tenancy.py`) applied to every ORM query on every tenant table, RBAC (owner/admin/member), authorization-scope ownership gate, an **append-only audit log**, and **workspace API keys** for programmatic access.
 - **Global** — premium landing page + full dashboard in **7 languages** (English, Arabic (RTL), Malay, French, Portuguese, Italian, Spanish).
 
 ## Security model (highlights)
 
 - **Authorization-first**: no scan runs without verified proof of target ownership.
-- **Tenant isolation**: RLS `ENABLE` + `FORCE` on every tenant table, keyed on a per-request session GUC.
+- **Tenant isolation**: an ORM-level filter auto-applied to every tenant table, keyed on a per-request workspace bound in a `contextvars` context. (The database is MySQL 8, which has no row-level security; isolation moved from Postgres RLS to the application layer at the Phase 0 cutover — see `apps/api/core/tenancy.py`.)
 - **Active-testing gate**: payload-sending tools (nuclei) run only when the scope explicitly authorizes it.
 - **Audit trail**: security-relevant actions (scan created, finding triaged, plan changed) are logged immutably per workspace.
 
@@ -45,12 +45,20 @@
 ```bash
 cp .env.example .env          # (Windows: copy .env.example .env)
 docker compose -f infra/docker-compose.yml -f infra/docker-compose.override.yml up --build -d
-docker compose -f infra/docker-compose.yml exec api sh -c "cd /srv/db && alembic upgrade head"
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.override.yml exec api sh -c "cd /srv/db && alembic upgrade head"
 ```
 
-> `docker-compose.override.yml` carries the dev-only bits — hot reload, code bind mounts, and
-> the `localhost:8000` API port. Compose auto-merges it only when **no** `-f` is given, so any
-> explicit `-f` list has to name it. Production deliberately leaves it out.
+> **Always pass both `-f` files for development.** `docker-compose.override.yml` carries the
+> dev-only bits — hot reload, the `localhost:8000` API port, and the `apps/api` **code bind
+> mount**. Compose auto-merges it only when **no** `-f` is given, so any explicit `-f` list has
+> to name it. Dropping it does not fail: the container starts, reports healthy, and serves the
+> code **baked into the image at its last build** — silently stale, indefinitely.
+>
+> The API now refuses to start in that state rather than serving stale code (the base file sets
+> `MBS_STACK_MODE=unconfigured`; each overlay replaces it — see `apps/api/core/stack_mode.py`).
+> Equivalently, run `cd infra && docker compose up -d`, where the override is merged
+> automatically. Production uses `docker-compose.prod.yml` and deliberately leaves the dev
+> override out.
 
 - **App (landing + dashboard)** — http://localhost  (also http://localhost:3000)
 - **API** — http://localhost:8000/health · interactive docs at http://localhost:8000/docs
@@ -96,9 +104,9 @@ Register → create a project → add a target (e.g. `scanme.nmap.org`, type `do
 ## Tests
 
 ```bash
-docker compose -f infra/docker-compose.yml exec api pytest apps/api/tests -q      # backend (96 tests)
-docker compose -f infra/docker-compose.yml exec web npx tsc --noEmit              # frontend typecheck
-docker compose -f infra/docker-compose.yml exec web node scripts/check-i18n.js    # 7-language parity
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.override.yml exec api pytest apps/api/tests -q
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.override.yml exec web npx tsc --noEmit
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.override.yml exec web node scripts/check-i18n.js
 ```
 
 ## Layout

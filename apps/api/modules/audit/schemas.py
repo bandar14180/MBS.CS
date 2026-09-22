@@ -14,4 +14,6 @@ class AuditEventRead(BaseModel):
     resource_type: str
     resource_id: uuid.UUID | None
     detail: str | None
+    outcome: str | None
+    correlation_id: str | None
     created_at: datetime

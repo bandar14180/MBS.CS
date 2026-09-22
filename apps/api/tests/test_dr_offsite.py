@@ -11,15 +11,15 @@ import pytest
 
 from apps.api.dr.offsite import LocalOffsiteTarget, get_offsite_target
 from apps.api.dr.service import run_backup
-from apps.api.tests.test_dr_backup import FakePgRunner, _sample_store
+from apps.api.tests.test_dr_backup import FakeMySQLRunner, _sample_store
 
 
 def _settings(tmp_path, **over):
     base = dict(
         backup_directory=str(tmp_path / "backups"),
-        database_url="postgresql+asyncpg://mbs:mbs@postgres:5432/mbs",
-        backup_pg_dump_cmd="pg_dump",
-        backup_pg_restore_cmd="pg_restore",
+        database_url="mysql+aiomysql://mbs:mbs@mysql:3306/mbs",
+        backup_mysqldump_cmd="mysqldump",
+        backup_mysql_cmd="mysql",
         backup_include_objects=True,
         backup_compression=True,
         backup_verification_enabled=True,
@@ -49,14 +49,14 @@ class FakeOffsite:
 def test_local_offsite_copies_every_file(tmp_path):
     src = tmp_path / "20260101T000000Z"
     src.mkdir(parents=True)
-    (src / "db.dump").write_bytes(b"PGDMP...")
+    (src / "db.sql").write_bytes(b"-- MySQL dump ...")
     (src / "MANIFEST.json").write_text("{}")
     dest_base = tmp_path / "offsite"
 
     n = LocalOffsiteTarget(str(dest_base)).replicate_set(src)
     assert n == 2
     copied = {p.name for p in (dest_base / src.name).iterdir()}
-    assert copied == {"db.dump", "MANIFEST.json"}
+    assert copied == {"db.sql", "MANIFEST.json"}
 
 
 def test_local_offsite_requires_base_dir():
@@ -80,14 +80,14 @@ def test_factory_rejects_unknown_provider():
 
 def test_run_backup_replicates_verified_set(tmp_path):
     off = FakeOffsite()
-    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner(), offsite=off)
+    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner(), offsite=off)
     assert res.ok is True
     assert off.calls == [res.set_dir]  # the verified set was replicated off-site
 
 
 def test_offsite_failure_does_not_fail_backup(tmp_path):
     off = FakeOffsite(fail=True)
-    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakePgRunner(), offsite=off)
+    res = run_backup(_settings(tmp_path), store=_sample_store(), runner=FakeMySQLRunner(), offsite=off)
     assert res.ok is True  # best-effort: replication failure never fails the backup
     assert (res.set_dir / "MANIFEST.json").exists()
 
@@ -95,6 +95,6 @@ def test_offsite_failure_does_not_fail_backup(tmp_path):
 def test_offsite_skipped_when_disabled(tmp_path):
     off = FakeOffsite()
     res = run_backup(_settings(tmp_path, backup_offsite_enabled=False),
-                     store=_sample_store(), runner=FakePgRunner(), offsite=off)
+                     store=_sample_store(), runner=FakeMySQLRunner(), offsite=off)
     assert res.ok is True
     assert off.calls == []  # disabled -> never called

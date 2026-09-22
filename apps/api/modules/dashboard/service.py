@@ -26,8 +26,16 @@ _KNOWN_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
 
 async def get_summary(db: AsyncSession, workspace_id: uuid.UUID) -> DashboardSummary:
-    """Workspace-wide rollup for the dashboard landing page. Every count is
-    scoped to `workspace_id` explicitly (belt-and-braces with RLS)."""
+    """Workspace-wide rollup for the dashboard landing page. Every count is scoped to
+    `workspace_id` EXPLICITLY, and that is not belt-and-braces -- it is the only thing
+    scoping these queries.
+
+    AUDIT-007: this comment used to say "belt-and-braces with RLS". There is no RLS (see
+    apps/api/core/tenancy.py); isolation is an application-layer ORM filter. More important,
+    that filter is injected with `with_loader_criteria`, which only attaches to statements
+    that LOAD a mapped entity -- every AGGREGATE here (`select(func.count())`, with or
+    without select_from) escapes it entirely. Dropping one of these explicit predicates
+    would therefore leak a cross-tenant COUNT with nothing behind it to catch the mistake."""
 
     projects_count = await db.scalar(
         select(func.count()).select_from(Project).where(Project.workspace_id == workspace_id)
@@ -129,7 +137,9 @@ async def get_recommendations(
         )
         .join(Project, Project.id == Vulnerability.project_id)
         .where(Project.workspace_id == workspace_id, Vulnerability.status.in_(_ACTIVE))
-        .order_by(severity_order, Vulnerability.cvss_score.desc().nullslast())
+        # Phase 0 MySQL cutover: nullslast() dropped -- see the identical comment in
+        # apps/api/modules/vulnerabilities/service.py's list_vulnerabilities.
+        .order_by(severity_order, Vulnerability.cvss_score.desc())
         .limit(limit)
     )
     return [

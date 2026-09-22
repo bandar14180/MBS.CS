@@ -197,9 +197,12 @@ def test_validate_production_rejects_unknown_and_self_fallback():
 
     base = dict(
         environment="production", jwt_secret_key="a" * 48, s3_access_key="r", s3_secret_key="r",
-        database_url="postgresql+asyncpg://u:p@db:5432/mbs", cors_allow_origins=["https://x.example.com"],
+        database_url="mysql+aiomysql://u:p@db:3306/mbs", cors_allow_origins=["https://x.example.com"],
         trusted_hosts=["x.example.com"], rate_limit_enabled=True, metrics_mode="token",
         mfa_encryption_key="k", ai_provider="openrouter",
+        # F-08: production now requires the refresh cookie to be Secure (it carries a
+        # long-lived credential). A 'hardened production config' must therefore set it.
+        refresh_cookie_secure=True,
     )
     with pytest.raises(RuntimeError) as exc:
         Settings(**base, ai_fallback_providers=["nope"]).validate_production()

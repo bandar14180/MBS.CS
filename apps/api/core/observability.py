@@ -7,6 +7,9 @@ try:
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
         Counter,
+        # MBS.SC: tunnel/heartbeat/queue-depth are point-in-time STATES, not cumulative
+        # counts, so they are Gauges rather than Counters.
+        Gauge,
         Histogram,
         generate_latest,
     )
@@ -82,6 +85,112 @@ if _PROM:
     SCAN_RELAYED = Counter(
         "mbs_scan_relayed_total", "Undelivered 'queued' scans re-dispatched by the queued relay"
     )
+    # ------------------------------------------------------------------------------
+    # MBS.SC -- scanner isolation / private scanning (Phase 16).
+    #
+    # LABEL DISCIPLINE: no workspace_id, no site_id, no worker_id, no CIDR, no hostname.
+    # Prometheus labels are effectively public within the deployment and unbounded
+    # cardinality is an outage risk -- but the decisive reason is that a tenant's site
+    # count, scan timing and internal addressing are customer data. `reason`, `pool_id`
+    # and `zone` are bounded, non-identifying vocabularies. The per-tenant detail lives
+    # in the structured LOGS, which are access-controlled.
+    # ------------------------------------------------------------------------------
+    SCANNER_AUTHZ_DENIED = Counter(
+        "mbs_scanner_authz_denied_total",
+        "Scanner-manager requests refused, by stable reason code",
+        ["reason"],
+    )
+    PRIVATE_SCAN_BLOCKED = Counter(
+        "mbs_private_scan_blocked_total",
+        "Private scans refused before execution, by reason (site/worker/tunnel/CIDR)",
+        ["reason"],
+    )
+    EGRESS_BLOCKED = Counter(
+        "mbs_scanner_egress_blocked_total",
+        "Outbound destinations refused by the scanner egress policy",
+        ["reason"],
+    )
+    TUNNEL_STATE = Gauge(
+        "mbs_tunnel_up",
+        "1 when a private site's tunnel passed its last preflight, 0 when it did not",
+        ["pool_id"],
+    )
+    TUNNEL_HANDSHAKE_AGE = Gauge(
+        "mbs_tunnel_handshake_age_seconds",
+        "Age of the last observed WireGuard handshake",
+        ["pool_id"],
+    )
+    # DEDICATED VPN EGRESS. Separate series from `mbs_tunnel_up` on purpose: mixing the
+    # platform's internet exit into the per-site tunnel gauge would dilute the
+    # private-tunnel-down alert with a pool that has no customer tunnel at all, and an
+    # operator could not tell which of the two failures they were looking at.
+    VPN_EGRESS_STATE = Gauge(
+        "mbs_vpn_egress_up",
+        "1 when the dedicated VPN egress path passed its last preflight, 0 when it did not",
+        ["pool_id"],
+    )
+    VPN_EGRESS_HANDSHAKE_AGE = Gauge(
+        "mbs_vpn_egress_handshake_age_seconds",
+        "Age of the last observed VPN egress WireGuard handshake",
+        ["pool_id"],
+    )
+    VPN_EGRESS_EXIT_IP_VERIFIED = Gauge(
+        "mbs_vpn_egress_exit_ip_verified",
+        "1 when the observed egress exit IP matched the expected VPN exit IP",
+        ["pool_id"],
+    )
+    VPN_EGRESS_BLOCKED = Counter(
+        "mbs_vpn_egress_blocked_total",
+        "Scans refused because the dedicated VPN egress path could not be verified",
+        ["reason"],
+    )
+    VPN_EGRESS_MIDSCAN_LOSS = Counter(
+        "mbs_vpn_egress_midscan_loss_total",
+        "Running scans cancelled because VPN egress became unverifiable mid-scan",
+        ["reason"],
+    )
+    WORKER_HEARTBEAT_AGE = Gauge(
+        "mbs_scanner_worker_heartbeat_age_seconds",
+        "Seconds since a scanner worker last checked in with the manager",
+        ["pool_id"],
+    )
+    SCANNER_QUEUE_DEPTH = Gauge(
+        "mbs_scanner_queue_depth",
+        "Pending scans on a scanner queue",
+        ["zone"],
+    )
+    WORKER_REVOKED = Counter(
+        "mbs_scanner_worker_revoked_total", "Scanner workers revoked by an operator"
+    )
+    SITE_SUSPENDED = Counter(
+        "mbs_private_site_suspended_total", "Private sites moved to a non-scannable state"
+    )
+    # --- Prompt 33: verification + evidence processing -------------------------------------
+    # Two capabilities that fully exist (reports/verification.py, scanner_engine/
+    # evidence_store.py + evidence_integrity.py) but emitted NO metric at all, so an operator
+    # could not see a verification-mix shift or an evidence-capture outage without reading
+    # reports. Deliberately NOT added: discovery/AUL/ASKG/session/TestPlan metrics, whose
+    # subsystems do not exist here -- emitting for them would require inventing them.
+    #
+    # Every label below is a CLOSED vocabulary fixed in code: the verification states and
+    # confidence bands from verification.py, and outcome codes chosen here. No workspace, no
+    # project, no target, no URL, no finding id, no tenant identifier -- those are unbounded
+    # and would both blow up cardinality and leak tenant data through the metrics endpoint.
+    VERIFICATION_OUTCOMES = Counter(
+        "mbs_verification_outcomes_total",
+        "Findings by reported verification state and evidence confidence",
+        ["state", "confidence"],
+    )
+    EVIDENCE_PROCESSED = Counter(
+        "mbs_evidence_processed_total",
+        "Evidence artifact capture attempts by artifact kind and outcome",
+        ["kind", "outcome"],
+    )
+    EVIDENCE_INTEGRITY = Counter(
+        "mbs_evidence_integrity_checks_total",
+        "Explicit evidence integrity re-verifications by result",
+        ["result"],
+    )
 
 
 def record_http_metrics(method: str, path: str, status: int, duration_s: float) -> None:
@@ -118,6 +227,150 @@ def record_ai_latency(agent_role: str, seconds: float) -> None:
     """AI-2.5: observe the latency of a successful AI call (label: bounded agent_role)."""
     if _PROM:
         AI_LATENCY.labels(agent_role or "unknown").observe(max(0.0, seconds))
+
+
+# --- MBS.SC recorders. Each takes only bounded, non-identifying labels. -------------
+
+def record_scanner_authz_denied(reason: str) -> None:
+    """One refused manager request. `reason` is a stable code (WORKER_REVOKED,
+    WORKER_WRONG_SITE, ...) -- never a worker id, workspace or site."""
+    if _PROM:
+        SCANNER_AUTHZ_DENIED.labels(reason or "unknown").inc()
+
+
+def record_private_scan_blocked(reason: str) -> None:
+    """One private scan refused before execution (SITE_SUSPENDED, TUNNEL_UNHEALTHY,
+    ROUTE_MISSING, TARGET_OUTSIDE_AUTHORIZED_CIDRS, ...)."""
+    if _PROM:
+        PRIVATE_SCAN_BLOCKED.labels(reason or "unknown").inc()
+
+
+def record_egress_blocked(reason: str) -> None:
+    """One destination refused by the egress policy. The DESTINATION is deliberately not a
+    label -- it can be a customer's internal hostname."""
+    if _PROM:
+        EGRESS_BLOCKED.labels(reason or "unknown").inc()
+
+
+# --- Prompt 33 recorders: verification + evidence ------------------------------------------
+#
+# Each CLAMPS its labels to a closed vocabulary rather than trusting the caller. That is the
+# load-bearing part: `state`/`kind`/`result` are derived from data that originates in scanner
+# output, and a caller passing an unexpected value through to `.labels()` would mint a new
+# Prometheus time series per distinct value. Clamping to "other" makes an unbounded label
+# structurally impossible instead of merely discouraged, and keeps tenant data out of metrics
+# by construction -- there is no code path by which a target, URL or id can become a label.
+
+_VERIFICATION_STATES = frozenset({"verified", "partially_verified", "unverified"})
+_CONFIDENCE_BANDS = frozenset({"high", "medium", "low"})
+_EVIDENCE_KINDS = frozenset({"raw_output", "screenshot", "remediation_proof", "log_excerpt"})
+_EVIDENCE_OUTCOMES = frozenset({"stored", "storage_failed", "skipped"})
+_INTEGRITY_RESULTS = frozenset({"pass", "integrity_failure", "missing_object", "no_checksum"})
+
+
+def _bounded(value, allowed: frozenset, default: str = "other") -> str:
+    """One label value, clamped to a closed set. Anything unknown collapses to `default`."""
+    text = str(value or "").strip().lower()
+    return text if text in allowed else default
+
+
+def record_verification_outcome(state: str, confidence: str) -> None:
+    """One finding's reported verification state + evidence confidence.
+
+    Lets an operator watch the MIX (e.g. a sudden collapse of `verified` to `unverified` after
+    an evidence-store outage) without reading any report. Counts only -- this NEVER influences
+    the state it observes, and carries no finding, target or tenant identity."""
+    if _PROM:
+        VERIFICATION_OUTCOMES.labels(
+            _bounded(state, _VERIFICATION_STATES, "unverified"),
+            _bounded(confidence, _CONFIDENCE_BANDS, "medium"),
+        ).inc()
+
+
+def record_evidence_processed(kind: str, outcome: str) -> None:
+    """One evidence capture attempt. `outcome=storage_failed` is the signal that the
+    `unavailable://` sentinel path was taken -- previously visible only as a log line, though
+    it directly suppresses corroboration in the report (see reports/verification.py)."""
+    if _PROM:
+        EVIDENCE_PROCESSED.labels(
+            _bounded(kind, _EVIDENCE_KINDS),
+            _bounded(outcome, _EVIDENCE_OUTCOMES),
+        ).inc()
+
+
+def record_evidence_integrity(result: str) -> None:
+    """One explicit evidence integrity re-verification (scanner_engine.evidence_integrity).
+
+    `integrity_failure` means stored bytes no longer match their recorded digest -- an alert
+    an operator should never have to discover by reading an audit row."""
+    if _PROM:
+        EVIDENCE_INTEGRITY.labels(_bounded(result, _INTEGRITY_RESULTS)).inc()
+
+
+def record_tunnel_state(pool_id: str, *, up: bool, handshake_age_s=None) -> None:
+    """Tunnel health for one private pool. Keyed by POOL, not by site or workspace: a pool
+    maps 1:1 to a site operationally, but the pool id is an infrastructure name rather than
+    a tenant identifier."""
+    if not _PROM:
+        return
+    label = pool_id or "unknown"
+    TUNNEL_STATE.labels(label).set(1 if up else 0)
+    if handshake_age_s is not None:
+        TUNNEL_HANDSHAKE_AGE.labels(label).set(float(handshake_age_s))
+
+
+def record_vpn_egress_state(
+    pool_id: str, *, up: bool, handshake_age_s=None, exit_ip_verified=None
+) -> None:
+    """VPN egress health for one pool. Keyed by POOL, like the tunnel gauge, and for the
+    same reason -- a pool id is an infrastructure name, never a tenant identifier.
+
+    `exit_ip_verified` is reported SEPARATELY from `up` because the two fail
+    independently and the distinction is the whole point of this feature: a tunnel can be
+    perfectly up while traffic bypasses it entirely, and an alert needs to tell those
+    apart."""
+    if not _PROM:
+        return
+    label = pool_id or "unknown"
+    VPN_EGRESS_STATE.labels(label).set(1 if up else 0)
+    if handshake_age_s is not None:
+        VPN_EGRESS_HANDSHAKE_AGE.labels(label).set(float(handshake_age_s))
+    if exit_ip_verified is not None:
+        VPN_EGRESS_EXIT_IP_VERIFIED.labels(label).set(1 if exit_ip_verified else 0)
+
+
+def record_vpn_egress_blocked(reason: str) -> None:
+    """One scan refused because VPN egress could not be verified."""
+    if _PROM:
+        VPN_EGRESS_BLOCKED.labels(reason or "unknown").inc()
+
+
+def record_vpn_egress_midscan_loss(reason: str) -> None:
+    """One RUNNING scan cancelled because egress became unverifiable mid-flight."""
+    if _PROM:
+        VPN_EGRESS_MIDSCAN_LOSS.labels(reason or "unknown").inc()
+
+
+def record_worker_heartbeat_age(pool_id: str, seconds: float) -> None:
+    if _PROM:
+        WORKER_HEARTBEAT_AGE.labels(pool_id or "unknown").set(max(0.0, float(seconds)))
+
+
+def record_scanner_queue_depth(zone: str, depth: int) -> None:
+    """Queue depth by ZONE (public/private) -- not per site, which would leak how many
+    private sites exist and how busy each customer is."""
+    if _PROM:
+        SCANNER_QUEUE_DEPTH.labels(zone or "unknown").set(max(0, int(depth)))
+
+
+def record_worker_revoked() -> None:
+    if _PROM:
+        WORKER_REVOKED.inc()
+
+
+def record_site_suspended() -> None:
+    if _PROM:
+        SITE_SUSPENDED.inc()
 
 
 def record_ai_error(provider: str) -> None:
@@ -270,23 +523,36 @@ def record_beat_tick(ts: int | None = None) -> None:
 
 # --- Dependency health (A): active liveness of the core backing services ----------------------
 # Exposed as mbs_dependency_up{component} on the API /metrics via a scrape-time collector doing
-# SHORT-TIMEOUT SYNCHRONOUS probes. The /ready probe already checks Postgres+Redis but is not
+# SHORT-TIMEOUT SYNCHRONOUS probes. The /ready probe already checks MySQL+Redis but is not
 # scraped, so a Redis-only outage (whose paths fail open) is otherwise near-silent. Fully
 # best-effort: any probe error is reported as down (0) and never breaks a /metrics scrape.
-# Low-cardinality label only (component in {postgres, redis}).
+# Low-cardinality label only (component in {mysql, redis}).
 _DEP_PROBE_TIMEOUT_S = 1.0
 
 
-def _probe_postgres() -> bool:
-    """Best-effort sync Postgres liveness (SELECT 1) with a short connect timeout. The app's async
-    DSN (+asyncpg) is normalized to a plain sync DSN for psycopg2. Never raises."""
+def _probe_mysql() -> bool:
+    """Best-effort sync MySQL liveness (SELECT 1) with a short connect timeout. Uses PyMySQL
+    directly (a plain sync DB-API driver, not the app's async aiomysql engine) parsed out of the
+    app's async DSN. Never raises.
+
+    Phase 0 MySQL cutover: was `_probe_postgres` / psycopg2 against a `+asyncpg`-stripped DSN;
+    PyMySQL takes plain connect kwargs rather than a DSN string, so the URL is parsed instead of
+    string-replaced."""
     try:
-        import psycopg2
+        import pymysql
+        from sqlalchemy.engine import make_url
 
         from apps.api.core.config import get_settings
 
-        dsn = get_settings().database_url.replace("+asyncpg", "")
-        conn = psycopg2.connect(dsn, connect_timeout=max(1, int(_DEP_PROBE_TIMEOUT_S)))
+        url = make_url(get_settings().database_url)
+        conn = pymysql.connect(
+            host=url.host or "localhost",
+            port=url.port or 3306,
+            user=url.username,
+            password=url.password or "",
+            database=url.database,
+            connect_timeout=max(1, int(_DEP_PROBE_TIMEOUT_S)),
+        )
         try:
             cur = conn.cursor()
             cur.execute("SELECT 1")
@@ -384,7 +650,7 @@ if _PROM:
             g = GaugeMetricFamily(
                 "mbs_dependency_up", "Core backing-service liveness (1=up, 0=down)", labels=["component"]
             )
-            g.add_metric(["postgres"], 1.0 if _probe_postgres() else 0.0)
+            g.add_metric(["mysql"], 1.0 if _probe_mysql() else 0.0)
             g.add_metric(["redis"], 1.0 if _probe_redis() else 0.0)
             yield g
 
