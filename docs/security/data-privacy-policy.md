@@ -1,6 +1,6 @@
 # Data Privacy Policy (Backend)
 
-This document describes how the MBS.CS backend collects, protects, retains, and
+This document describes how the MBS.PT backend collects, protects, retains, and
 disposes of personal data, and the data-subject rights it implements. It reflects the
 behavior of the `apps/api` service and is kept in sync with the code it describes.
 

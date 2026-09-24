@@ -28,7 +28,7 @@ bcrypt==4.2.1
 # MFA (Sprint 1): TOTP codes + Fernet encryption of the stored MFA secret.
 # cryptography pinned >=50.0.0: 43.0.1 carried 6 advisories (PYSEC-2026-35/1284/2141/3553/3554,
 # GHSA-537c-gmf6-5ccf) and the 44.0.0-49.x range carries PYSEC-2026-3552 (PKCS#7 decrypt oracle,
-# fixed in 50.0.0). MBS.CS uses only Fernet (never pkcs7_decrypt_*), but we do not allowlist CVEs.
+# fixed in 50.0.0). MBS.PT uses only Fernet (never pkcs7_decrypt_*), but we do not allowlist CVEs.
 pyotp==2.9.0
 cryptography==50.0.0
 anthropic==0.34.2

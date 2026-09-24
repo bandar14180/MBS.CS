@@ -37,7 +37,7 @@ def test_provisioning_uri_contains_issuer_account_and_secret(monkeypatch):
     secret = mfa.generate_totp_secret()
     uri = mfa.provisioning_uri(secret, account_name="user@example.com")
     assert uri.startswith("otpauth://totp/")
-    assert "issuer=MBS.CS" in uri
+    assert "issuer=MBS.PT" in uri
     # the account label is URL-encoded in the otpauth URI (@ -> %40)
     assert "user%40example.com" in uri
     assert secret in uri

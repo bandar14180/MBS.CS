@@ -213,7 +213,7 @@ class Settings(BaseSettings):
     # <NAME>_FILE convention via _FILE_BACKED_SECRETS (Docker Secrets / Vault). Empty by default
     # -- MFA helpers raise a clear error if used unconfigured. No login behavior depends on these
     # yet (foundation only). mfa_challenge_ttl_seconds bounds the interim MFA-challenge token.
-    mfa_issuer: str = "MBS.CS"
+    mfa_issuer: str = "MBS.PT"
     mfa_challenge_ttl_seconds: int = 300
     mfa_encryption_key: str = ""
     # Per-user MFA brute-force protection (Step 3, Redis-backed, independent of IP rate limiting).

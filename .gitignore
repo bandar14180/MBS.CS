@@ -80,7 +80,7 @@ htmlcov/
 
 # Ad-hoc audit/report artifacts (not source)
 backend_full_review.pdf
-MBS_CS_Backend_Production_Audit_Report.pdf
+MBS_PT_Backend_Production_Audit_Report.pdf
 
 # AUDIT-012: ad-hoc local RUN artifacts -- dev-server logs and captured test output.
 #

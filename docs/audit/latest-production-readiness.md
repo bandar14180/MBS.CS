@@ -1,4 +1,4 @@
-# MBS.CS — Production Readiness Audit
+# MBS.PT — Production Readiness Audit
 
 _Read-only audit. No code changed to produce this document._
 _Branch: `feat/phase2-pentest-attack-mapping` · HEAD at audit time: `9160d04` · CI: 6/6 green · Suite: 741 passed / coverage 86.88%._
@@ -90,4 +90,4 @@ _Branch: `feat/phase2-pentest-attack-mapping` · HEAD at audit time: `9160d04` �
 - **P2 (deployment-time):** Alertmanager routing (R4); Retention Stage-2 go-live after a validated dry-run + backup (R5); optional bundled Grafana service.
 
 ## Conclusion
-MBS.CS is a **mature, production-hardened, investor-demo-ready** platform with strong security, reliability, and a comprehensively-governed AI pipeline. There are **no critical (P0) blockers**. The highest-value next step is the **beat-liveness alert (P1.1)** — additive and low-risk — followed by the infra-HA items (R1/R3), which are architecture/deployment decisions and should be scoped with explicit approval.
+MBS.PT is a **mature, production-hardened, investor-demo-ready** platform with strong security, reliability, and a comprehensively-governed AI pipeline. There are **no critical (P0) blockers**. The highest-value next step is the **beat-liveness alert (P1.1)** — additive and low-risk — followed by the infra-HA items (R1/R3), which are architecture/deployment decisions and should be scoped with explicit approval.
