@@ -46,7 +46,7 @@ severity, a CVSS score, or a model's self-rating.
   by side and leaves prioritisation to the analyst.
 - **The AI cannot invent actions.** The planner's output is filtered against the tool registry,
   the user's requested modules, the target type, and the authorization state. It may reorder
-  and prune within those bounds; it cannot introduce a tool. See `_filter_plan` in
+  and prune within those bounds; it cannot introduce a tool. See `_sanitize` in
   [`ai_agent/planner.py`](apps/api/ai_agent/planner.py).
 - **Proof attempts are bounded and non-destructive.** An exploit-confirmation module declares a
   single benign `proof_action`, must never modify, delete, persist or exfiltrate, and must
@@ -65,7 +65,7 @@ flowchart TD
     B -- no --> BX[Refused: no scan runs without<br/>proven target ownership]
     B -- yes --> C[AI Planner]
 
-    C --> D[_filter_plan<br/>registry + scope + target type<br/>+ active-testing gate]
+    C --> D[_sanitize<br/>registry + scope + target type<br/>+ active-testing gate]
     D --> E[Deterministic tool chain<br/>subfinder &rarr; httpx &rarr; naabu &rarr; nmap<br/>&rarr; katana &rarr; nuclei · 12 registered tools]
 
     E --> F[(Raw output<br/>MinIO / S3<br/>checksummed)]
