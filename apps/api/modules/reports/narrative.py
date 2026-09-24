@@ -1126,6 +1126,23 @@ EVIDENCE_INTEGRITY_NOTE = (
     "a cryptographic signature, and does not by itself attest to the evidence store."
 )
 
+# EVIDENCE SCOPE. The pipeline stores raw tool output at TOOL-RUN granularity: one
+# `log_excerpt` artefact per tool run, linked to every finding that run produced (see
+# orchestrator._run_single_tool, which creates one Evidence row per run and passes its id to
+# ingest_vulnerability_findings for the whole batch). That sharing is deliberate and correct --
+# the artefact genuinely IS the same file for all of those findings -- but it means a reader
+# who sees a raw-output artefact under a finding could reasonably, and wrongly, take it to be
+# a capture made for that finding alone. Per-finding artefacts do exist (screenshots, captured
+# individually and linked to one finding), so the two granularities sit side by side in the
+# same list and must be distinguishable. This note is emitted only when a shared tool-run
+# artefact is actually listed, and it states the scope rather than implying any conclusion.
+EVIDENCE_SHARED_SCOPE_NOTE = (
+    "Raw tool output is captured per tool run, not per finding: the artefact above is the "
+    "complete output of the run that produced this finding and is the same artefact "
+    "referenced by the other findings from that run. It corroborates that this finding came "
+    "from the recorded run; it is not a capture made solely for this finding."
+)
+
 SEVERITY_CVSS_NOTE_TEMPLATE = (
     "Severity is the scanning engine's own rating; the CVSS base score of {score} bands as "
     "{band} under CVSS v3.1. Both are reported exactly as recorded, and neither is derived "

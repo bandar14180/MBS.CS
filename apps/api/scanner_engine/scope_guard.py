@@ -16,11 +16,151 @@ module only decides what may be actively TOUCHED.
 
 This module NEVER expands scope and NEVER changes net_guard/SSRF behavior -- it only
 reuses net_guard's host parser / resolver. It can only NARROW what gets probed.
+
+PER-SCAN RESOLUTION MEMOIZATION
+-------------------------------
+The scope decision above needs a hostname's addresses, and it needs them once per
+(finding x authorized host) pair. Resolving live at each of those pairs made the gate an
+O(findings x authorized-hosts) blocking DNS loop -- see `resolution_cache_scope`, which
+memoizes BOTH successful and failed lookups for the duration of one scan. It is a pure
+performance boundary: the verdict for any given (host, target) pair is identical with and
+without the cache, a cached failure stays a failure, and the DNS-rebinding defense (which
+lives in `net_guard.resolve_and_validate`, immediately before a tool is handed an address)
+is untouched and still re-resolves on every call.
 """
+import contextlib
+import contextvars
 import ipaddress
+import logging
+from typing import Iterator
 
 from apps.api.core.config import get_settings
 from apps.api.scanner_engine import net_guard
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# PER-SCAN RESOLUTION CACHE (performance only -- see the module docstring)
+# ---------------------------------------------------------------------------
+# A sentinel distinguishing "resolved to nothing / failed" from "not yet looked up".
+# A FAILURE IS CACHED AS A FAILURE, never as an empty success: every consumer below
+# treats an empty address list exactly as it treats a raised resolver error -- as
+# "cannot confirm membership" -> out of scope. That equivalence is what makes caching
+# the negative result security-neutral.
+_UNRESOLVED: tuple = ()
+
+# ContextVar, not a module global, and deliberately mirroring `net_policy._current`:
+# resolution results are only comparable WITHIN one scan's policy (a private scan
+# resolves through the customer's own site resolvers via site_dns, a public scan
+# through the OS resolver, so the same name can legitimately have different answers
+# in two concurrently-running scans). Each asyncio task and each thread gets its own
+# copy of the context, so two scans in one worker process cannot read each other's
+# cached answers -- the same property that keeps their policies isolated.
+#
+# Unbound default is None, meaning NO CACHING AT ALL: every lookup goes live, exactly
+# as before this change. Forgetting to open a scope means losing the optimization,
+# never reusing a stale answer.
+_resolution_cache: contextvars.ContextVar = contextvars.ContextVar(
+    "mbs_scope_guard_resolution_cache", default=None
+)
+
+
+class _ResolutionCache:
+    """One scan's memoized derived-scope resolutions, plus counters for the log line.
+
+    `entries` maps hostname -> tuple of addresses, where the EMPTY tuple (`_UNRESOLVED`)
+    is a cached FAILURE. Membership is tested with a `KeyError` lookup rather than
+    `.get() is not None`, so a cached failure is a genuine hit and never re-resolves.
+    """
+
+    __slots__ = ("entries", "hits")
+
+    def __init__(self) -> None:
+        self.entries: dict[str, tuple] = {}
+        self.hits: int = 0
+
+    @property
+    def resolved_count(self) -> int:
+        return sum(1 for v in self.entries.values() if v)
+
+    @property
+    def unresolvable_count(self) -> int:
+        return sum(1 for v in self.entries.values() if not v)
+
+
+@contextlib.contextmanager
+def resolution_cache_scope() -> "Iterator[_ResolutionCache]":
+    """Memoize derived-scope hostname resolution for the duration of ONE scan.
+
+    WHY (the ftu.ac.th regression). `host_in_scope` consults every entry of
+    `extra_authorized_hosts` for every out-of-scope finding, and each consultation was a
+    live, BLOCKING `socket.getaddrinfo` -- including for permanently dead names, which
+    `net_guard.resolve_hostname` retries 3x with a 0.2s + 0.4s backoff before raising.
+    On a real scan (54 authorized hosts, 27 of them unresolvable) that was an uncached
+    O(findings x authorized-hosts) DNS loop: 115,791 `net_guard.resolve_failed` lines and
+    ~12h05m of a 13h20m runtime, against ~1h14m of actual tool execution.
+
+    WHAT IT DOES NOT CHANGE. This caches ONLY the two `scope_guard` lookups, which decide
+    "may this discovered host be actively probed". It does NOT touch
+    `net_guard.resolve_and_validate` -- the path that resolves a host immediately before
+    handing an address to a tool, whose re-resolution IS the DNS-rebinding defense. That
+    path still resolves live, every time, per call. Caching here cannot affect which
+    address any tool is actually given.
+
+    Fail-closed semantics are preserved exactly: a failed lookup is cached AS A FAILURE
+    (`_UNRESOLVED`) and every reader turns it into "out of scope", identically to the
+    raised-exception path it replaces. The cache can therefore only ever reproduce the
+    verdict the live lookup already returned in this scan -- it never converts a failure
+    into a success, and never widens scope.
+    """
+    cache = _ResolutionCache()
+    token = _resolution_cache.set(cache)
+    try:
+        yield cache
+    finally:
+        _resolution_cache.reset(token)
+        logger.info(
+            "scope_guard.resolution_cache_closed distinct_hosts=%d resolved=%d "
+            "unresolvable=%d reused=%d",
+            len(cache.entries), cache.resolved_count, cache.unresolvable_count, cache.hits,
+            extra={"event": "scope_guard.resolution_cache_closed",
+                   "distinct_hosts": len(cache.entries),
+                   "resolved": cache.resolved_count,
+                   "unresolvable": cache.unresolvable_count,
+                   "reused": cache.hits},
+        )
+
+
+def _resolve_cached(hostname: str) -> tuple:
+    """`net_guard.resolve_hostname` memoized for this scan. Returns a tuple of
+    addresses, or `_UNRESOLVED` (empty) when the name does not resolve.
+
+    A resolver error is NOT propagated: it is recorded as `_UNRESOLVED` and every caller
+    below already treats "no addresses" as fail-closed, which is what the previous
+    `except Exception -> return False` did at each call site. Both outcomes are stored, so
+    a dead host costs exactly one retry sequence per scan instead of one per finding.
+    """
+    cache = _resolution_cache.get()
+    if cache is None:
+        # No scope open -> behave exactly as before: resolve live, let errors propagate
+        # to the caller's own existing try/except.
+        return tuple(net_guard.resolve_hostname(hostname))
+    try:
+        result = cache.entries[hostname]
+    except KeyError:
+        pass
+    else:
+        cache.hits += 1
+        return result
+    try:
+        result = tuple(net_guard.resolve_hostname(hostname) or ())
+    except Exception as exc:  # noqa: BLE001 -- a failure is a CACHED failure, see above
+        logger.debug(
+            "scope_guard.resolution_cached_failure host=%s error=%s", hostname, exc,
+        )
+        result = _UNRESOLVED
+    cache.entries[hostname] = result
+    return result
 
 
 def _norm(host: str | None) -> str:
@@ -54,8 +194,12 @@ def _ip_host_in_range(target_value: str, host: str) -> bool:
         return ipaddress.ip_address(host) in net
     except ValueError:
         pass  # not a bare IP -> a hostname; resolve it
+    # Memoized per scan (see resolution_cache_scope). `_resolve_cached` already folds a
+    # resolver error into an EMPTY result, and an empty result is refused two lines below
+    # -- the same fail-closed verdict the bare `except -> return False` produced. The
+    # try/except is kept for the no-cache-scope path, where errors still propagate here.
     try:
-        addrs = net_guard.resolve_hostname(host)
+        addrs = _resolve_cached(host)
     except Exception:  # noqa: BLE001 -- unresolvable => out of scope for probing
         return False
     if not addrs:
@@ -79,8 +223,13 @@ def _hostname_resolves_to(hostname: str, ip_value: str) -> bool:
     Non-IP input / unresolvable hostname -> False (fail closed)."""
     if not _is_ip(ip_value):
         return False
+    # Memoized per scan (see resolution_cache_scope). THIS is the hot site behind the
+    # ftu.ac.th regression: it is called once per (finding x authorized host), and a dead
+    # authorized host cost a full 3-attempt retry sequence every single time. A cached
+    # failure is the empty tuple, and `in ()` is False -- byte-for-byte the fail-closed
+    # verdict the exception path gave.
     try:
-        addrs = net_guard.resolve_hostname(hostname)
+        addrs = _resolve_cached(hostname)
     except Exception:  # noqa: BLE001 -- unresolvable => cannot confirm membership, fail closed
         return False
     return ip_value in addrs

@@ -2753,6 +2753,11 @@ def _finding_block(idx, g, styles, colors, Paragraph, Table, TableStyle, mm):
             )
             parts.append(Paragraph(f"• {_esc(record.storage_uri)}", styles["Mono"]))
             parts.append(Paragraph(f"  {_esc(record.checksum_label())}", styles["Mono"]))
+        # Scope note for tool-run-granular artefacts (see N.EVIDENCE_SHARED_SCOPE_NOTE).
+        # Emitted only when one is actually listed, so a finding whose evidence is entirely
+        # per-finding never carries a caveat that does not apply to it.
+        if any(r.evidence_type == "log_excerpt" for r in evidence_records):
+            parts.append(Paragraph(N.EVIDENCE_SHARED_SCOPE_NOTE, styles["Small"]))
         parts.append(Paragraph(N.EVIDENCE_INTEGRITY_NOTE, styles["Small"]))
         parts.append(Paragraph(N.EVIDENCE_STORE_NOTE, styles["Small"]))
     elif typed_evidence:
@@ -2760,6 +2765,8 @@ def _finding_block(idx, g, styles, colors, Paragraph, Table, TableStyle, mm):
         for etype, uri in typed_evidence:
             parts.append(Paragraph(f"[{_esc(_evidence_type_label(etype))}]", styles["Small"]))
             parts.append(Paragraph(f"• {_esc(uri)}", styles["Mono"]))
+        if any((etype or "").strip().lower() == "log_excerpt" for etype, _ in typed_evidence):
+            parts.append(Paragraph(N.EVIDENCE_SHARED_SCOPE_NOTE, styles["Small"]))
         parts.append(Paragraph(N.EVIDENCE_STORE_NOTE, styles["Small"]))
     elif g["evidence_uris"]:
         parts.append(Paragraph(f"{len(g['evidence_uris'])} stored artifact(s):", styles["Small"]))

@@ -154,9 +154,9 @@ apps/api/retention/repo.py:
            # moved from 243)
 
 apps/api/scanner_engine/orchestrator.py:
-  - 86     # SYSTEM_SCOPED  scans -- ATOMIC CLAIM; status predicate is the claim token
-  - 170    # SYSTEM_SCOPED  scans -- failure finalisation by scan id
-  - 267    # SYSTEM_SCOPED  tool_runs + scans -- TOOL-RUN ORPHAN RECONCILIATION (incident
+  - 87     # SYSTEM_SCOPED  scans -- ATOMIC CLAIM; status predicate is the claim token
+  - 171    # SYSTEM_SCOPED  scans -- failure finalisation by scan id
+  - 268    # SYSTEM_SCOPED  tool_runs + scans -- TOOL-RUN ORPHAN RECONCILIATION (incident
            # 615d0e0b). Repairs tool_runs left 'running' under an already-terminal scan: a
            # state nothing can leave legitimately, because the scan that would have reported
            # the result is over. Cross-tenant by the SAME justification as the scan orphan
@@ -168,6 +168,6 @@ apps/api/scanner_engine/orchestrator.py:
            # error_message. Atomic conditional UPDATE whose source state is 'running', which
            # is what makes it idempotent and safe to run concurrently with itself, with scan
            # finalisation and with the reaper. Not reachable from any request path.
-  - 309    # SYSTEM_SCOPED  scans -- completion fenced by id + execution_token
-  - 355    # SYSTEM_SCOPED  scans -- reads status/token by trusted internal scan id
-  - 1403   # SYSTEM_SCOPED  scans -- heartbeat UPDATE by scan id
+  - 310    # SYSTEM_SCOPED  scans -- completion fenced by id + execution_token
+  - 356    # SYSTEM_SCOPED  scans -- reads status/token by trusted internal scan id
+  - 1404   # SYSTEM_SCOPED  scans -- heartbeat UPDATE by scan id

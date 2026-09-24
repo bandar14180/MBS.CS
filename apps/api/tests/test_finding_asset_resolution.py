@@ -522,3 +522,135 @@ def test_finding_origin_keeps_scheme_host_and_explicit_port():
     assert len(distinct) == 5
     for bad in (None, "", "ex.test:443", "src/A.java:1", "ftp://h/x", "not a url"):
         assert _finding_origin(bad or "") is None, bad
+
+
+# --- 10: per-scan cache behaviour --------------------------------------------------------------
+
+def test_origin_index_is_cached_per_scan_and_is_deterministic():
+    """The index is built once per ingest batch and cached on the Scan instance
+    (`_mbs_origin_index`). Two properties matter and neither was pinned before:
+
+      * the cache is POPULATED after the first resolution, which is what keeps ingestion
+        from re-scanning every asset of the target once per finding;
+      * a second resolution returns the SAME answer. The cache is only safe because the
+        index is a pure function of the target's assets, so a repeat call must not drift.
+    """
+    async def scenario():
+        engine = _engine()
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                project, target, scan, wsid, _uid = await _seed_target(s)
+                with tenancy.workspace_scope(wsid):
+                    svc = await _asset(s, project, target, "http_service", "https://ex.test")
+                    assert getattr(scan, "_mbs_origin_index", None) is None
+
+                    first = await _resolve_asset_id(s, scan, "https://ex.test/deep/a?x=1")
+                    assert first == svc.id
+                    cached = getattr(scan, "_mbs_origin_index", None)
+                    assert cached is not None, "origin index was not cached on the Scan"
+                    assert cached.get("https://ex.test") == svc.id
+
+                    # Repeat resolution: same answer, and the SAME cache object (not rebuilt).
+                    second = await _resolve_asset_id(s, scan, "https://ex.test/other/b")
+                    assert second == svc.id
+                    assert getattr(scan, "_mbs_origin_index", None) is cached
+        finally:
+            await engine.dispose()
+    _run(scenario())
+
+
+def test_cached_index_is_scoped_to_its_own_scan():
+    """The cache hangs off the Scan INSTANCE, so two scans of two different targets must
+    not share one index. If they did, a finding from one target could resolve to the
+    other's asset -- the one failure mode a per-instance cache could introduce."""
+    async def scenario():
+        engine = _engine()
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                p1, t1, scan1, ws1, uid = await _seed_target(s, host="one.test")
+                with tenancy.workspace_scope(ws1):
+                    a1 = await _asset(s, p1, t1, "http_service", "https://one.test")
+                    assert await _resolve_asset_id(s, scan1, "https://one.test/x") == a1.id
+
+                p2, t2, scan2, ws2, _ = await _seed_target(
+                    s, workspace_id=ws1, user_id=uid, host="two.test"
+                )
+                with tenancy.workspace_scope(ws2):
+                    a2 = await _asset(s, p2, t2, "http_service", "https://two.test")
+                    # scan2 builds its OWN index; one.test is not in its target's inventory.
+                    assert await _resolve_asset_id(s, scan2, "https://two.test/x") == a2.id
+                    assert await _resolve_asset_id(s, scan2, "https://one.test/x") is None
+                    assert getattr(scan1, "_mbs_origin_index", None) is not getattr(
+                        scan2, "_mbs_origin_index", None
+                    )
+        finally:
+            await engine.dispose()
+    _run(scenario())
+
+
+# --- 11: duplicate candidates ------------------------------------------------------------------
+
+def test_duplicate_rank_zero_spellings_collapse_to_one_candidate():
+    """DUPLICATE CANDIDATES AT RANK 0 ARE STRUCTURALLY BENIGN, and this pins why.
+
+    Rank 0 means "this asset IS the origin", so every rank-0 row for a given origin
+    necessarily denotes the SAME location -- it can differ only in spelling (bare vs
+    trailing slash, host case, an explicitly written default port). `normalize_url`
+    collapses all of those to one value, and the index keys its tie check on that
+    normalised value, so several rank-0 rows resolve rather than fail closed.
+
+    This is the counterpart to `test_ambiguous_origin_returns_none`, where the rivals are
+    rank-1 pages that genuinely are different locations. Keeping both pinned is what makes
+    the distinction between a benign duplicate and a real tie a tested property rather
+    than an accident of ordering."""
+    async def scenario():
+        engine = _engine()
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                project, target, scan, wsid, _uid = await _seed_target(s)
+                with tenancy.workspace_scope(wsid):
+                    # Four spellings of ONE location, all rank 0 for https://ex.test.
+                    ids = {(await _asset(s, project, target, "url", v)).id for v in (
+                        "https://ex.test", "https://ex.test/", "https://ex.test:443",
+                        "https://EX.test",
+                    )}
+                    # The property that matters is that a deep URL under the origin RESOLVES
+                    # -- the duplicates must not be mistaken for a tie and fail closed. WHICH
+                    # of the four wins is deliberately not asserted: they denote the same
+                    # location, the underlying query has no ORDER BY, and pinning one row
+                    # would be asserting an incidental ordering rather than the contract.
+                    resolved = await _resolve_asset_id(s, scan, "https://ex.test/deep/page")
+                    assert resolved is not None, "benign duplicates were treated as a tie"
+                    assert resolved in ids
+                    # Stable across repeat calls: the cached index answers consistently.
+                    assert await _resolve_asset_id(s, scan, "https://ex.test/other") == resolved
+        finally:
+            await engine.dispose()
+    _run(scenario())
+
+
+def test_exact_match_still_wins_when_the_origin_is_ambiguous():
+    """Tier ordering under ambiguity: an EXACT value match is decided before the origin
+    index is ever consulted, so an ambiguous origin must not suppress a finding whose
+    location matches a stored asset byte-for-byte."""
+    async def scenario():
+        engine = _engine()
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as s:
+                project, target, scan, wsid, _uid = await _seed_target(s)
+                with tenancy.workspace_scope(wsid):
+                    exact = await _asset(s, project, target, "url", "https://ex.test/a/page")
+                    # Make the ORIGIN ambiguous with two rival rank-1 pages.
+                    await _asset(s, project, target, "url", "https://ex.test/b/other")
+                    await _asset(s, project, target, "url", "https://ex.test/c/third")
+                    # Exact hit -> tier 2, never reaches the (ambiguous) origin index.
+                    assert await _resolve_asset_id(s, scan, "https://ex.test/a/page") == exact.id
+                    # A location with no exact row falls through to the ambiguous origin.
+                    assert await _resolve_asset_id(s, scan, "https://ex.test/z/none") is None
+        finally:
+            await engine.dispose()
+    _run(scenario())

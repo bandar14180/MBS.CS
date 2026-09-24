@@ -49,7 +49,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from apps.api.core.config import get_settings
-from apps.api.scanner_engine import net_policy
+from apps.api.scanner_engine import net_policy, scope_guard
 from apps.api.scanner_engine.scan_routing import JobNotForThisWorker, assert_job_matches_worker
 
 logger = logging.getLogger(__name__)
@@ -623,7 +623,19 @@ class LeaseLoop:
         watchdog = None
         exec_task = None
         try:
-            with net_policy.bind(policy):
+            # DERIVED-SCOPE RESOLUTION CACHE -- bound here, beside the policy, because the
+            # two share exactly one lifetime: ONE leased scan. The cached answers are only
+            # comparable under the policy that produced them (a private scan resolves through
+            # the customer's site resolvers, a public scan through the OS resolver), so
+            # entering the cache inside `net_policy.bind` makes that pairing structural.
+            #
+            # It memoizes the DNS lookups the derived-scope gate performs per
+            # (finding x authorized host) -- successes AND failures -- which is the
+            # regression this addresses. Purely a performance boundary: it changes no scope
+            # verdict, and the DNS-rebinding defense in `net_guard.resolve_and_validate`
+            # (re-resolved immediately before a tool is given an address) is untouched.
+            # Leaving the block drops the cache, so the next scan resolves fresh.
+            with net_policy.bind(policy), scope_guard.resolution_cache_scope():
                 if self.executor is None:
                     raise LeaseError(
                         "NO_EXECUTOR", "no executor configured on this lease loop"

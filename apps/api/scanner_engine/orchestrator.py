@@ -24,6 +24,7 @@ from apps.api.modules.authorization_scope.service import require_verified_target
 from apps.api.modules.compliance.service import sync_mappings
 from apps.api.modules.risk.service import upsert_risk_score
 from apps.api.modules.scans.models import Scan
+from apps.api.modules.vulnerabilities.remediation_service import sync_remediation
 from apps.api.modules.vulnerabilities.service import ingest_finding
 from apps.api.scanner_engine import evidence_store
 from apps.api.scanner_engine.location_normalize import normalize_url
@@ -459,6 +460,18 @@ async def run_scan(
         # scan even if a tool raises. Each asyncio task/thread gets its own copy of the
         # context, which is what keeps two concurrent scans in one worker isolated.
         _policy_token = _net_policy.set_policy(scan_policy)
+
+        # DERIVED-SCOPE RESOLUTION CACHE. Same lifetime as the policy above, and bound the
+        # same way (a token + the `finally` below) rather than a `with` block, for the same
+        # reason: it avoids reindenting the entire pipeline. Memoizes the DNS lookups that
+        # `scope_guard.host_in_scope` performs per (finding x authorized host) -- both
+        # successes and failures -- which is a pure performance boundary and changes no
+        # scope verdict. Tied to the scan, not the process, so a name is re-resolved fresh
+        # on the next scan. See scope_guard.resolution_cache_scope.
+        from apps.api.scanner_engine import scope_guard as _scope_guard
+
+        _scope_cache_cm = _scope_guard.resolution_cache_scope()
+        _scope_cache_cm.__enter__()
         logger.info(
             "scan.policy_bound scan=%s zone=%s site=%s cidrs=%d",
             scan.id, scan_policy.network_zone, scan_policy.site_id,
@@ -693,6 +706,14 @@ async def run_scan(
             # NameError: we failed before the policy was bound (e.g. the claim was lost).
             # ValueError/LookupError: the token belongs to a different Context (the reset
             # is then unnecessary -- that context is already gone).
+            pass
+        # The scope-resolution cache must not outlive the scan either: a stale address for
+        # an authorized host carried into the NEXT scan would be a scope decision made on
+        # data this scan never verified. Guarded identically -- the cache is only entered
+        # after the claim succeeds.
+        try:
+            _scope_cache_cm.__exit__(None, None, None)
+        except (NameError, ValueError, LookupError):
             pass
 
     _duration = time.monotonic() - scan_started
@@ -1750,6 +1771,13 @@ async def ingest_vulnerability_findings(
         await upsert_risk_score(db, vuln.id, vuln.cvss_score, criticality)
         await sync_mappings(db, vuln.id, vuln.category)
         await sync_attack_mappings(db, vuln.id, vuln.category, vuln_finding.metadata)
+        # Deterministic remediation guidance, written at the SAME boundary as the risk,
+        # compliance and ATT&CK enrichments above. Before this the `remediations` table was
+        # only ever written by the on-demand AI endpoint, so a completed scan produced zero
+        # rows and every finding in the report read "no remediation available". A catalogue
+        # lookup with no reviewed entry writes nothing -- see remediation_service for why an
+        # unsupported finding type gets no row rather than filler text.
+        await sync_remediation(db, vuln.id, vuln.fingerprint, vuln.category)
         if capture_screenshots:
             # Visual evidence for non-info web findings (best effort -- never fails the scan).
             await _maybe_capture_screenshot(
