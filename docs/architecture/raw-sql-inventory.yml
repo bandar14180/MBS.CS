@@ -170,4 +170,10 @@ apps/api/scanner_engine/orchestrator.py:
            # finalisation and with the reaper. Not reachable from any request path.
   - 310    # SYSTEM_SCOPED  scans -- completion fenced by id + execution_token
   - 356    # SYSTEM_SCOPED  scans -- reads status/token by trusted internal scan id
-  - 1404   # SYSTEM_SCOPED  scans -- heartbeat UPDATE by scan id
+  - 1424   # SYSTEM_SCOPED  scans -- heartbeat UPDATE by scan id. (Line moved from 1404:
+           # 28 lines were inserted EARLIER in the file by the remediation-catalogue and
+           # scope-guard-caching work; `git diff` over that range shows insertions only and
+           # touches no heartbeat line. Statement re-read and unchanged -- it is still the
+           # fenced `UPDATE scans SET last_heartbeat_at = now(6) WHERE id = :id AND status =
+           # 'running'` keyed by trusted internal scan id, with the execution_token predicate
+           # added when the caller holds one.)

@@ -139,6 +139,15 @@ def web_targets(
     except (socket.gaierror, IndexError):
         pass  # unresolvable now; the tool will fail cleanly on a host that isn't there
     host = net_guard._host_from_value(target_value) or target_value
+    # A blank host cannot be a scan target. Without this, an empty/whitespace target_value
+    # produces the malformed pair ["http://", "https://"]: `resolve_scan_host("")` raises
+    # socket.gaierror, which the handler above deliberately passes over, and both fallbacks
+    # below then interpolate an empty host. That list is truthy, so callers read it as "we
+    # have somewhere to fuzz" -- nuclei_dast's coverage_state() reported `fallback_root_only`
+    # for a run with no target at all, and nuclei/katana/whatweb/ffuf would each be handed a
+    # schemeless-host URL. Returning [] lets every caller take its existing no-targets path.
+    if not host.strip():
+        return []
     return [f"http://{host}", f"https://{host}"]
 
 
@@ -184,6 +193,15 @@ def content_discovery_targets(
     except (socket.gaierror, IndexError):
         pass  # unresolvable now; the tool will fail cleanly on a host that isn't there
     host = net_guard._host_from_value(target_value) or target_value
+    # A blank host cannot be a scan target. Without this, an empty/whitespace target_value
+    # produces the malformed pair ["http://", "https://"]: `resolve_scan_host("")` raises
+    # socket.gaierror, which the handler above deliberately passes over, and both fallbacks
+    # below then interpolate an empty host. That list is truthy, so callers read it as "we
+    # have somewhere to fuzz" -- nuclei_dast's coverage_state() reported `fallback_root_only`
+    # for a run with no target at all, and nuclei/katana/whatweb/ffuf would each be handed a
+    # schemeless-host URL. Returning [] lets every caller take its existing no-targets path.
+    if not host.strip():
+        return []
     return [f"http://{host}", f"https://{host}"]
 
 
