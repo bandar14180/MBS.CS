@@ -1,6 +1,6 @@
 # Runbook: Deployment, Rolling Restart & Graceful Shutdown
 
-How to deploy MBS.CS without losing in-flight scans or corrupting state. The system is built to
+How to deploy MBS.PT without losing in-flight scans or corrupting state. The system is built to
 tolerate abrupt worker loss (acks_late redelivery + orphan reaper), but a *clean* rollout avoids
 unnecessary scan restarts and downtime.
 

@@ -1,0 +1,23 @@
+# gitleaks fingerprint allowlist (file:rule:line) -- consumed automatically by
+# `gitleaks detect` from the repo root, on the pinned 8.18.4 CLI that CI runs.
+#
+# Every entry below is a SYNTHETIC test constant, manually verified as non-live:
+# the first two are fake keys fed to the log/detail scrubber so a test can assert the
+# scrubber redacts them; the third is a fake WireGuard key used to assert that a key
+# rotation never exposes the key through argv (/proc is world-readable).
+#
+# These are pinned by exact fingerprint rather than by allowlisting the files or a
+# regex, so the scanner still inspects the REST of each file -- a genuine secret added
+# to any of them would still fail CI. A fingerprint is line-anchored: if one of these
+# constants moves, the entry stops matching and CI re-flags it for a fresh human look,
+# which is the intended fail-safe direction.
+#
+# NOTE: rulesets differ BETWEEN gitleaks versions -- 8.30.x and the pinned 8.18.4 flag
+# different lines in these same files. Every entry here was produced by running the
+# EXACT version CI pins (8.18.4). If GITLEAKS_VERSION in .github/workflows/ci.yml is
+# bumped, re-run the scan and refresh this list; do not assume it carries over.
+apps/api/tests/test_audit_hardening.py:generic-api-key:95
+apps/api/tests/test_credential_testing_readiness.py:generic-api-key:169
+apps/api/tests/test_phase8_vpn_operations.py:generic-api-key:432
+apps/api/tests/test_audit_hardening.py:private-key:100
+apps/api/tests/test_private_worker_startup.py:generic-api-key:255

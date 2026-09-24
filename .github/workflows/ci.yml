@@ -145,7 +145,22 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install lint tooling
-        run: pip install --no-cache-dir -r apps/api/requirements-dev.txt
+        # The RUNTIME requirements are installed alongside the dev tooling because mypy
+        # resolves imports against real installed packages. Without them the job failed with
+        # 17 errors that do not exist in a developer checkout:
+        #   * 14x `import-untyped` for redis -- redis 5.0.8 ships a py.typed marker, so it is
+        #     self-typing and `ignore_missing_imports` does NOT cover it; mypy knows the types
+        #     should be there and errors when the package is absent. (Installing `types-redis`
+        #     would be the wrong fix: those stubs are deprecated precisely because redis is
+        #     self-typing.)
+        #   * 3x `unused-ignore` -- `warn_unused_ignores = true` plus missing pydantic and
+        #     SQLAlchemy made three CORRECT `# type: ignore` comments look redundant. Deleting
+        #     them would have broken the lint for everyone who has the deps installed.
+        # Verified in a clean python:3.12-slim container: dev-only = 17 errors, exit 1;
+        # runtime + dev = 0 errors, exit 0.
+        run: |
+          pip install --no-cache-dir -r apps/api/requirements.txt
+          pip install --no-cache-dir -r apps/api/requirements-dev.txt
       - name: Ruff lint (blocking)
         # AUDIT-013: `scripts` added to the lint scope. It was previously excluded entirely --
         # despite holding scripts/raw_sql_inventory.py, which IS the raw-SQL security gate. A
