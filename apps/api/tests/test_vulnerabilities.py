@@ -31,10 +31,20 @@ def test_nuclei_parse() -> None:
     f = findings[0]
     assert f.title == "HTTP Missing Security Headers"
     assert f.severity == "info"
-    assert f.category == "CWE-693"
+    # NORMALIZED, not passthrough: nuclei reported "CWE-693" and taxonomy.canonical_cwe
+    # collapses every recognised spelling onto the single lowercase form the ATT&CK and
+    # compliance catalogues are keyed by (they contain no uppercase "CWE-" keys at all).
+    # The id itself is preserved exactly -- 693 in, 693 out -- so provenance is unchanged;
+    # only the spelling is canonical. A malformed id would become None, never a guess.
+    assert f.category == "cwe-693"
+    # matched_at itself is kept exactly as nuclei reported it (raw, unnormalized) -- only the
+    # fingerprint's location component is normalized. See location_normalize.py (Prompt 13,
+    # Finding #1).
     assert f.matched_at == "http://10.0.0.1"
-    # fingerprint is stable + location-specific
-    assert f.fingerprint == "http-missing-security-headers|strict-transport-security|http://10.0.0.1"
+    # fingerprint is stable + location-specific. The empty path on a bare host normalizes to
+    # "/" (RFC 3986 equivalence -- location_normalize.normalize_url), so the location segment
+    # below is "http://10.0.0.1/", not the raw "http://10.0.0.1" matched_at value.
+    assert f.fingerprint == "http-missing-security-headers|strict-transport-security|http://10.0.0.1/"
     # regular parse() emits no assets for a vuln scanner
     assert NucleiRunner().parse(raw) == []
 
@@ -73,9 +83,33 @@ def test_nuclei_falls_back_to_discovered_ports_when_httpx_found_nothing() -> Non
     assert urls == ["http://172.18.0.7:3000", "https://172.18.0.7:3000"]
 
 
-def test_nuclei_bare_host_fallback_when_no_findings() -> None:
-    urls = NucleiRunner()._target_urls("10.0.0.1", [])
-    assert urls == ["http://10.0.0.1", "https://10.0.0.1"]
+def test_nuclei_refuses_an_ssrf_blocked_bare_host() -> None:
+    """AUDIT-011 -- CORRECTED EXPECTATION. Was:
+        urls = NucleiRunner()._target_urls("10.0.0.1", [])
+        assert urls == ["http://10.0.0.1", "https://10.0.0.1"]
+    i.e. nuclei was handed an RFC1918 target the SSRF policy rejects, because _web.py
+    swallowed TargetNotAllowed. The denial must reach the caller instead.
+    """
+    import pytest
+
+    from apps.api.scanner_engine.net_guard import TargetNotAllowed
+
+    with pytest.raises(TargetNotAllowed):
+        NucleiRunner()._target_urls("10.0.0.1", [])
+
+
+def test_nuclei_bare_host_fallback_when_host_does_not_resolve(monkeypatch) -> None:
+    """The fallback still applies to a merely UNRESOLVABLE host."""
+    import socket
+
+    from apps.api.scanner_engine.tool_runners import _web
+
+    monkeypatch.setattr(
+        _web, "resolve_scan_host",
+        lambda v: (_ for _ in ()).throw(socket.gaierror("no such host")),
+    )
+    urls = NucleiRunner()._target_urls("nonexistent.invalid", [])
+    assert urls == ["http://nonexistent.invalid", "https://nonexistent.invalid"]
 
 
 # --- vulnerability engine CVSS floor (pure) ---

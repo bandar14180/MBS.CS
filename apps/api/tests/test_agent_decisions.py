@@ -9,12 +9,13 @@ import asyncio
 import uuid
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from apps.api.ai_agent.agent import AgentDecision, CandidateAction
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.agent.models import AgentStep
 from apps.api.modules.agent.repo import latest_agent_decision, persist_agent_decision
@@ -25,9 +26,11 @@ from apps.api.modules.workspaces.models import Workspace
 
 
 async def _set_guc(session, ws_id):
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :wid, false)"), {"wid": str(ws_id)}
-    )
+    # Phase 0 MySQL cutover: was a Postgres `set_config` GUC call (session-level RLS binding).
+    # Replaced by tenancy.bind_workspace -- a plain Python ContextVar set, not DB-side at all
+    # (see apps.api.core.tenancy's module docstring). `session` is now unused but kept as a
+    # parameter so every call site in this file is unchanged.
+    tenancy.bind_workspace(ws_id)
 
 
 async def _seed_scan(session):
@@ -134,41 +137,22 @@ def test_unique_scan_step_no():
         asyncio.run(scenario())
 
 
-def test_agent_decisions_force_rls_configured_like_agent_steps():
-    """The additive table carries the SAME workspace-isolation control as the
-    accepted agent_steps / engagement_state tables: ENABLE + FORCE ROW LEVEL
-    SECURITY plus a workspace_isolation policy keyed on the app.current_workspace_id
-    GUC. (Runtime cross-workspace BLOCKING can't be exercised here because the dev
-    DB role is a superuser, which bypasses RLS; the app layer's cross-workspace
-    denial is covered by the API 403/404 tests -- see M4.4.5. This asserts the DB
-    control is DEFINED correctly, identical to the platform's accepted pattern.)"""
-    async def scenario():
-        settings = get_settings()
-        engine = create_async_engine(settings.database_url, poolclass=StaticPool)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-        try:
-            async with maker() as s:
-                flags = (
-                    await s.execute(
-                        text(
-                            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
-                            "WHERE relname = 'agent_decisions'"
-                        )
-                    )
-                ).one()
-                qual = (
-                    await s.execute(
-                        text(
-                            "SELECT qual FROM pg_policies WHERE tablename = 'agent_decisions' "
-                            "AND policyname = 'workspace_isolation'"
-                        )
-                    )
-                ).scalar_one()
-            return flags, qual
-        finally:
-            await engine.dispose()
+def test_agent_decisions_isolation_configured_like_agent_steps():
+    """The additive table carries the SAME workspace-isolation control as the accepted
+    agent_steps / engagement_state tables.
 
-    (enabled, forced), qual = asyncio.run(scenario())
-    assert enabled is True and forced is True          # ENABLE + FORCE RLS
-    assert "current_setting('app.current_workspace_id'" in qual
-    assert "workspace_id" in qual                       # keyed on the tenant column
+    Phase 0 MySQL cutover: this used to assert the Postgres DB-side control (ENABLE +
+    FORCE ROW LEVEL SECURITY plus a workspace_isolation policy keyed on the
+    app.current_workspace_id GUC), read straight out of pg_class/pg_policies -- MySQL has
+    neither. Workspace isolation is now app-layer (apps.api.core.tenancy), and the exact
+    thing this test always meant to prove -- "agent_decisions gets the same tenant-isolation
+    treatment as agent_steps, not a bespoke or missing one" -- has a direct MySQL-cutover
+    equivalent: both table names must be registered as directly workspace-scoped in
+    tenancy._DIRECT_TABLES, the single place (per tenancy.py's own module docstring) that
+    answers "which tables are tenant-isolated and how". Runtime cross-workspace BLOCKING is
+    exercised for real by test_scope_enforcement.py / the API 403/404 tests -- see M4.4.5.
+    """
+    assert "agent_decisions" in tenancy._DIRECT_TABLES
+    assert "agent_steps" in tenancy._DIRECT_TABLES
+    # Both are DIRECT (a plain workspace_id column, no FK-chain lookup) -- confirms
+    # agent_decisions didn't get a weaker/different scoping mechanism than its sibling.

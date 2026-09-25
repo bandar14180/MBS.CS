@@ -1,0 +1,9 @@
+# MBS.SC P8-D -- runtime operational flag directory.
+#
+# Bind-mounted READ-ONLY into scanner-manager at /run/mbs. An operator toggles the
+# platform-wide private-scanning kill switch by creating or removing:
+#
+#   infra/runtime/EMERGENCY_DISABLE_PRIVATE_SCANNING
+#
+# Existence = private scanning DISABLED, effective within ~5s with NO manager restart.
+# The sentinel itself is git-ignored; this file only keeps the mount point in the tree.

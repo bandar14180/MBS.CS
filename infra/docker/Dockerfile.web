@@ -1,31 +1,146 @@
-FROM node:20-slim
+# MBS.SC web (Next.js) -- PRODUCTION image.
+#
+# WHY THIS IS A MULTI-STAGE BUILD (deployment hardening).
+# This image previously did `npm install` + `COPY apps/web ./` and ended with
+# `CMD ["npm","run","dev"]`. Because infra/docker-compose.prod.yml declares no `web:` section,
+# the production merge inherited that CMD verbatim: the effective production web service ran
+# the Next.js DEVELOPMENT server. Verified on the running stack -- the live process tree was
+# `npm run dev` -> `next dev` -> `next-server (v15.5.25)`, with NODE_ENV undefined and the host
+# source bind-mounted read-write into /srv.
+#
+# That is not a cosmetic mismatch. `next dev` compiles routes on demand, ships the React
+# refresh/HMR client and unminified sources, disables the production optimiser, and serves
+# detailed build errors to the client. It also depends on a writable working tree -- which is
+# exactly how the pre-fix stack ended up returning HTTP 500 on /login with MODULE_NOT_FOUND out
+# of setup-dev-bundler.js, from a half-written `.next` cache.
+#
+# Equally important: nothing was ever BUILT in the old image. There was no `npm run build`
+# anywhere in this file. The `.next` directory that appeared inside the image had simply been
+# COPYed off the developer's machine by `COPY apps/web ./` (proven: the image's BUILD_ID was
+# byte-identical to the host's), and at runtime a named volume masked it anyway.
+#
+# The build/runtime split below fixes all of that:
+#   deps    -- production-only dependency layer, installed from the lockfile.
+#   builder -- full dependency set + `npm run build`, producing a real optimised build.
+#   runtime -- the built app + production dependencies ONLY. No source-tree mount, no dev
+#              server, no build tooling, NODE_ENV=production, non-root.
+#
+# NOT `output: 'standalone'`: apps/web/next.config.mjs does not set it, and adding it would
+# change the app's build contract to satisfy the container rather than the other way round.
+# `next start` against a normal `.next` build is the supported production server for this
+# configuration, and it is what `npm run start` already means in apps/web/package.json.
+
+# --------------------------------------------------------------------------------------------
+# Base -- pinned by IMMUTABLE DIGEST (AUDIT-005).
+# A tag is a moving pointer the registry can repoint at any time, so a rebuild months later
+# would silently produce a different base than the one that was tested and scanned.
+# Tag kept in the comment for readability. To update:
+#   docker buildx imagetools inspect node:20-slim
+# node:20-slim
+# --------------------------------------------------------------------------------------------
+FROM node@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS deps
 
 WORKDIR /srv
 
-COPY apps/web/package.json ./package.json
+# Lockfile-first so the dependency layer caches on package*.json alone.
+COPY apps/web/package.json apps/web/package-lock.json ./
 
 # Local TLS-interception support (BUILD-TIME ONLY).
-# Where an AV/proxy terminates TLS, registry.npmjs.org presents a locally-signed
-# cert and npm fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE. Node does NOT read the
-# system trust store -- its roots are compiled in -- and NODE_EXTRA_CA_CERTS
-# APPENDS to them, so pointing it at the root alone is sufficient (no
-# ca-certificates package, no update-ca-certificates, no combined bundle).
+# Where an AV/proxy terminates TLS, registry.npmjs.org presents a locally-signed cert and npm
+# fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE. Node does NOT read the system trust store -- its
+# roots are compiled in -- and NODE_EXTRA_CA_CERTS APPENDS to them, so pointing it at the root
+# alone is sufficient (no ca-certificates package, no update-ca-certificates, no bundle).
 #
 # The root is an OPTIONAL BuildKit secret:
 #   local: docker build --secret id=extra_ca,src=infra/docker/norton-webmail-root.crt ...
 #   CI/prod: no secret passed -> public CAs only; the image trusts nothing extra.
-# The secret is readable only inside this layer and is never copied into the
-# image, so no interception root ships and no persistent ENV weakens runtime TLS.
-# TLS verification is never disabled (no strict-ssl=false, no NODE_TLS_REJECT_UNAUTHORIZED).
+# The secret is readable only inside this layer and is never copied into the image, so no
+# interception root ships and no persistent ENV weakens runtime TLS. TLS verification is never
+# disabled (no strict-ssl=false, no NODE_TLS_REJECT_UNAUTHORIZED).
+#
+# `npm ci --omit=dev` installs STRICTLY from package-lock.json (never resolving a newer
+# version) and excludes devDependencies, so the runtime layer below carries no eslint /
+# typescript / vitest. Same lockfile discipline as the CI frontend job's `npm ci`.
 RUN --mount=type=secret,id=extra_ca \
     if [ -f /run/secrets/extra_ca ]; then \
-      NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca npm install; \
+      NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca npm ci --omit=dev; \
     else \
-      npm install; \
+      npm ci --omit=dev; \
+    fi
+
+
+# --------------------------------------------------------------------------------------------
+# Builder -- needs the FULL dependency set (next build uses typescript, tailwind, postcss...).
+# --------------------------------------------------------------------------------------------
+FROM node@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS builder
+
+WORKDIR /srv
+
+COPY apps/web/package.json apps/web/package-lock.json ./
+
+RUN --mount=type=secret,id=extra_ca \
+    if [ -f /run/secrets/extra_ca ]; then \
+      NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca npm ci; \
+    else \
+      npm ci; \
     fi
 
 COPY apps/web ./
 
+# Remove any `.next` that rode in from the build context. Without this, a developer's stale
+# local build would be overwritten by the real build below anyway -- but deleting it first
+# makes the image's provenance unambiguous: everything in `.next` was produced HERE.
+RUN rm -rf .next
+
+# NODE_ENV=production during the build so Next applies production optimisations and drops
+# development-only code paths. `next build` type-checks and lints as part of the build, so a
+# type error fails the image build rather than shipping.
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+
+# --------------------------------------------------------------------------------------------
+# Runtime -- the built app + production dependencies ONLY.
+# --------------------------------------------------------------------------------------------
+FROM node@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS runtime
+
+WORKDIR /srv
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+# Production dependency tree (no devDependencies).
+COPY --from=deps /srv/node_modules ./node_modules
+
+# Exactly what `next start` needs, and nothing else. Deliberately NOT `COPY apps/web ./`:
+# the runtime image must not carry the TypeScript sources, tests, eslint config or any other
+# development tooling.
+# NOTE: there is deliberately no `public/` COPY -- apps/web has no public/ directory, and
+# COPYing a non-existent path fails the build. Add it here if one is ever introduced.
+COPY --from=builder /srv/.next           ./.next
+COPY --from=builder /srv/package.json    ./package.json
+COPY --from=builder /srv/next.config.mjs ./next.config.mjs
+
+# Run as an unprivileged user (defense in depth for the internet-facing service) -- same
+# convention and uid as Dockerfile.api's appuser.
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /srv
+USER appuser
+
 EXPOSE 3000
 
-CMD ["npm", "run", "dev"]
+# Liveness probe. Uses node's stdlib (no curl/wget in the slim image) against the app's own
+# root route, mirroring Dockerfile.api's stdlib-only HEALTHCHECK.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD node -e "require('http').get('http://127.0.0.1:3000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+
+# PRODUCTION server. `next start` serves the prebuilt `.next` output -- no compilation, no HMR,
+# no dev bundler.
+#
+# `exec` so next REPLACES the shell and becomes PID 1: Docker's SIGTERM then reaches the server
+# directly and it shuts down gracefully on `docker stop`. Without exec, `sh` is PID 1 and does
+# not forward SIGTERM, so the server is SIGKILLed and in-flight requests are dropped. Same
+# rationale as Dockerfile.api's CMD.
+CMD ["sh", "-c", "exec npm run start -- --hostname 0.0.0.0 --port ${PORT:-3000}"]

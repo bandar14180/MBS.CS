@@ -1,0 +1,36 @@
+[
+  {
+    "id": "9c5792fc-84f4-5d79-957b-0fb7b7743741",
+    "workspace_id": "137bd391-0733-5cc3-aa67-82e2087159d5",
+    "project_id": "28e9dd2b-3a26-59c1-9107-d69e7652f7be",
+    "target_id": "293396a4-dd3a-544b-9d86-759595d08177",
+    "initiated_by": "736cd231-6c52-5690-87f3-1ec6b8a75359",
+    "scan_type": "web",
+    "status": "completed",
+    "config": {
+      "site_id": null,
+      "use_agent": false,
+      "network_zone": "public",
+      "approved_hosts": [],
+      "use_ai_planner": false,
+      "requested_modules": [
+        "subfinder",
+        "amass",
+        "dnsx",
+        "httpx",
+        "whatweb",
+        "naabu",
+        "nmap",
+        "katana",
+        "ffuf",
+        "arjun",
+        "nuclei",
+        "nuclei-dast"
+      ],
+      "exploitation_enabled": false
+    },
+    "started_at": "2026-09-19T06:31:09Z",
+    "completed_at": "2026-09-19T08:40:05Z",
+    "created_at": "2026-09-19T06:30:58.728059Z"
+  }
+]

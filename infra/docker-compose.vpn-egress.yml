@@ -1,0 +1,244 @@
+# MBS.SC -- DEDICATED VPN EGRESS WORKER (public scanner traffic)
+#
+# Apply it alongside the base + production overlays:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#                  -f docker-compose.vpn-egress.yml up -d
+#
+# WHAT THIS IS
+# ------------
+#   Public VPN Scanner -> Dedicated VPN/WireGuard Egress -> Internet Target
+#
+# A public scan worker whose target traffic leaves from a VPN provider's exit IP instead of
+# the platform's own address. It is a PLATFORM-WIDE SHARED exit: one pool, one tunnel, no
+# tenant-specific state anywhere in it.
+#
+# HOW IT DIFFERS FROM docker-compose.private-site.yml, AND WHY THEY NEVER MERGE
+# -----------------------------------------------------------------------------
+# The private-site template exists because RFC1918 space is not globally unique, so each
+# customer needs its own namespace and its own SPLIT tunnel whose AllowedIPs are exactly
+# that customer's authorized CIDRs -- never 0.0.0.0/0.
+#
+# This file is the opposite tunnel: AllowedIPs IS 0.0.0.0/0, because the entire point is
+# that ALL public target traffic leaves via the provider. Those two shapes must never share
+# a container, a network, or a code path:
+#
+#   * NO site_id, NO site secret, NOT on any mbs-site-* network. This worker therefore
+#     cannot reach a private range at all, and the manager refuses it every private job
+#     (assert_worker_may_serve_site) -- so the full tunnel can never become a path into a
+#     customer network.
+#   * NOT on mbs-core. No database, no broker, no object store, exactly like every other
+#     execution-plane worker.
+#   * The full-tunnel default route lives in a DEDICATED ROUTING TABLE (51820), never the
+#     main table, so manager/dispatch traffic keeps its ordinary path. The worker refuses
+#     to start if the main table's default ever points at the tunnel.
+#
+# THE KILL-SWITCH IS A FIREWALL, NOT A PYTHON CHECK
+# --------------------------------------------------
+# egress_guard is in-process and cannot intercept nuclei/katana/ffuf sockets -- they do
+# their own socket work in another process. So the fail-closed guarantee is iptables on
+# OUTPUT: default DROP, with narrow ACCEPTs for the VPN endpoint, the dispatch plane,
+# loopback, and anything leaving via wg-egress. If the tunnel drops, the last rule stops
+# matching and target traffic is dropped by the KERNEL. The rules are installed BEFORE the
+# tunnel comes up, so the startup window is closed rather than open.
+#
+# ---------------------------------------------------------------------------------------
+# TO INSTANTIATE
+#   1. Obtain a WireGuard peer from the VPN provider. Generate the private key INSIDE this
+#      container (see the secret contract at the bottom) and give the provider only the
+#      public half.
+#   2. Register the worker (a `scanner_workers` row, site_id NULL, pool_id
+#      `public-vpn-egress`) and put its token in
+#      infra/secrets/scanner_worker_token_vpn_egress.txt.
+#   3. Set SCANNER_VPN_EGRESS_DISPATCH_CIDRS to the real mbs-dispatch subnet
+#      (`docker network inspect mbs_mbs-dispatch -f '{{(index .IPAM.Config 0).Subnet}}'`).
+#      The kill-switch denies by default, so an unset/incorrect value means the worker
+#      cannot reach its manager -- it fails closed, loudly, at startup.
+#   4. Set SCANNER_VPN_EGRESS_FORBIDDEN_EXIT_IPS to the platform's own public egress
+#      address(es). Observing one of them as the exit IP is positive proof of a bypass.
+# ---------------------------------------------------------------------------------------
+
+networks:
+  # The egress worker's own plane. `internal: true` is deliberately NOT set -- the worker
+  # must reach the VPN provider's endpoint over the internet. Egress is restricted by the
+  # kill-switch firewall inside the container, not by making the network internal (which
+  # would block the tunnel itself, exactly as it would for a private site).
+  #
+  # SEPARATE from mbs-scan-egress: a direct public worker and the VPN worker must not share
+  # a broadcast domain, so neither can observe or reach the other's traffic.
+  mbs-vpn-egress:
+    driver: bridge
+
+services:
+  worker-vpn-egress:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+    restart: unless-stopped
+    # PRIVILEGE DROP WITH A RETAINED AMBIENT CAPABILITY -- identical mechanism to the
+    # private-site worker (see P7-1 there for the full kernel-capability reasoning). Start
+    # as root holding only the capabilities below, then `setpriv` to uid 10001 raising
+    # CAP_NET_ADMIN into the AMBIENT set so it survives into the non-root process.
+    #
+    # CAP_NET_ADMIN is RETAINED rather than dropped after setup for two reasons here:
+    #   * SystemEgressProbe runs `wg show` on every job and every mid-scan re-check, which
+    #     requires it. Dropping it makes the probe fail forever, which the fail-closed gate
+    #     turns into "refuse every scan" -- permanently.
+    #   * CAP_NET_RAW is NOT granted (iptables needs NET_ADMIN, not NET_RAW).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        command -v setpriv >/dev/null 2>&1 || {
+          echo "FATAL: setpriv (util-linux) is missing from this image. The VPN-egress
+        worker must drop from root to uid 10001 while retaining ambient CAP_NET_ADMIN, and
+        setpriv is what performs that drop. It is pinned in infra/docker/Dockerfile.worker;
+        a base-image change has removed it." >&2
+          exit 1
+        }
+        command -v iptables >/dev/null 2>&1 || {
+          echo "FATAL: iptables is missing from this image. The VPN-egress kill-switch is a
+        FIREWALL, not a Python check -- without iptables this worker cannot fail closed when
+        the tunnel drops, and it must not start." >&2
+          exit 1
+        }
+        exec setpriv \
+          --reuid=10001 --regid=10001 --clear-groups \
+          --inh-caps=+net_admin --ambient-caps=+net_admin \
+          -- "$@"
+      - --
+    command: ["python", "-m", "apps.api.scanner_worker.main"]
+    # The shared scanner env file -- NO control-plane credentials, exactly as for every
+    # other execution-plane worker. The VPN PROVIDER KEY IS NOT IN HERE: it is a platform
+    # secret delivered as a file (see `secrets` below), because .env.scanner is shared with
+    # tenant site workers and a platform credential must not sit in a tenant-shared file.
+    env_file:
+      - ../.env.scanner
+    environment:
+      ENVIRONMENT: production
+      SCANNER_EXECUTION_PLANE: "true"
+      SCANNER_MANAGER_URL: http://scanner-manager:8100
+      SCANNER_WORKER_ID: worker-vpn-egress
+      # The pool the MANAGER uses to derive this worker's egress mode from its persisted
+      # row (core/config.py VPN_EGRESS_POOLS). A worker cannot choose its own pool -- the
+      # manager reads pool_id from the database, never from the worker.
+      SCANNER_POOL_ID: public-vpn-egress
+      # DELIBERATELY UNSET: SCANNER_SITE_ID. This is a PUBLIC worker. Setting it would make
+      # the container a private-site worker as well, which config validation refuses
+      # outright (the two roles are mutually exclusive).
+      SCANNER_WORKER_TOKEN_FILE: /run/secrets/scanner_worker_token_vpn_egress
+      # EXPLICIT MODE -- never inferred from the presence of a key file. A secret that
+      # failed to mount would otherwise silently downgrade this to a DIRECT worker that
+      # scans from the platform's own address while looking correct.
+      SCANNER_EGRESS_MODE: vpn
+      SCANNER_VPN_EGRESS_INTERFACE: wg-egress
+      # The provider key, delivered as a FILE. Never an env value: an env var appears in
+      # `docker inspect`, in crash dumps, and in every child process's environment.
+      SCANNER_VPN_EGRESS_PRIVATE_KEY_FILE: /run/secrets/vpn_egress_private_key
+      # Provider peer parameters. Not secrets. REPLACE ALL FOUR.
+      SCANNER_VPN_EGRESS_PEER_PUBLIC_KEY: REPLACE_WITH_PROVIDER_PUBLIC_KEY
+      SCANNER_VPN_EGRESS_ENDPOINT_HOST: REPLACE_WITH_PROVIDER_ENDPOINT_HOST
+      SCANNER_VPN_EGRESS_ENDPOINT_PORT: "51820"
+      # This peer's address on the provider's tunnel, as the provider assigned it.
+      SCANNER_VPN_EGRESS_ADDRESS: REPLACE_WITH_ASSIGNED_ADDRESS
+      # Dedicated routing table + fwmark. The main table is never modified.
+      SCANNER_VPN_EGRESS_TABLE: "51820"
+      # EXIT-IP VERIFICATION. Tunnel-up plus a handshake proves the tunnel lives; it does
+      # NOT prove traffic uses it (a flushed table or an absent ip rule leaves a healthy
+      # tunnel beside traffic still going out the host address). This URL is fetched over
+      # the worker's real egress path, so the answer is evidence.
+      SCANNER_VPN_EGRESS_EXIT_IP_URL: https://api.ipify.org
+      # Pin the provider's exit IP when it is stable -- the strongest form of the check.
+      SCANNER_VPN_EGRESS_EXPECTED_EXIT_IP: ""
+      # The platform's OWN public egress address(es), comma-separated. Observing one of
+      # these is positive proof the VPN was bypassed. SET THIS even if the expected exit IP
+      # above is left empty -- it is what makes the unpinned case still meaningful.
+      SCANNER_VPN_EGRESS_FORBIDDEN_EXIT_IPS: ""
+      # The mbs-dispatch subnet, which the kill-switch permits directly so the manager stays
+      # reachable. Narrow by design: a blanket 10.0.0.0/8 here would re-open exactly the
+      # private-range reachability this worker must not have. REPLACE with the real subnet.
+      SCANNER_VPN_EGRESS_DISPATCH_CIDRS: REPLACE_WITH_DISPATCH_SUBNET
+      # How often a RUNNING scan re-verifies egress. Without this a tunnel that dies
+      # mid-scan would let the remaining tools continue over direct egress and the scan
+      # would still report as completed.
+      SCANNER_VPN_EGRESS_RECHECK_SECONDS: "60"
+      PROMETHEUS_MULTIPROC_DIR: /run/prometheus-multiproc
+    networks:
+      # The egress plane + the dispatch plane (to reach the manager). NOT mbs-core, NOT
+      # mbs-edge, and NOT any mbs-site-* network.
+      - mbs-vpn-egress
+      - mbs-dispatch
+    secrets:
+      - scanner_worker_token_vpn_egress
+      - vpn_egress_private_key
+    # Deny everything, then grant back exactly three capabilities -- one for the tunnel AND
+    # the firewall, two consumed by the privilege drop. NET_RAW is deliberately NOT granted.
+    cap_drop:
+      - ALL
+    cap_add:
+      # Creates wg-egress, installs the policy routes and `ip rule`s, runs iptables for the
+      # kill-switch, and is what `wg show` needs for the per-job and mid-scan health checks.
+      - NET_ADMIN
+      # Consumed by setpriv's setresuid/setresgid ONLY; not raised into the ambient set, so
+      # the worker cannot change identity again once it is uid 10001.
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    # NOT privileged, and NO docker socket -- either would let a tunnel compromise become a
+    # host compromise.
+    read_only: true
+    tmpfs:
+      # The provider private key is copied here (0600) for the single `wg set` call and
+      # unlinked immediately. tmpfs only: RAM for the life of the container, never a
+      # persistent layer. uid/gid 10001 because the worker has already dropped privileges
+      # by the time it writes.
+      - /run/wireguard:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001,size=1m
+      - /tmp:rw,noexec,nosuid,size=2g
+      - /run/prometheus-multiproc:rw,nosuid,mode=1777,size=64m
+    # Root for the ENTRYPOINT only -- see the private-site template for why `user: "0:0"` is
+    # required here rather than merely conventional (Dockerfile.worker ends with
+    # `USER appuser`, and setpriv cannot drop from an already-unprivileged uid). What runs
+    # long-lived is uid 10001.
+    user: "0:0"
+    sysctls:
+      # No IP forwarding: this container is a tunnel ENDPOINT, not a router. Without this a
+      # compromised worker could forward traffic between the VPN and anything else it can
+      # reach -- including the dispatch plane.
+      net.ipv4.ip_forward: "0"
+    stop_grace_period: 120s
+    depends_on:
+      scanner-manager:
+        condition: service_started
+
+# ---------------------------------------------------------------------------------------
+# SECRET-INJECTION CONTRACT
+#
+# Two secrets, both delivered as FILES (Docker secret today; a Vault-templated file drops in
+# unchanged, because the worker only ever reads a path).
+#
+#   scanner_worker_token_vpn_egress   the worker's manager credential. Scoped to this ONE
+#                                     worker id; the manager re-derives every permission
+#                                     from the worker's persisted row.
+#
+#   vpn_egress_private_key            the VPN PROVIDER's WireGuard private key. This is a
+#                                     PLATFORM secret, not a tenant one, which is why it is
+#                                     NOT in .env.scanner -- that file is shared with every
+#                                     tenant site worker, and a platform credential must
+#                                     never sit in a tenant-shared file.
+#
+#                                     GENERATE IT INSIDE THIS CONTAINER:
+#                                       docker compose exec worker-vpn-egress sh -c \
+#                                         'umask 077; wg genkey | tee /run/wireguard/private.key | wg pubkey'
+#                                     Send ONLY the printed public key to the VPN provider.
+#
+# Both files must be mode 0600 and owned by uid 10001. egress_setup reads the key once at
+# startup, copies it to a 0600 temp file for the single `wg set` call, and unlinks that
+# immediately -- the key never reaches argv (world-readable via /proc) and is never logged.
+# ---------------------------------------------------------------------------------------
+secrets:
+  scanner_worker_token_vpn_egress:
+    file: ./secrets/scanner_worker_token_vpn_egress.txt
+  vpn_egress_private_key:
+    file: ./secrets/vpn_egress_private_key.txt

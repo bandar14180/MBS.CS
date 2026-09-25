@@ -34,25 +34,45 @@ def _is_worker_command(command) -> bool:
 
 
 def test_scan_and_default_queues_run_on_separate_workers():
+    """F1's property -- scan work and control-plane work never share a worker -- now holds
+    by a STRONGER mechanism than a queue flag.
+
+    The scan worker no longer runs `celery worker -Q scans.public` at all: it cannot reach
+    the broker (MBS.SC network segmentation), so it leases authorized work from the
+    scanner-manager instead. It therefore cannot drain `default` even by misconfiguration,
+    because it cannot drain any queue. `worker-default` is unchanged and still consumes
+    `default` only.
+    """
     svcs = _services()
     assert "worker" in svcs and "worker-default" in svcs, "both dedicated workers must exist"
-    assert _queues(svcs["worker"]["command"]) == {"scans"}          # scans-only
+
+    scan_cmd = svcs["worker"]["command"]
+    parts = scan_cmd if isinstance(scan_cmd, list) else scan_cmd.split()
+    assert "apps.api.scanner_worker.main" in parts, (
+        "the scan worker must run the lease loop, not a celery consumer"
+    )
+    assert "celery" not in parts, (
+        "the scan worker must NOT be a celery consumer -- it has no route to the broker"
+    )
+    # The control-plane worker is untouched: still celery, still `default` only.
     assert _queues(svcs["worker-default"]["command"]) == {"default"}  # default-only
 
 
 def test_no_single_worker_consumes_both_queues():
-    # The regression F1 fixes: no worker may drain both `scans` and `default`.
+    # The regression F1 fixes: no worker may drain both `scans` and `default`. With the
+    # scan worker no longer consuming any queue, this now checks the remaining celery
+    # consumers -- and asserts, in effect, that none of them picked up the scan queue.
     for name, svc in _services().items():
         cmd = svc.get("command")
         if not _is_worker_command(cmd):
             continue
         queues = _queues(cmd)
-        assert queues in ({"scans"}, {"default"}), f"{name} consumes both queues: {queues}"
+        assert queues in ({"scans.public"}, {"default"}), f"{name} consumes both queues: {queues}"
 
 
 def test_routing_unchanged_scans_go_to_scans_queue():
     # F1 must NOT change routing: scans.run_scan still targets the `scans` queue.
     from apps.api.celery_app.worker import celery_app
 
-    assert celery_app.conf.task_routes["scans.run_scan"] == {"queue": "scans"}
+    assert celery_app.conf.task_routes["scans.run_scan"] == {"queue": "scans.public"}
     assert celery_app.conf.task_default_queue == "default"

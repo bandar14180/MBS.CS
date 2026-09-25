@@ -1,7 +1,7 @@
 import uuid
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.compliance.catalog import controls_for_category
@@ -24,8 +24,14 @@ async def sync_mappings(db: AsyncSession, vulnerability_id: uuid.UUID, category:
         }
         for framework, control_id, description in controls
     ]
-    stmt = pg_insert(ComplianceMapping.__table__).values(rows)
-    stmt = stmt.on_conflict_do_nothing(constraint="uq_compliance_vuln_framework_control")
+    stmt = mysql_insert(ComplianceMapping.__table__).values(rows)
+    # Phase 0 MySQL cutover: MySQL has no on_conflict_do_nothing. The standard SQLAlchemy
+    # idiom for a true no-op ON DUPLICATE KEY UPDATE is to set the table's own PK column to
+    # itself via VALUES() -- it satisfies "must SET something" while changing nothing, which
+    # is exactly do-nothing-on-conflict's contract. (INSERT IGNORE was deliberately NOT used
+    # here: it silently swallows every warning-level error, not just this specific duplicate
+    # key, which is broader than what this call site wants.)
+    stmt = stmt.on_duplicate_key_update(id=stmt.inserted.id)
     await db.execute(stmt)
 
 

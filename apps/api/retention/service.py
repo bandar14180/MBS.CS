@@ -4,7 +4,7 @@ Double-gated OFF: a run does nothing unless settings.retention_enabled is true, 
 defaults to dry-run (plan only, read-only counts) unless retention_dry_run is set false. Live
 mode deletes, per the Phase 5.3.1 safety audit:
 
-  * iterate tenants from the NON-RLS `workspaces` anchor; set the workspace GUC per tenant.
+  * iterate tenants from the `workspaces` anchor; bind tenancy.py's workspace context per tenant.
   * order: reports -> scans (cascade) -> ai_usage -> notifications -> audit_events LAST.
   * capture evidence tool_run_ids + report object URIs BEFORE deleting rows.
   * DB delete + audit are one transaction per workspace; object cleanup is best-effort AFTER
@@ -19,10 +19,10 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from apps.api.core.config import Settings, get_settings
+from apps.api.core.db import make_worker_engine
 from apps.api.retention import repo
 from apps.api.scanner_engine.storage_provider import get_storage_provider
 
@@ -64,11 +64,23 @@ POLICIES: list[RetentionPolicy] = [
     RetentionPolicy("report", "retention_report_days", "generated reports (rows + PDFs)"),
     RetentionPolicy("refresh_token", "retention_refresh_token_grace_days", "expired refresh tokens (deferred)"),
     RetentionPolicy("notification", "retention_notification_days", "in-app notifications"),
+    RetentionPolicy(
+        "remediation_event", "retention_remediation_event_days", "remediation workflow history"
+    ),
+    RetentionPolicy(
+        "risk_assessment", "retention_risk_assessment_days",
+        "issued client risk assessments (client-facing deliverable; longest window)",
+    ),
     RetentionPolicy("audit", "retention_audit_days", "audit events (compliance window)"),
 ]
 
 # Resources run_purge actually processes, in the mandated delete order (audit LAST).
-PROCESSED: list[str] = ["report", "scan", "ai_usage", "notification", "audit"]
+# `remediation_event` and `risk_assessment` sit before audit for the same reason every other
+# resource does: their own purge writes an audit event, which must not then be pruned by the
+# audit pass in the SAME run.
+PROCESSED: list[str] = [
+    "report", "scan", "ai_usage", "notification", "remediation_event", "risk_assessment", "audit",
+]
 _DAYS_ATTR = {p.resource: p.days_attr for p in POLICIES}
 _DESC = {p.resource: p.description for p in POLICIES}
 
@@ -102,6 +114,17 @@ class RetentionRunResult:
 class _StorageTargets:
     tool_run_ids: list = field(default_factory=list)  # -> tool-runs/{id}/ prefixes (mbs-evidence)
     report_uris: list = field(default_factory=list)   # raw storage_uri strings (filtered at cleanup)
+    # P1-1: EXACT evidence object URIs, read off the Evidence rows before they are deleted.
+    # Covers the two families the tool-run prefix never reached: per-vulnerability screenshots
+    # (`vulnerabilities/{id}/screenshot-*.png`) and human-uploaded remediation proof
+    # (`workspaces/{ws}/remediation/{item}/proof-*`). Deleting by the stored URI is inherently
+    # workspace-scoped -- the URI came from a row read under a workspace-scoped query, so no
+    # other tenant's object can be named here.
+    evidence_uris: list = field(default_factory=list)
+    # P1-1: workspaces being torn down entirely -> delete their whole remediation-evidence
+    # prefix in one call. A belt-and-braces sweep for any object whose row was already gone
+    # (e.g. cascaded away by an earlier partial run) and therefore has no URI to enumerate.
+    workspace_ids: list = field(default_factory=list)
 
 
 def _cutoff(now: datetime, days: int) -> datetime:
@@ -202,19 +225,22 @@ def run_purge(
 async def _run_async(settings: Settings, dry_run: bool, cutoffs: dict[str, datetime]) -> dict[str, list[int]]:
     """Per-workspace purge. Returns {resource: [eligible, deleted]} aggregated across tenants."""
     agg: dict[str, list[int]] = {res: [0, 0] for res in PROCESSED}
-    engine = create_async_engine(settings.database_url, poolclass=StaticPool)
+    engine = make_worker_engine(settings.database_url)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with maker() as session:
             workspace_ids = await repo.list_workspace_ids(session)
             for wid in workspace_ids:
-                await repo.set_workspace(session, wid)  # RLS bootstrap for this tenant
-                targets = await _purge_workspace(session, wid, cutoffs, settings, dry_run, agg)
-                if dry_run:
-                    await session.rollback()  # read-only pass -- discard any tx state
-                    continue
-                await session.commit()  # DB deletes + audit are atomic per workspace
-                _cleanup_storage(settings, targets)  # best-effort, AFTER commit
+                # AUDIT-004: SCOPED bind -- the context is restored after each tenant, so a
+                # failure mid-sweep cannot leave an arbitrary workspace bound to this worker
+                # Task, and the sweep does not end with the last tenant still bound.
+                with repo.workspace_scope(wid):
+                    targets = await _purge_workspace(session, wid, cutoffs, settings, dry_run, agg)
+                    if dry_run:
+                        await session.rollback()  # read-only pass -- discard any tx state
+                        continue
+                    await session.commit()  # DB deletes + audit are atomic per workspace
+                _cleanup_storage(settings, targets)  # best-effort, AFTER commit, outside the bind
     finally:
         await engine.dispose()
     return agg
@@ -225,11 +251,11 @@ async def _purge_workspace(session, wid, cutoffs, settings, dry_run, agg) -> _St
     targets = _StorageTargets()
 
     async def _generic(resource: str, table: str, ts: str) -> None:
-        eligible = await repo.count_eligible_generic(session, table, ts, cutoffs[resource], mk)
+        eligible = await repo.count_eligible_generic(session, table, ts, cutoffs[resource], mk, wid)
         agg[resource][0] += eligible
         if dry_run or not eligible:
             return
-        ids = await repo.select_eligible_generic(session, table, ts, cutoffs[resource], mk, bs)
+        ids = await repo.select_eligible_generic(session, table, ts, cutoffs[resource], mk, bs, wid)
         if resource == "report":
             targets.report_uris.extend(await repo.capture_report_uris(session, ids))  # before delete
         deleted = await repo.delete_by_ids(session, table, ids)
@@ -244,7 +270,16 @@ async def _purge_workspace(session, wid, cutoffs, settings, dry_run, agg) -> _St
     agg["scan"][0] += eligible
     if not dry_run and eligible:
         scan_ids = await repo.select_eligible_scans(session, wid, cutoffs["scan"], mk, bs)
-        targets.tool_run_ids.extend(await repo.capture_tool_run_ids(session, scan_ids))
+        tool_run_ids = await repo.capture_tool_run_ids(session, scan_ids)
+        targets.tool_run_ids.extend(tool_run_ids)
+        # P1-1: the scan cascade destroys the Evidence rows, so their object URIs must be
+        # read BEFORE the delete -- including screenshot rows, whose keys are per-vulnerability
+        # and are therefore NOT under any `tool-runs/{id}/` prefix.
+        targets.evidence_uris.extend(await repo.capture_evidence_uris(session, tool_run_ids))
+        # Prompt 13, Finding #8: flag any surviving report whose (immutable) scan_ids cites one
+        # of these scans -- BEFORE the delete, same transaction, so the flag and the deletion
+        # are atomic. A report purged in step (1) above is already gone and has nothing to flag.
+        await repo.mark_reports_with_purged_scans(session, wid, scan_ids)
         deleted = await repo.delete_scans(session, scan_ids)
         agg["scan"][1] += deleted
         await _audit(session, wid, "scan", deleted)
@@ -253,15 +288,24 @@ async def _purge_workspace(session, wid, cutoffs, settings, dry_run, agg) -> _St
     await _generic("ai_usage", "ai_usage", "created_at")
     await _generic("notification", "notifications", "created_at")
 
-    # 5) audit_events LAST (its own prune never removes the just-written retention events)
+    # 5) remediation workflow history + issued client assessments. Both are plain age-based
+    # generic purges over a workspace_id-carrying table (see repo._WORKSPACE_FILTER, where the
+    # assessment filter additionally restricts to `issued` so drafts are never swept).
+    # Deleting a risk_assessment cascades its frozen findings, which is correct: the findings
+    # exist only to describe that one snapshot.
+    await _generic("remediation_event", "remediation_events", "created_at")
+    await _generic("risk_assessment", "risk_assessments", "created_at")
+
+    # 6) audit_events LAST (its own prune never removes the just-written retention events)
     await _generic("audit", "audit_events", "created_at")
 
     return targets
 
 
 async def _audit(session, wid, resource_type: str, count: int) -> None:
-    """Append a system audit event (actor=None) for a resource purge, within the workspace GUC
-    so the FORCE-RLS insert on audit_events passes. Flushes (commits with the workspace tx)."""
+    """Append a system audit event (actor=None) for a resource purge, within the bound workspace
+    so the ORM insert on audit_events (workspace-scoped) is correctly attributed. Flushes
+    (commits with the workspace tx)."""
     from apps.api.modules.audit import service as audit
 
     await audit.record(
@@ -283,6 +327,38 @@ def _cleanup_storage(settings: Settings, targets: _StorageTargets) -> None:
                     "retention.storage_cleanup_failed kind=evidence tool_run=%s", tool_run_id,
                     exc_info=True, extra={"event": "retention.storage_cleanup", "kind": "evidence"},
                 )
+    # P1-1: evidence objects addressed by their EXACT stored URI. This is what removes the
+    # per-vulnerability screenshots and the human-uploaded remediation proof that the
+    # tool-run prefix above never covered.
+    for uri in targets.evidence_uris:
+        parsed = _parse_s3(uri)
+        if parsed is None:  # skip NULL / unavailable:// -- never send a non-s3 key to storage
+            continue
+        bucket, key = parsed
+        try:
+            get_storage_provider(bucket).delete(key)
+        except Exception:  # noqa: BLE001 -- a stranded object must not fail an otherwise-done purge
+            logger.warning(
+                "retention.storage_cleanup_failed kind=evidence_object key=%s", key,
+                exc_info=True,
+                extra={"event": "retention.storage_cleanup", "kind": "evidence_object"},
+            )
+
+    # P1-1: whole-workspace teardown -- one prefix delete catches any remediation artifact
+    # whose row is already gone. Self-scoping: the prefix embeds the workspace id, so it can
+    # never reach another tenant's objects.
+    if targets.workspace_ids:
+        evidence_store = get_storage_provider(settings.s3_bucket_evidence)
+        for workspace_id in targets.workspace_ids:
+            try:
+                evidence_store.delete_prefix(f"workspaces/{workspace_id}/remediation/")
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "retention.storage_cleanup_failed kind=workspace_evidence workspace=%s",
+                    workspace_id, exc_info=True,
+                    extra={"event": "retention.storage_cleanup", "kind": "workspace_evidence"},
+                )
+
     for uri in targets.report_uris:
         parsed = _parse_s3(uri)
         if parsed is None:  # skip NULL / unavailable:// -- never send a non-s3 key to storage

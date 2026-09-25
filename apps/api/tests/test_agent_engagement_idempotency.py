@@ -16,6 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.agent.models import EngagementState
 from apps.api.modules.projects.models import Project, Target
@@ -44,9 +45,11 @@ def _engine():
 
 
 async def _set_guc(session, wid):
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": str(wid)}
-    )
+    # Phase 0 MySQL cutover: was a Postgres `set_config` GUC call (session-level RLS binding).
+    # Replaced by tenancy.bind_workspace -- a plain Python ContextVar set, not DB-side at all
+    # (see apps.api.core.tenancy's module docstring). `session` is now unused but kept as a
+    # parameter so every call site in this file is unchanged.
+    tenancy.bind_workspace(wid)
 
 
 async def _seed(session):

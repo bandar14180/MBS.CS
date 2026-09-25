@@ -1,8 +1,10 @@
 """AI-2.2B-2 -- AI cost reporting (aggregation over ai_usage).
 
-Read-only aggregation of a workspace's AI spend. `ai_usage` is FORCE-RLS on workspace_id and the
-request already set the workspace GUC (WorkspaceContextDep), so reads are tenant-isolated; we ALSO
-filter by workspace_id explicitly (defense-in-depth, and correct even under a RLS-bypassing dev
+Read-only aggregation of a workspace's AI spend. `ai_usage` is a DIRECT table in
+apps/api/core/tenancy.py and the request already bound the workspace (WorkspaceContextDep), so
+entity reads are tenant-isolated; we ALSO filter by workspace_id explicitly -- REQUIRED here,
+not merely defence in depth, because these are AGGREGATES and tenancy's `with_loader_criteria`
+does not attach to aggregate statements (see tenancy.workspace_criterion). Correct even in a dev
 role). Metadata only -- no prompts/findings/secrets are stored on ai_usage, so none can leak.
 """
 import uuid

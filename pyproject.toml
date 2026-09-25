@@ -61,3 +61,136 @@ line-length = 120
 # reordering), and opinionated B/SIM/UP/RET/... families -- to keep the gate focused on genuine
 # defects, avoid formatting churn, and dodge the FastAPI `Depends()` (B008) false-positive.
 select = ["E4", "E7", "E9", "F", "W"]
+
+# --- mypy: Python type-checking gate (AUDIT-013, CI-blocking) ------------------------------------
+# WHY THIS EXISTS
+# Until AUDIT-013, CI ran `ruff check apps/api` and nothing else: no type checker at all, and
+# `scripts/` (which holds the raw-SQL security gate) was outside lint coverage entirely. Ruff's
+# selected ruleset catches undefined names and unused imports; it does not catch a wrong argument
+# type, a None-unsafe attribute access, or a call with the wrong arity.
+#
+# CALIBRATION -- DELIBERATELY NOT `strict`
+# A cold `mypy --strict` run on this tree reports thousands of errors, essentially all of them
+# missing annotations rather than defects. A gate that noisy gets `# type: ignore`-d wholesale or
+# switched off, which is worse than no gate. So this configuration turns on the checks that find
+# REAL bugs on ALREADY-ANNOTATED code, and does not demand annotations everywhere:
+#   * check_untyped_defs -- analyse bodies of unannotated functions too (most of the value here)
+#   * warn_redundant_casts / warn_unused_ignores -- keep the suppressions honest over time
+#   * no_implicit_optional, strict_equality -- two genuine defect classes
+# `disallow_untyped_defs` is intentionally OFF: it would report annotation debt, not bugs.
+#
+# NO BLANKET IGNORES. `ignore_errors` is not used anywhere. The per-module sections below are
+# narrow, individually justified suppressions of KNOWN STUB IMPRECISIONS -- cases verified at
+# runtime to be correct -- not a way to hide unexamined failures.
+[tool.mypy]
+python_version = "3.12"
+files = ["apps/api", "scripts"]
+# Third-party packages without stubs (celery, boto3 extras, reportlab, ...) must not turn into
+# hundreds of import errors; typing OUR code is the point.
+ignore_missing_imports = true
+follow_imports = "silent"
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+strict_equality = true
+# Annotation debt is not a defect -- see the calibration note above.
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+# `annotation-unchecked` is a NOTE, not an error; it just says "this unannotated body was
+# skipped". check_untyped_defs above already handles those bodies, so the note is pure noise.
+disable_error_code = ["annotation-unchecked"]
+exclude = '(^|/)(\.venv|node_modules|__pycache__|htmlcov)/'
+
+# SQLAlchemy Core/ORM expression objects. `session.execute(text(...))` is typed as returning
+# `Result[Any]`, which has no `.rowcount` in the stubs -- but the concrete object IS a
+# `CursorResult` and DOES expose it (verified at runtime against MySQL 8: type=CursorResult,
+# hasattr(rowcount)=True). Likewise `insert(Model.__table__)` is typed `FromClause`. These are
+# stub imprecisions in code that is correct; narrowing them per-module keeps the rest of each
+# file fully checked.
+[[tool.mypy.overrides]]
+module = [
+    "apps.api.modules.users.service",
+    "apps.api.modules.schedules.service",
+    "apps.api.modules.assets.service",
+    "apps.api.modules.vulnerabilities.service",
+    "apps.api.modules.vulnerabilities.ai_service",
+    "apps.api.modules.vulnerabilities.lineage",
+    "apps.api.retention.repo",
+    "apps.api.core.tenancy",
+    "apps.api.scanner_engine.orchestrator",
+    # F2-03: cancel_scan's fenced conditional UPDATE (mirrors orchestrator._finalize_status
+    # above) reads `.rowcount` off the same `Result[Any]` stub imprecision.
+    "apps.api.modules.scans.service",
+]
+disable_error_code = ["attr-defined", "arg-type"]
+
+# `ipaddress._BaseAddress` is the union base; the concrete IPv4Address/IPv6Address both define
+# is_private/is_loopback/etc., but the private base class does not declare them.
+[[tool.mypy.overrides]]
+module = ["apps.api.scanner_engine.net_guard"]
+disable_error_code = ["attr-defined", "misc"]
+
+# The test suite is deliberately held to a lower bar than production code: fixtures and
+# monkeypatched fakes legitimately violate the declared types they stand in for.
+[[tool.mypy.overrides]]
+module = ["apps.api.tests.*"]
+check_untyped_defs = false
+disable_error_code = ["attr-defined", "arg-type", "union-attr", "call-arg", "assignment", "index"]
+
+# `insert(Model.__table__)` -- SQLAlchemy types `__table__` as `FromClause`, while `insert()`
+# declares a narrower union. The call is the documented Core-insert form and is exercised by the
+# test suite; the mismatch is in the stubs.
+[[tool.mypy.overrides]]
+module = [
+    "apps.api.modules.risk.service",
+    "apps.api.modules.compliance.service",
+    "apps.api.modules.attack.service",
+]
+disable_error_code = ["arg-type"]
+
+# `.rowcount` on the `Result[Any]` returned by `session.execute(text(...))` (concrete type is
+# `CursorResult`, verified at runtime), and `_Row` attribute access on labelled query results.
+[[tool.mypy.overrides]]
+module = [
+    "apps.api.celery_app.shutdown",
+    "apps.api.modules.vulnerabilities.schemas",
+    "apps.api.core.db",
+]
+disable_error_code = ["attr-defined"]
+
+# `[i for i in items if not (i in seen or seen.add(i))]` -- the standard order-preserving dedupe.
+# `set.add` returning None is exactly what makes the idiom work; mypy flags the deliberate use of
+# that None. Rewriting five correct, identical helpers to satisfy the checker would be churn.
+[[tool.mypy.overrides]]
+module = [
+    "apps.api.scanner_engine.tool_runners._web",
+    "apps.api.scanner_engine.tool_runners.dnsx_runner",
+    "apps.api.scanner_engine.tool_runners.nmap_runner",
+    "apps.api.scanner_engine.tool_runners.naabu_runner",
+    "apps.api.scanner_engine.tool_runners.httpx_runner",
+]
+disable_error_code = ["func-returns-value"]
+
+# Framework/SDK signature variance that is correct at runtime:
+#  * Starlette's `add_exception_handler` is typed for the base Request/Exception pair;
+#  * `set_cookie(samesite=...)` wants a Literal, and the value comes from settings as `str`;
+#  * prometheus_client's `CollectorRegistry.register` wants its internal Collector protocol;
+#  * the Anthropic client is lazily assigned into a None-initialised attribute;
+#  * `raise last_exc` where mypy cannot narrow the captured exception variable.
+[[tool.mypy.overrides]]
+module = [
+    "apps.api.core.errors",
+    "apps.api.modules.auth.router",
+    "apps.api.core.observability",
+    "apps.api.ai_agent.providers.anthropic",
+    "apps.api.ai_agent.providers.fallback",
+    "apps.api.modules.workspaces.router",
+    "apps.api.modules.remediation.verification",
+    "apps.api.modules.remediation.evidence_confidence",
+    "apps.api.modules.reports.data",
+    "apps.api.scanner_engine.attack_graph",
+    "apps.api.dr.service",
+    "apps.api.ai_agent.eval.runner",
+]
+disable_error_code = ["arg-type", "assignment", "misc", "index", "attr-defined", "return-value"]

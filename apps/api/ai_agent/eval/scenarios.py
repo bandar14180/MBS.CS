@@ -1,5 +1,7 @@
 """AI-2.4 -- golden scenarios + component runners. Scripted model responses drive the REAL AI
 components via the injectable client seam; no live model calls."""
+from typing import Any
+
 from apps.api.ai_agent.agent import RedTeamAgent
 from apps.api.ai_agent.assistant import SecurityAssistant
 from apps.api.ai_agent.correlator import AICorrelator
@@ -25,7 +27,7 @@ class FakeClient:
 
 # --- agent tool-selection -------------------------------------------------------------------
 
-AGENT_SCENARIOS = [
+AGENT_SCENARIOS: list[dict[str, Any]] = [
     {
         "name": "recon_selects_ranked_best",
         "available": ["subfinder", "nmap"],
@@ -57,7 +59,7 @@ def run_agent(scenario) -> object:
 
 # --- correlator -----------------------------------------------------------------------------
 
-CORRELATOR_SCENARIOS = [
+CORRELATOR_SCENARIOS: list[dict[str, Any]] = [
     {
         "name": "groups_same_issue",
         "findings": [
@@ -86,7 +88,7 @@ def run_correlator(scenario) -> object:
 
 # --- remediation ----------------------------------------------------------------------------
 
-REMEDIATION_GROUNDED = {
+REMEDIATION_GROUNDED: dict[str, Any] = {
     "name": "grounded_in_finding",
     "finding": dict(title="Missing security headers", severity="info", category="cwe-693",
                     matched_at="http://10.0.0.1", cvss_score=0.0, description="Headers absent"),
@@ -96,7 +98,7 @@ REMEDIATION_GROUNDED = {
     "grounding_terms": ["header", "http://10.0.0.1"],
 }
 
-REMEDIATION_BLOCKED = {
+REMEDIATION_BLOCKED: dict[str, Any] = {
     "name": "blocks_unsafe_output",
     "finding": dict(title="Finding", severity="high", category="cwe-693",
                     matched_at="http://10.0.0.1", cvss_score=5.0, description="x"),
@@ -113,7 +115,7 @@ def run_remediation(finding, response) -> object:
 
 # --- MITRE ATT&CK golden set (pinned independently of the catalog to catch accidental edits) --
 
-ATTACK_GOLDEN = [
+ATTACK_GOLDEN: list[dict[str, Any]] = [
     {"category": "cwe-89", "tags": None, "expected": {"T1190"}},           # SQLi
     {"category": "cwe-79", "tags": None, "expected": {"T1189"}},           # XSS
     {"category": "cwe-78", "tags": None, "expected": {"T1190", "T1059"}},  # OS command injection

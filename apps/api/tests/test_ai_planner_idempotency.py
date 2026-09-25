@@ -15,6 +15,7 @@ from sqlalchemy.pool import StaticPool
 from apps.api.ai_agent.models import AIPlan
 from apps.api.ai_agent.planner import AIPlanner
 from apps.api.ai_agent.providers.usage import collect_ai_usage
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.projects.models import Project, Target
 from apps.api.modules.scans.models import Scan
@@ -40,9 +41,9 @@ def _engine():
 
 
 async def _set_ws(session, wid):
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": str(wid)}
-    )
+    # Phase 0 MySQL cutover: was a Postgres set_config GUC call; tenancy.bind_workspace is the
+    # app-layer replacement (a plain ContextVar set) -- see apps.api.core.tenancy.
+    tenancy.bind_workspace(wid)
 
 
 async def _seed_scan(session):

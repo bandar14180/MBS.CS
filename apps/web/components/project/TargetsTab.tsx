@@ -10,7 +10,7 @@ const CRITICALITY = ["low", "medium", "high", "critical"];
 const TARGET_TYPES = ["domain", "ip_range", "api", "cloud_account", "repo"];
 const PROOF_TYPES = ["dns_txt", "file_upload", "signed_letter", "cloud_iam_role"];
 
-export function TargetsTab({ projectId }: { projectId: string }) {
+export function TargetsTab({ projectId, onChange }: { projectId: string; onChange?: () => void }) {
   const { t: tr } = useTranslation();
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [scopes, setScopes] = useState<Record<string, AuthorizationScope | null>>({});
@@ -55,6 +55,7 @@ export function TargetsTab({ projectId }: { projectId: string }) {
       await projectApi.addTarget(projectId, type, value, criticality);
       setValue("");
       await load();
+      onChange?.();
     } catch (e: any) {
       setError(e.message);
     } finally {

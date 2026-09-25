@@ -5,3 +5,9 @@ pip-audit==2.7.3
 cyclonedx-bom==4.6.1
 # Static lint gate (CI-blocking). Pinned for reproducible CI; config in pyproject.toml [tool.ruff].
 ruff==0.16.3
+# AUDIT-013: Python type-checking gate (CI-blocking). Pinned for reproducible CI; config in
+# pyproject.toml [tool.mypy]. The types-* packages are STUBS for libraries that ship none --
+# installing them is the correct fix for `import-untyped`, rather than silencing the error.
+mypy==1.14.1
+types-PyYAML==6.0.12.20260815
+types-PyMySQL==1.2.0.20260807

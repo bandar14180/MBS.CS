@@ -20,6 +20,7 @@ from apps.api.modules.users.models import User
 from apps.api.modules.workspaces.models import Workspace
 from apps.api.scanner_engine.models import ToolRun
 from apps.api.scanner_engine.orchestrator import _claim_scan, run_scan
+from apps.api.core import tenancy
 
 
 async def _seed_scan(session, status: str) -> uuid.UUID:
@@ -29,6 +30,11 @@ async def _seed_scan(session, status: str) -> uuid.UUID:
     ws = Workspace(name="claim-ws", owner_user_id=user.id)
     session.add(ws)
     await session.flush()
+    # Bind the just-created workspace before inserting rows into it -- the same step
+    # production takes in workspaces.service.create_workspace, and required by the INSERT
+    # guard in core/tenancy.py (an ORM flush INSERT bypasses the SELECT/UPDATE/DELETE
+    # filter, so tenant-scoped writes are validated separately and fail closed).
+    tenancy.bind_workspace(ws.id)
     project = Project(workspace_id=ws.id, name="claim-proj", created_by=user.id)
     session.add(project)
     await session.flush()

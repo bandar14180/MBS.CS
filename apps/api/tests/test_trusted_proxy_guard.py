@@ -29,11 +29,13 @@ _PROD = dict(
     jwt_secret_key="a" * 48,
     s3_access_key="real-access",
     s3_secret_key="real-secret",
-    database_url="postgresql+asyncpg://user:strongpass@db:5432/mbs",
+    database_url="mysql+aiomysql://user:strongpass@db:3306/mbs",
     cors_allow_origins=["https://mbs.example.com"],
     trusted_hosts=["mbs.example.com"],
     ai_provider="openrouter",
     rate_limit_enabled=True,
+    # F-08: production requires a Secure refresh cookie.
+    refresh_cookie_secure=True,
     metrics_mode="token",
     mfa_encryption_key="a-real-mfa-encryption-key",
 )

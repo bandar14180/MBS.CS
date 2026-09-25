@@ -14,8 +14,14 @@ import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@
 import { useAssistant } from "@/components/assistant/AssistantWidget";
 
 const SEVERITIES = ["", "critical", "high", "medium", "low", "info"];
-const STATUSES = ["", "open", "confirmed", "false_positive", "remediated", "accepted_risk"];
-const STATUS_CHOICES = ["confirmed", "false_positive", "remediated", "accepted_risk"];
+// Must mirror the BACKEND lifecycle exactly (vulnerabilities/models.py + service.SETTABLE_STATUSES):
+// open | confirmed | false_positive | fixed | accepted_risk, plus the engine-set `reopened`.
+// `remediated` was never a valid backend status -- filtering by it returned nothing, and
+// submitting it was rejected by the API -- so the "mark as remediated" control could not work.
+const STATUSES = ["", "open", "confirmed", "reopened", "false_positive", "fixed", "accepted_risk"];
+// Only statuses an analyst may SET (service.SETTABLE_STATUSES). `reopened` is engine-set on
+// re-detection and is deliberately not offered here.
+const STATUS_CHOICES = ["confirmed", "false_positive", "fixed", "accepted_risk"];
 
 export function VulnerabilitiesTab({ projectId }: { projectId: string }) {
   const { t } = useTranslation();
@@ -81,7 +87,21 @@ export function VulnerabilitiesTab({ projectId }: { projectId: string }) {
                 <div className="flex items-center gap-3">
                   <Badge kind="severity" value={v.severity} />
                   <div>
-                    <div className="font-medium text-slate-100">{v.title}</div>
+                    <div className="flex items-center gap-2">
+                      <div className="font-medium text-slate-100">{v.title}</div>
+                      {/* A DETECTION is an observation (technology/WAF/version), not a
+                          weakness, and is excluded from the security score. Without this
+                          marker an open finding looks like it should count, and silently
+                          does not. Derived server-side; absent on older API responses. */}
+                      {v.classification === "detection" && (
+                        <span
+                          className="rounded border border-slate-600 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400"
+                          title="Detection: an observed technology/configuration, not a confirmed weakness. Does not affect the security score."
+                        >
+                          Detection
+                        </span>
+                      )}
+                    </div>
                     <div className="text-xs text-slate-500">
                       {v.category || t("vulns.uncategorized")}
                       {v.cvss_score != null && ` · CVSS ${v.cvss_score}`}

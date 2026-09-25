@@ -1,10 +1,27 @@
 """seed rbac defaults: system permissions and owner/admin/member roles
 
 Revision ID: 6a99a2128bba
-Revises: 87ca3d89a924
+Revises: 417cf2df2299
 Create Date: 2026-07-24 09:16:31.835283
 
 """
+# Phase 0 MySQL cutover: re-chained to follow the new squashed MySQL baseline
+# (417cf2df2299) instead of the old Postgres migration it used to sit after (now
+# archived, not deleted -- see docs/architecture). down_revision updated accordingly.
+#
+# Also: the ad-hoc `table()` column types below were switched from the generic sa.UUID()
+# to this codebase's own GUID type (apps.api.core.db_types) -- caught empirically by
+# actually running this migration against MySQL, not by inspection. SQLAlchemy's generic
+# Uuid type has NO native-MySQL representation, so on bind it falls back to `.hex` (a
+# 32-char string with no dashes), while the REAL `roles`/`permissions`/etc. columns (CHAR(36)
+# via GUID, created by the baseline migration) store the canonical 36-char DASHED form --
+# the same form the ORM/runtime binds via GUID everywhere else. Seeding with sa.UUID() wrote
+# rows whose primary keys didn't match what any later dashed-string lookup (FK insert, ORM
+# query) would ever produce -- not a crash at migration time, but a silent, permanent
+# integrity mismatch that then broke every FK insert into these seeded rows (workspace
+# creation, membership, etc.) with a 'foreign key constraint fails' error. On Postgres this
+# was never visible: its native UUID type round-trips correctly regardless of which generic
+# SQLAlchemy UUID spelling was used to bind it.
 import uuid
 from typing import Sequence, Union
 
@@ -12,30 +29,32 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.sql import column, table
 
+from apps.api.core.db_types import GUID
+
 
 # revision identifiers, used by Alembic.
 revision: str = '6a99a2128bba'
-down_revision: Union[str, None] = '87ca3d89a924'
+down_revision: Union[str, None] = '417cf2df2299'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 permissions_table = table(
     "permissions",
-    column("id", sa.UUID()),
+    column("id", GUID()),
     column("key", sa.String()),
     column("description", sa.Text()),
 )
 roles_table = table(
     "roles",
-    column("id", sa.UUID()),
-    column("workspace_id", sa.UUID()),
+    column("id", GUID()),
+    column("workspace_id", GUID()),
     column("name", sa.String()),
     column("description", sa.Text()),
 )
 role_permissions_table = table(
     "role_permissions",
-    column("role_id", sa.UUID()),
-    column("permission_id", sa.UUID()),
+    column("role_id", GUID()),
+    column("permission_id", GUID()),
 )
 
 # Deliberately small: only what's needed for workspaces/projects/targets (step 2).
@@ -96,7 +115,10 @@ def downgrade() -> None:
     op.execute("DELETE FROM role_permissions")
     op.execute("DELETE FROM roles WHERE workspace_id IS NULL AND name IN ('owner', 'admin', 'member')")
     op.execute(
-        "DELETE FROM permissions WHERE key IN ("
+        # `key` is a MySQL reserved word and must be backtick-quoted in raw SQL (SQLAlchemy
+        # Core auto-quotes it when going through a Table/Column construct, as the upgrade()
+        # above does via bulk_insert, but this raw op.execute() string does not).
+        "DELETE FROM permissions WHERE `key` IN ("
         + ", ".join(f"'{key}'" for key, _ in PERMISSIONS)
         + ")"
     )

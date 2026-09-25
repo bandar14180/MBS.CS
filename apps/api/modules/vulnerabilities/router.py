@@ -14,6 +14,7 @@ from apps.api.modules.risk.schemas import RiskScoreRead
 from apps.api.modules.vulnerabilities import ai_service, service
 from apps.api.modules.vulnerabilities.schemas import (
     FPAnalysisRead,
+    FPAssessmentRead,
     RemediationRead,
     VulnerabilityRead,
     VulnerabilityStatusUpdate,
@@ -77,7 +78,7 @@ async def update_status(
     dependencies=[Depends(require_permission("vulnerability:read"))],
 )
 async def get_risk(project_id: uuid.UUID, vuln_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep) -> RiskScoreRead:
-    # 404s if the vuln isn't in this workspace/project (RLS + explicit check)
+    # 404s if the vuln isn't in this workspace/project (tenancy.py's filter + explicit check)
     await service.get_vulnerability(db, ctx.workspace_id, project_id, vuln_id)
     risk = await risk_service.get_risk_score(db, vuln_id)
     if risk is None:
@@ -147,13 +148,15 @@ async def fp_analysis(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
     return FPAnalysisRead(
         model_version=result.model_version,
         prompt_version=result.prompt_version,
+        # AUDIT-013: build the declared model rather than a bare dict, so the response type is
+        # actually checked instead of relying on pydantic coercing an untyped dict.
         assessments=[
-            {
+            FPAssessmentRead(**{
                 "finding_id": a.finding_id,
                 "likely_false_positive": a.likely_false_positive,
                 "confidence": a.confidence,
                 "reasoning": a.reasoning,
-            }
+            })
             for a in result.assessments
         ],
     )

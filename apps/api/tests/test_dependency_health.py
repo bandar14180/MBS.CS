@@ -1,6 +1,6 @@
 """A -- dependency-health metric (mbs_dependency_up).
 
-The API exposes a scrape-time gauge for the liveness of its core backing services (Postgres,
+The API exposes a scrape-time gauge for the liveness of its core backing services (MySQL,
 Redis) via short-timeout SYNCHRONOUS probes. Probes are best-effort: an underlying error is
 reported as down (0) and never raises, so a dependency outage can never break a /metrics scrape.
 """
@@ -16,9 +16,9 @@ def _prom_or_skip():
 
 # --- probes are best-effort (never raise) ---------------------------------------------------
 
-def test_probe_postgres_reports_down_on_error(monkeypatch):
-    monkeypatch.setattr("psycopg2.connect", lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
-    assert obs._probe_postgres() is False   # returns, does not raise
+def test_probe_mysql_reports_down_on_error(monkeypatch):
+    monkeypatch.setattr("pymysql.connect", lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
+    assert obs._probe_mysql() is False   # returns, does not raise
 
 
 def test_probe_redis_reports_down_on_error(monkeypatch):
@@ -33,20 +33,20 @@ def test_probe_redis_reports_down_on_error(monkeypatch):
 
 def test_collector_reports_up_and_down(monkeypatch):
     _prom_or_skip()
-    monkeypatch.setattr(obs, "_probe_postgres", lambda: True)
+    monkeypatch.setattr(obs, "_probe_mysql", lambda: True)
     monkeypatch.setattr(obs, "_probe_redis", lambda: False)
     families = {mf.name: mf for mf in obs.DependencyHealthCollector().collect()}
     assert "mbs_dependency_up" in families
     vals = {s.labels["component"]: s.value for s in families["mbs_dependency_up"].samples}
-    assert vals == {"postgres": 1.0, "redis": 0.0}
+    assert vals == {"mysql": 1.0, "redis": 0.0}
 
 
 def test_collector_reports_all_up(monkeypatch):
     _prom_or_skip()
-    monkeypatch.setattr(obs, "_probe_postgres", lambda: True)
+    monkeypatch.setattr(obs, "_probe_mysql", lambda: True)
     monkeypatch.setattr(obs, "_probe_redis", lambda: True)
     fam = {mf.name: mf for mf in obs.DependencyHealthCollector().collect()}["mbs_dependency_up"]
-    assert {s.labels["component"]: s.value for s in fam.samples} == {"postgres": 1.0, "redis": 1.0}
+    assert {s.labels["component"]: s.value for s in fam.samples} == {"mysql": 1.0, "redis": 1.0}
 
 
 # --- registration is API-side + idempotent --------------------------------------------------

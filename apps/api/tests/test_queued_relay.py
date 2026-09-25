@@ -5,6 +5,7 @@ recoverable; and the relay never touches running/terminal or freshly-queued scan
 """
 import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -16,6 +17,7 @@ from apps.api.modules.scans.models import Scan
 from apps.api.modules.users.models import User
 from apps.api.modules.workspaces.models import Workspace
 from apps.api.scanner_engine.orchestrator import _claim_scan
+from apps.api.core import tenancy
 
 RELAY_OLD = 600  # seconds; older than the default 300s relay threshold
 
@@ -25,11 +27,38 @@ class _FakeResult:
         self.id = f"task-{uuid.uuid4()}"
 
 
+def _enable_celery_dispatch(monkeypatch):
+    """This whole suite tests the CELERY relay, which only runs where Celery is the
+    dispatcher.
+
+    The relay now declines outright when `celery_scan_dispatch_enabled` is False (the
+    deployed default, since nothing consumes `scans.public` under the lease model) --
+    relaying there would enqueue onto an unconsumed queue and stamp a task id that
+    disqualifies the scan from any future relay. So these tests opt into the Celery model
+    explicitly: they are exercising that path, not the deployed default.
+    """
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "celery_scan_dispatch_enabled", True, raising=False)
+
+
 def _patch_delay(monkeypatch):
     from apps.api.celery_app.tasks import scan_tasks
 
+    _enable_celery_dispatch(monkeypatch)
     calls: list[str] = []
     monkeypatch.setattr(scan_tasks.run_scan_task, "delay", lambda sid: (calls.append(sid), _FakeResult())[1])
+
+    # MBS.SC: the relay now dispatches with apply_async(args=[...], queue=...) so a stranded
+    # PRIVATE scan is re-delivered to its OWN per-site queue instead of the public one.
+    # Record from `args` so the existing assertions (which check WHICH scan was dispatched)
+    # keep working unchanged.
+    def _fake_apply_async(args=None, kwargs=None, **opts):
+        if args:
+            calls.append(args[0])
+        return _FakeResult()
+
+    monkeypatch.setattr(scan_tasks.run_scan_task, "apply_async", _fake_apply_async)
     return calls
 
 
@@ -48,6 +77,10 @@ async def _seed_scan(status="queued", *, task_id=None, age_seconds=0) -> uuid.UU
             ws = Workspace(name="relay-ws", owner_user_id=user.id)
             s.add(ws)
             await s.flush()
+            # Bind the just-created workspace before inserting into it -- same step production
+            # takes in workspaces.service.create_workspace, required by the INSERT guard in
+            # core/tenancy.py (an ORM flush INSERT bypasses the SELECT/UPDATE/DELETE filter).
+            tenancy.bind_workspace(ws.id)
             project = Project(workspace_id=ws.id, name="relay-proj", created_by=user.id)
             s.add(project)
             await s.flush()
@@ -59,8 +92,12 @@ async def _seed_scan(status="queued", *, task_id=None, age_seconds=0) -> uuid.UU
             s.add(scan)
             await s.flush()
             if age_seconds:
-                await s.execute(text("UPDATE scans SET created_at = now() - make_interval(secs => :a), queued_at = now() - make_interval(secs => :a) WHERE id = :i"),
-                                {"a": age_seconds, "i": scan.id})
+                # Phase 0 MySQL cutover: make_interval() has no MySQL equivalent; the cutoff is
+                # computed in Python instead (same fix as the production relay query in
+                # apps.api.celery_app.tasks.scan_tasks._relay_queued).
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+                await s.execute(text("UPDATE scans SET created_at = :c, queued_at = :c WHERE id = :i"),
+                                {"c": cutoff, "i": scan.id})
             await s.commit()
             return scan.id
     finally:
@@ -118,6 +155,10 @@ async def _seed_scan_inline(session, status):
     ws = Workspace(name="relay2-ws", owner_user_id=user.id)
     session.add(ws)
     await session.flush()
+    # Bind the just-created workspace before inserting into it -- same step production
+    # takes in workspaces.service.create_workspace, required by the INSERT guard in
+    # core/tenancy.py (an ORM flush INSERT bypasses the SELECT/UPDATE/DELETE filter).
+    tenancy.bind_workspace(ws.id)
     project = Project(workspace_id=ws.id, name="relay2-proj", created_by=user.id)
     session.add(project)
     await session.flush()
@@ -136,12 +177,20 @@ async def _seed_scan_inline(session, status):
 def test_relay_dispatch_failure_leaves_scan_recoverable(monkeypatch):
     from apps.api.celery_app.tasks import scan_tasks
 
+    # Patches apply_async directly rather than via _patch_delay, so opt into the Celery
+    # dispatch model explicitly -- otherwise the relay declines before reaching the broker
+    # and this would assert "nothing dispatched" for the wrong reason.
+    _enable_celery_dispatch(monkeypatch)
     scan_id = asyncio.run(_seed_scan("queued", task_id=None, age_seconds=RELAY_OLD))
 
     def _boom(_sid):
         raise RuntimeError("broker down")
 
     monkeypatch.setattr(scan_tasks.run_scan_task, "delay", _boom)
+    # The relay calls apply_async (MBS.SC routing); make it fail the same way so the
+    # "dispatch failed -> scan stays recoverable" path is what is actually exercised.
+    monkeypatch.setattr(scan_tasks.run_scan_task, "apply_async",
+                        lambda *a, **k: _boom("x"))
     relayed = asyncio.run(scan_tasks._relay_queued())
     assert relayed == 0                                              # nothing dispatched
     assert asyncio.run(_scan_field(scan_id, "status")) == "queued"   # untouched

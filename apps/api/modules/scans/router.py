@@ -8,7 +8,8 @@ from apps.api.modules.attack import service as attack_service
 from apps.api.modules.attack.schemas import AttackGraphRead, KillChainRead, TacticMatrixRead
 from apps.api.modules.scans import service
 from apps.api.modules.scans.schemas import (
-    AgentDecisionTraceRead, AIPlanRead, EvidenceRead, ScanCreate, ScanRead, ScanTimelineEvent, ToolRunRead,
+    AgentDecisionTraceRead, AIPlanRead, EvidenceRead, ScanCoverageRead, ScanCreate, ScanRead,
+    ScanNextStepsRead, ScanTimelineEvent, ToolRunRead,
 )
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/projects/{project_id}/scans", tags=["scans"])
@@ -24,6 +25,37 @@ async def get_scan_capabilities(current_user: CurrentUserDep) -> dict:
     from apps.api.scanner_engine.capabilities import capability_map
 
     return capability_map()
+
+
+@capabilities_router.get("/pipeline")
+async def get_tool_pipeline(current_user: CurrentUserDep) -> list[dict]:
+    """Every registered scanner tool, in execution (phase) order, with the metadata
+    the UI needs: capability/category, whether it needs an active-testing scope,
+    which target types it applies to, whether it can produce a vulnerability (vs
+    assets only), and whether its binary is installed.
+
+    The scan form, the schedule form and the progress widget all build their tool
+    lists from this, so a tool registered in TOOL_REGISTRY can never again be
+    invisible in the UI (amass/dnsx/whatweb/ffuf previously were).
+
+    `binary_available` is the SCAN WORKER's answer, published by it at startup and
+    read back here -- never this API process's own PATH, which has none of the
+    scanner binaries (they are installed only by Dockerfile.worker). It is null
+    when no worker has reported yet: unknown, not missing."""
+    from apps.api.scanner_engine.capabilities import tool_pipeline
+
+    return tool_pipeline()
+
+
+@capabilities_router.get("/tool-registry")
+async def get_tool_capability_registry(current_user: CurrentUserDep) -> dict:
+    """The Capability Registry tree: category (discovery/web/network) ->
+    capability -> the tool name(s) currently implementing it. Read-only
+    introspection of what scanner_engine.capability_registry resolves the AI
+    Planner/RedTeamAgent's capability choices against."""
+    from apps.api.scanner_engine.capability_registry import category_tree
+
+    return category_tree()
 
 
 @router.post(
@@ -45,6 +77,7 @@ async def create_scan(project_id: uuid.UUID, payload: ScanCreate, db: DbDep, ctx
         payload.use_agent,
         payload.exploitation_enabled,
         payload.approved_hosts,
+        payload.tool_config,
     )
     return ScanRead.model_validate(scan)
 
@@ -153,7 +186,7 @@ async def get_attack_graph(
     """The scan's evidence-driven attack graph (M4.4.5): the ACTUAL persisted
     EngagementState.attack_graph -- read-only, never recomputed or writable here. A
     non-agent scan returns an empty graph (has_engagement=False), not a 404. Scope +
-    workspace isolation via get_scan (404s out-of-scope) + RLS on engagement_state."""
+    workspace isolation via get_scan (404s out-of-scope) + tenancy.py on engagement_state."""
     from apps.api.modules.agent.service import get_engagement
 
     await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope
@@ -170,6 +203,40 @@ async def get_attack_graph(
 
 
 @router.get(
+    "/{scan_id}/coverage",
+    response_model=ScanCoverageRead,
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_scan_coverage(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> ScanCoverageRead:
+    """Engagement-wide coverage projection (Prompt 14): which discovered surface still has
+    unfulfilled testing opportunities (coverage debt). Read-only; derived deterministically
+    from persisted assets + tool_runs. RBAC (scan:read) + workspace isolation via get_scan
+    (404 out-of-scope) + tenancy.py on the source tables. Makes 'no finding != no
+    vulnerability' visible instead of implicit."""
+    coverage = await service.get_scan_coverage(db, ctx.workspace_id, project_id, scan_id)
+    return ScanCoverageRead(**coverage)
+
+
+@router.get(
+    "/{scan_id}/next-steps",
+    response_model=ScanNextStepsRead,
+    dependencies=[Depends(require_permission("scan:read"))],
+)
+async def get_scan_next_steps(
+    project_id: uuid.UUID, scan_id: uuid.UUID, db: DbDep, ctx: WorkspaceContextDep
+) -> ScanNextStepsRead:
+    """Adaptive Detection Engine next-step candidates (Prompt 21): the detection/investigation
+    steps the accumulated evidence deterministically justifies next. Read-only; each entry is a
+    CANDIDATE/signal (never a finding), carrying a machine-checkable reason trace + provenance.
+    Gated by the same verified scope + RoE the orchestrator enforces; RBAC (scan:read) +
+    workspace isolation via get_scan (404 out-of-scope) + tenancy.py on the source tables."""
+    next_steps = await service.get_scan_next_steps(db, ctx.workspace_id, project_id, scan_id)
+    return ScanNextStepsRead(**next_steps)
+
+
+@router.get(
     "/{scan_id}/timeline",
     response_model=list[ScanTimelineEvent],
     dependencies=[Depends(require_permission("scan:read"))],
@@ -180,7 +247,7 @@ async def get_scan_timeline(
 ) -> list[ScanTimelineEvent]:
     """Chronological scan events (Phase 1.3): scan started, tool executed, finding
     generated, agent decision, scan completed. Read-only; RBAC (scan:read) + workspace
-    isolation via get_scan (404 out-of-scope) + FORCE-RLS on the source tables. Paginated
+    isolation via get_scan (404 out-of-scope) + tenancy.py's filter on the source tables. Paginated
     (X-Total-Count/X-Limit/X-Offset/X-Has-More headers)."""
     events, total = await service.get_scan_timeline(db, ctx.workspace_id, project_id, scan_id, page)
     set_page_headers(response, total=total, page=page)
@@ -199,7 +266,7 @@ async def get_agent_decisions(
     """Structured agent-decision trace (Phase 1.3): decision type/action, selected tool,
     reasoning summary, timestamp -- ordered by step_no. Prompts are never stored, and
     raw evidence/candidate blobs are not surfaced (no sensitive prompt leakage). RBAC
-    (scan:read) + get_scan ownership (404 out-of-scope) + FORCE-RLS on agent_decisions."""
+    (scan:read) + get_scan ownership (404 out-of-scope) + tenancy.py on agent_decisions."""
     from apps.api.modules.agent.service import list_agent_decisions
 
     await service.get_scan(db, ctx.workspace_id, project_id, scan_id)  # 404s if not in scope

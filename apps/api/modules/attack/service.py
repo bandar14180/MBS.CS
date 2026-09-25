@@ -1,7 +1,7 @@
 import uuid
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.attack.catalog import (
@@ -22,8 +22,15 @@ async def sync_attack_mappings(
     do-nothing-on-conflict, so re-detection doesn't duplicate rows. Mirrors
     compliance.service.sync_mappings. Uses the finding's CWE `category` plus any
     Nuclei `tags` in its metadata."""
-    tags = (metadata or {}).get("tags")
-    techniques = techniques_for(category, tags)
+    md = metadata or {}
+    tags = md.get("tags")
+    # Pass identifying metadata so techniques_for can skip DETECTIONS (P1.6): a technology/WAF/
+    # version detection must not inherit ATT&CK techniques via a generic CWE. Genuine
+    # vulnerabilities are unaffected -- see attack/catalog.techniques_for. cvss_score isn't in
+    # this metadata; None is correct (the classifier then leans on template_id/cve/tags).
+    techniques = techniques_for(
+        category, tags, template_id=md.get("template_id"), cve=md.get("cve")
+    )
     if not techniques:
         return
     rows = [
@@ -37,8 +44,10 @@ async def sync_attack_mappings(
         }
         for tactic_id, technique_id, technique_name, phase in techniques
     ]
-    stmt = pg_insert(AttackMapping.__table__).values(rows)
-    stmt = stmt.on_conflict_do_nothing(constraint="uq_attack_vuln_technique")
+    stmt = mysql_insert(AttackMapping.__table__).values(rows)
+    # Phase 0 MySQL cutover: MySQL do-nothing-on-conflict idiom -- see
+    # compliance/service.py's sync_mappings for the fuller explanation.
+    stmt = stmt.on_duplicate_key_update(id=stmt.inserted.id)
     await db.execute(stmt)
 
 
@@ -62,7 +71,9 @@ async def save_attack_narrative(
     prompt_version: str | None,
 ) -> None:
     """Upsert the one attack-path narrative for a scan (re-runs overwrite it)."""
-    stmt = pg_insert(AttackNarrative.__table__).values(
+    # Phase 0 MySQL cutover: Postgres's `excluded` (the row that would have been
+    # inserted) -> MySQL's `.inserted` / VALUES(col), same concept under a different name.
+    stmt = mysql_insert(AttackNarrative.__table__).values(
         id=uuid.uuid4(),
         workspace_id=workspace_id,
         scan_id=scan_id,
@@ -71,14 +82,11 @@ async def save_attack_narrative(
         model_version=model_version,
         prompt_version=prompt_version,
     )
-    stmt = stmt.on_conflict_do_update(
-        constraint="uq_attack_narrative_scan",
-        set_={
-            "summary": stmt.excluded.summary,
-            "steps": stmt.excluded.steps,
-            "model_version": stmt.excluded.model_version,
-            "prompt_version": stmt.excluded.prompt_version,
-        },
+    stmt = stmt.on_duplicate_key_update(
+        summary=stmt.inserted.summary,
+        steps=stmt.inserted.steps,
+        model_version=stmt.inserted.model_version,
+        prompt_version=stmt.inserted.prompt_version,
     )
     await db.execute(stmt)
 
@@ -99,6 +107,16 @@ async def _scan_mappings(db: AsyncSession, scan_id: uuid.UUID) -> list[AttackMap
             .where(Vulnerability.last_seen_scan_id == scan_id)
         )
     )
+
+
+async def _scan_vulns_by_id(db: AsyncSession, scan_id: uuid.UUID) -> dict[uuid.UUID, Vulnerability]:
+    """The scan's findings, indexed by id, so a mapping can be resolved back to the finding
+    that produced it -- which is what makes canonical issue identity and the scorable filter
+    available to the API surfaces (see attack.aggregation)."""
+    return {
+        v.id: v
+        for v in await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan_id))
+    }
 
 
 def kill_chain_steps(title_by_vuln_id: dict[uuid.UUID, str], mappings: list[AttackMapping]) -> list[dict]:
@@ -135,31 +153,54 @@ def kill_chain_steps(title_by_vuln_id: dict[uuid.UUID, str], mappings: list[Atta
 async def scan_kill_chain_steps(db: AsyncSession, scan_id: uuid.UUID) -> list[dict]:
     """Deterministic kill-chain steps for a scan's findings so far (pure ATT&CK
     mapping, no AI). Shared by the live agent state-projection (mid-scan reasoning)
-    and the kill-chain endpoint's fallback, so the two never diverge."""
+    and the kill-chain endpoint's fallback, so the two never diverge.
+
+    Restricted to the SCORABLE findings (attack.aggregation) so the kill chain describes
+    the same population as the ATT&CK matrix and the PDF: a remediated or false-positive
+    finding is no longer presented as evidence of a live attack path, and a technology
+    DETECTION no longer contributes a step. Mappings whose finding is excluded are dropped
+    before the fold, so an excluded finding cannot leave an empty technique behind."""
+    from apps.api.modules.attack.aggregation import scorable_vuln_ids
+
     mappings = await _scan_mappings(db, scan_id)
-    vulns = list(await db.scalars(select(Vulnerability).where(Vulnerability.last_seen_scan_id == scan_id)))
-    return kill_chain_steps({v.id: v.title for v in vulns}, mappings)
+    vulns_by_id = await _scan_vulns_by_id(db, scan_id)
+    countable = scorable_vuln_ids(mappings, vulns_by_id)
+    scorable_mappings = [m for m in mappings if m.vulnerability_id in countable]
+    titles = {vid: v.title for vid, v in vulns_by_id.items() if vid in countable}
+    return kill_chain_steps(titles, scorable_mappings)
 
 
 async def attack_matrix_for_scan(db: AsyncSession, scan_id: uuid.UUID) -> list[dict]:
-    """ATT&CK-navigator-style view: tactics -> techniques with a hit count (how
-    many of the scan's findings map to each technique)."""
+    """ATT&CK-navigator-style view: tactics -> techniques with a hit count.
+
+    `count` is the number of DISTINCT LOGICAL ISSUES hitting the technique -- the SAME
+    number the PDF report shows, because both now go through attack.aggregation (see that
+    module for why the two used to disagree). It previously counted raw `attack_mappings`
+    ROWS over every finding regardless of status, so one issue observed at five URLs read as
+    five, and fixed / false-positive / informational / detection findings all contributed to
+    what the UI presents as current coverage.
+    """
+    from apps.api.modules.attack.aggregation import count_issues_by_technique
+
     mappings = await _scan_mappings(db, scan_id)
+    vulns_by_id = await _scan_vulns_by_id(db, scan_id)
+    counts = count_issues_by_technique(mappings, vulns_by_id)
+
+    # kill_chain_phase is a property of the technique, not of the count, so it is carried
+    # over from the mapping rows.
+    phase_by_technique = {m.technique_id: m.kill_chain_phase for m in mappings}
+
     tactics: dict[str, dict] = {}
-    for m in mappings:
+    for (tactic_id, tactic_name, technique_id, technique_name), count in counts.items():
         tactic = tactics.setdefault(
-            m.tactic_id, {"tactic_id": m.tactic_id, "tactic_name": m.tactic_name, "techniques": {}}
+            tactic_id, {"tactic_id": tactic_id, "tactic_name": tactic_name, "techniques": {}}
         )
-        tech = tactic["techniques"].setdefault(
-            m.technique_id,
-            {
-                "technique_id": m.technique_id,
-                "technique_name": m.technique_name,
-                "kill_chain_phase": m.kill_chain_phase,
-                "count": 0,
-            },
-        )
-        tech["count"] += 1
+        tactic["techniques"][technique_id] = {
+            "technique_id": technique_id,
+            "technique_name": technique_name,
+            "kill_chain_phase": phase_by_technique.get(technique_id),
+            "count": count,
+        }
     return [
         {"tactic_id": t["tactic_id"], "tactic_name": t["tactic_name"], "techniques": list(t["techniques"].values())}
         for t in tactics.values()

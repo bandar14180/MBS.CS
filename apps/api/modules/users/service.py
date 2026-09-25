@@ -22,6 +22,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core import tenancy
 from apps.api.core.security import hash_password, verify_password
 from apps.api.modules.api_keys.models import ApiKey
 from apps.api.modules.audit.models import AuditEvent
@@ -59,15 +60,20 @@ async def export_user_data(db: AsyncSession, user: User) -> DataExportResponse:
             select(ApiKey).where(ApiKey.created_by == user.id).order_by(ApiKey.created_at.desc())
         )
     )
-    membership_rows = (
-        await db.execute(
-            select(WorkspaceMember, Role, Workspace)
-            .join(Role, Role.id == WorkspaceMember.role_id)
-            .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
-            .where(WorkspaceMember.user_id == user.id)
-            .order_by(WorkspaceMember.invited_at)
-        )
-    ).all()
+    # Legitimately cross-workspace: this is exactly the query that discovers which
+    # workspaces the user belongs to, so no single workspace can be bound yet. Scoped to
+    # this user's own memberships by the user_id filter below -- no other user's or
+    # workspace's data is reachable through it.
+    with tenancy.admin_bypass():
+        membership_rows = (
+            await db.execute(
+                select(WorkspaceMember, Role, Workspace)
+                .join(Role, Role.id == WorkspaceMember.role_id)
+                .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
+                .where(WorkspaceMember.user_id == user.id)
+                .order_by(WorkspaceMember.invited_at)
+            )
+        ).all()
 
     memberships = [
         ExportedMembership(
@@ -92,7 +98,7 @@ async def export_user_data(db: AsyncSession, user: User) -> DataExportResponse:
 
     workspace_ids = [m.workspace_id for m in memberships]
     scans = await _export_scans(db, user.id)
-    reports, audit_events = await _export_rls_scoped(db, user.id, workspace_ids)
+    reports, audit_events = await _export_workspace_scoped(db, user.id, workspace_ids)
 
     response = DataExportResponse(
         generated_at=datetime.now(timezone.utc),
@@ -130,9 +136,10 @@ async def export_user_data(db: AsyncSession, user: User) -> DataExportResponse:
 
 
 async def _export_scans(db: AsyncSession, user_id: uuid.UUID) -> list[ExportedScan]:
-    """Scans the user initiated. `scans` is RLS-EXEMPT by design (worker bootstrap), so it is
-    filtered explicitly by initiated_by -- returning ONLY this user's scans, never a whole
-    workspace. Metadata only; scan config/evidence/tool output are never included."""
+    """Scans the user initiated. `scans` is in tenancy.EXEMPT_TABLES by design (worker
+    bootstrap), so it is filtered explicitly by initiated_by -- returning ONLY this user's
+    scans, never a whole workspace. Metadata only; scan config/evidence/tool output are
+    never included."""
     rows = await db.scalars(
         select(Scan)
         .where(Scan.initiated_by == user_id)
@@ -153,82 +160,105 @@ async def _export_scans(db: AsyncSession, user_id: uuid.UUID) -> list[ExportedSc
     ]
 
 
-async def _export_rls_scoped(
+async def _export_workspace_scoped(
     db: AsyncSession, user_id: uuid.UUID, workspace_ids: list[uuid.UUID]
 ) -> tuple[list[ExportedReport], list[ExportedAuditEvent]]:
-    """Reports the user generated + audit events where the user was the actor. Both tables are
-    FORCE-RLS, so we set the workspace GUC per membership before querying (a query without the GUC
-    would be RLS-filtered to zero under a non-superuser production role). Scoping to the user's own
-    memberships + filtering by generated_by/actor_user_id preserves tenant isolation -- another
-    tenant's data can never appear. Reports exclude storage_uri; audit events exclude free-text."""
+    """Reports the user generated + audit events where the user was the actor.
+
+    AUDIT-007: both tables are workspace-scoped by the APPLICATION-LAYER tenancy filter in
+    apps/api/core/tenancy.py -- not by PostgreSQL RLS, and there is no GUC. (This function was
+    named `_export_rls_scoped` and documented in terms of `set_config`/FORCE RLS, both of which
+    stopped existing at the MySQL cutover.) The loop binds each of the user's own workspaces in
+    turn so the auto-filter scopes each query to that tenant; combined with the explicit
+    generated_by / actor_user_id predicates, another tenant's data can never appear.
+
+    AUDIT-004: bound with `workspace_scope`, not a bare `bind_workspace`. The bare form left the
+    LAST workspace in the list bound to the caller's Task after this function returned, so the
+    caller's later queries silently inherited a tenancy context it never established.
+
+    Reports exclude storage_uri; audit events exclude free-text detail."""
     reports: list[ExportedReport] = []
     audit_events: list[ExportedAuditEvent] = []
     for ws_id in workspace_ids:
-        await db.execute(
-            text("SELECT set_config('app.current_workspace_id', :wid, true)"),
-            {"wid": str(ws_id)},
-        )
-        rrows = await db.scalars(
-            select(Report)
-            .where(Report.generated_by == user_id)
-            .order_by(Report.generated_at.desc())
-            .limit(EXPORT_ROW_LIMIT)
-        )
-        for r in rrows:
-            reports.append(
-                ExportedReport(
-                    id=r.id,
-                    project_id=r.project_id,
-                    type=r.type,
-                    format=r.format,
-                    scan_ids=[str(sid) for sid in (r.scan_ids or [])],
-                    generated_at=r.generated_at,
-                )
+        with tenancy.workspace_scope(ws_id):
+            rrows = await db.scalars(
+                select(Report)
+                .where(Report.generated_by == user_id)
+                .order_by(Report.generated_at.desc())
+                .limit(EXPORT_ROW_LIMIT)
             )
-        arows = await db.scalars(
-            select(AuditEvent)
-            .where(AuditEvent.actor_user_id == user_id)
-            .order_by(AuditEvent.created_at.desc())
-            .limit(EXPORT_ROW_LIMIT)
-        )
-        for a in arows:
-            audit_events.append(
-                ExportedAuditEvent(
-                    id=a.id,
-                    workspace_id=a.workspace_id,
-                    action=a.action,
-                    resource_type=a.resource_type,
-                    resource_id=a.resource_id,
-                    created_at=a.created_at,
+            for r in rrows:
+                reports.append(
+                    ExportedReport(
+                        id=r.id,
+                        project_id=r.project_id,
+                        type=r.type,
+                        format=r.format,
+                        scan_ids=[str(sid) for sid in (r.scan_ids or [])],
+                        generated_at=r.generated_at,
+                    )
                 )
+            arows = await db.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.actor_user_id == user_id)
+                .order_by(AuditEvent.created_at.desc())
+                .limit(EXPORT_ROW_LIMIT)
             )
+            for a in arows:
+                audit_events.append(
+                    ExportedAuditEvent(
+                        id=a.id,
+                        workspace_id=a.workspace_id,
+                        action=a.action,
+                        resource_type=a.resource_type,
+                        resource_id=a.resource_id,
+                        created_at=a.created_at,
+                    )
+                )
     return reports, audit_events
 
 
-async def _anonymize_audit_actor(db: AsyncSession, user_id: uuid.UUID) -> None:
-    """Scrub the denormalized actor_email from this user's audit events. audit_events is
-    FORCE-RLS on workspace_id, so we set the workspace GUC per membership before each
-    UPDATE (a global UPDATE would be an RLS-filtered silent no-op under a non-superuser
-    production role -- the same footgun retention/repo.py guards against). actor_user_id
-    is deliberately left intact so the audit trail stays attributable to the (now
-    anonymized) user record."""
-    workspace_ids = list(
-        await db.scalars(
-            select(WorkspaceMember.workspace_id).where(WorkspaceMember.user_id == user_id)
-        )
+async def _anonymize_audit_actor(db: AsyncSession, user_id: uuid.UUID) -> int:
+    """Scrub the denormalized actor_email from this user's audit events, everywhere.
+
+    AUDIT-007 -- what actually scopes this. Under PostgreSQL, `audit_events` was FORCE RLS on
+    workspace_id and a bare UPDATE would have been silently filtered to zero rows for a
+    non-superuser role, so the original code set the workspace GUC once per membership and
+    re-issued the UPDATE inside that loop. After the MySQL cutover there is no RLS and no GUC:
+    tenancy is enforced in the application layer (apps/api/core/tenancy.py), which hooks the
+    ORM. This statement is RAW SQL, so the ORM filter never sees it -- binding a workspace
+    around it changed nothing about which rows it touched.
+
+    AUDIT-008 -- the loop was therefore pure redundancy. The statement carries NO workspace
+    predicate, so each iteration re-executed the identical global UPDATE; the first pass
+    already anonymized every matching row and iterations 2..N matched nothing (the
+    `actor_email IS NOT NULL` guard made them no-ops) while still paying a full round trip.
+    A user in 50 workspaces meant 50 identical UPDATEs.
+
+    Executing it ONCE, outside any workspace binding, is both correct and what GDPR erasure
+    requires: erasure must be complete, so it deliberately spans every workspace the actor
+    appears in -- including any where the membership row was already removed, which the old
+    per-membership loop would have MISSED. It is registered in the raw-SQL inventory as a
+    deliberate cross-tenant statement.
+
+    Rows are matched by `actor_user_id`, so no other user's events can be touched.
+    `actor_user_id` itself is deliberately left intact, keeping the audit trail attributable
+    to the (now anonymized) user record.
+
+    Returns the number of rows anonymized.
+    """
+    # Deliberately cross-tenant: GDPR erasure must reach this actor's events in EVERY
+    # workspace. admin_bypass() is not needed -- raw SQL is not intercepted by the ORM
+    # tenancy filter at all -- but no workspace is bound either, so nothing here can be
+    # mistaken for a tenant-scoped operation.
+    result = await db.execute(
+        text(
+            "UPDATE audit_events SET actor_email = :anon "
+            "WHERE actor_user_id = :uid AND actor_email IS NOT NULL"
+        ),
+        {"anon": ANONYMIZED_ACTOR_EMAIL, "uid": str(user_id)},
     )
-    for ws_id in workspace_ids:
-        await db.execute(
-            text("SELECT set_config('app.current_workspace_id', :wid, true)"),
-            {"wid": str(ws_id)},
-        )
-        await db.execute(
-            text(
-                "UPDATE audit_events SET actor_email = :anon "
-                "WHERE actor_user_id = :uid AND actor_email IS NOT NULL"
-            ),
-            {"anon": ANONYMIZED_ACTOR_EMAIL, "uid": str(user_id)},
-        )
+    return result.rowcount or 0
 
 
 async def erase_user(db: AsyncSession, user: User, password: str) -> None:
@@ -240,9 +270,10 @@ async def erase_user(db: AsyncSession, user: User, password: str) -> None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect password")
 
     uid = user.id
-    # 1) Anonymize the denormalized PII in the audit trail (per-workspace, RLS-scoped).
+    # 1) Anonymize the denormalized PII in the audit trail. ONE global UPDATE matched on
+    #    actor_user_id -- GDPR erasure must span every workspace (AUDIT-008).
     await _anonymize_audit_actor(db, uid)
-    # 2) Destroy credentials outright (user-scoped, non-RLS tables).
+    # 2) Destroy credentials outright (user-scoped tables, not workspace-scoped at all).
     await db.execute(delete(RefreshToken).where(RefreshToken.user_id == uid))
     await db.execute(delete(MfaRecoveryCode).where(MfaRecoveryCode.user_id == uid))
     # 3) Revoke every API key the user created (kept for audit, but rendered unusable).

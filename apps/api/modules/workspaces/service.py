@@ -2,8 +2,10 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from apps.api.core import tenancy
 
 from apps.api.modules.users.models import Role, User, WorkspaceMember
 from apps.api.modules.workspaces.models import Workspace
@@ -24,11 +26,14 @@ async def create_workspace(db: AsyncSession, owner: User, name: str) -> Workspac
     await db.flush()
 
     # No {workspace_id} path param exists yet at this point (the workspace was
-    # just created), so get_workspace_context never ran to set this. Bootstrap
-    # it manually so the FORCE RLS policy on workspace_members allows this insert.
-    await db.execute(
-        text("SELECT set_config('app.current_workspace_id', :wid, true)"), {"wid": str(workspace.id)}
-    )
+    # just created), so get_workspace_context never ran to bind this. Phase 0 MySQL
+    # cutover: bind it manually (tenancy.py) so the membership insert below is scoped.
+    # AUDIT-004 classification: INTENTIONALLY PERSISTENT. create_workspace() runs inside a
+    # request whose {workspace_id} path param does not exist yet, so nothing bound this
+    # Task. The binding must persist for the rest of the request handler (the membership
+    # INSERT below and anything the caller does afterwards with the new workspace), and it
+    # is confined to the request's own Task/Context exactly as in core/deps.py.
+    tenancy.bind_workspace(workspace.id)
 
     db.add(
         WorkspaceMember(
@@ -101,6 +106,16 @@ async def invite_member(db: AsyncSession, workspace_id: uuid.UUID, email: str, r
     )
     db.add(member)
     await db.commit()
+    # `invited_at` is server-defaulted only (no client-side `default=` -- see
+    # WorkspaceMember in apps/api/modules/users/models.py) and `member` was just
+    # constructed in Python, so it never had a value for that column to begin with.
+    # Postgres/asyncpg populated it for free via an implicit INSERT ... RETURNING, which is
+    # why this worked silently pre-cutover; MySQL has no RETURNING, so without this refresh
+    # the attribute is unloaded and reading it below triggers an implicit lazy SELECT that
+    # async SQLAlchemy can't run outside an explicit await -- MissingGreenlet, a 500 on
+    # every invite. Found by running this endpoint against real MySQL (not MariaDB, which
+    # does support RETURNING and never exposed the gap).
+    await db.refresh(member)
 
     return {
         "id": member.id,

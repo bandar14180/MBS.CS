@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.projects.models import Project, Target
 from apps.api.modules.scans.models import Scan
@@ -35,6 +36,10 @@ async def _seed_scan(session, status, started_at):
     ws = Workspace(name="reap-ws", owner_user_id=user.id)
     session.add(ws)
     await session.flush()
+    # Bind the just-created workspace before inserting into it -- same step production
+    # takes in workspaces.service.create_workspace, required by the INSERT guard in
+    # core/tenancy.py (an ORM flush INSERT bypasses the SELECT/UPDATE/DELETE filter).
+    tenancy.bind_workspace(ws.id)
     project = Project(workspace_id=ws.id, name="reap-proj", created_by=user.id)
     session.add(project)
     await session.flush()
@@ -219,8 +224,12 @@ def test_reaper_is_tenant_selective():
                 await reap_orphaned_scans(s, TIMEOUT)
                 a = await _status(s, a_id)
                 b = await _status(s, b_id)
-                # tenant B's project/target rows are untouched by the reaper.
+                # tenant B's project/target rows are untouched by the reaper. `projects` is
+                # workspace-scoped under apps.api.core.tenancy (Phase 0 MySQL cutover), so
+                # this check -- run on behalf of tenant B, after tenant A's scan was already
+                # reaped -- must bind tenant B's workspace before querying it.
                 b_proj = await s.scalar(select(Scan.project_id).where(Scan.id == b_id))
+                tenancy.bind_workspace(ws_b)
                 proj_ok = await s.scalar(select(Project.id).where(Project.id == b_proj))
             return ws_a, ws_b, a, b, proj_ok
         finally:

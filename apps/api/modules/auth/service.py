@@ -18,6 +18,7 @@ from apps.api.core.security import (
     verify_password,
 )
 from apps.api.modules.auth import mfa_guard
+from apps.api.modules.auth.mfa_guard import security_event
 from apps.api.modules.auth.models import MfaRecoveryCode, RefreshToken
 from apps.api.modules.auth.schemas import (
     LoginResponse,
@@ -26,6 +27,11 @@ from apps.api.modules.auth.schemas import (
     TokenResponse,
 )
 from apps.api.modules.users.models import User
+
+# Upper bound on how far _revoke_token_family walks the replaced_by_id chain. A family only
+# grows by one link per successful rotation, so this is generous for any real session while
+# still guaranteeing termination if the chain is ever corrupt or cyclic.
+_MAX_FAMILY_HOPS = 100
 
 
 async def register_user(db: AsyncSession, email: str, password: str, full_name: str) -> User:
@@ -65,12 +71,62 @@ async def issue_token_pair(db: AsyncSession, user: User) -> TokenResponse:
     return TokenResponse(access_token=create_access_token(user.id), refresh_token=raw_refresh)
 
 
+async def _revoke_token_family(db: AsyncSession, token: RefreshToken, now: datetime) -> int:
+    """Revoke every live token descended from `token`, following the replaced_by_id chain.
+
+    F-04: rotation already recorded `replaced_by_id`, but nothing ever READ it, so a replayed
+    (already-rotated) token was indistinguishable from a garbage one -- both got a flat 401.
+    That is the classic refresh-token-theft blind spot: the thief rotates once, the legitimate
+    client later presents its now-stale copy, and the ONLY signal that a token was cloned is
+    thrown away. The thief's freshly-minted token stays valid indefinitely.
+
+    Walking the chain forward from the replayed token revokes the descendants -- which is
+    exactly the branch the attacker is holding. Bounded by _MAX_FAMILY_HOPS so a corrupt or
+    cyclic chain can never spin here.
+
+    Returns the number of tokens newly revoked (0 when the family was already fully revoked,
+    which makes a repeated replay idempotent rather than an error)."""
+    revoked = 0
+    cursor: RefreshToken | None = token
+    seen: set[uuid.UUID] = set()
+    for _ in range(_MAX_FAMILY_HOPS):
+        if cursor is None or cursor.id in seen:
+            break
+        seen.add(cursor.id)
+        if cursor.revoked_at is None:
+            cursor.revoked_at = now
+            revoked += 1
+        next_id = cursor.replaced_by_id
+        if next_id is None:
+            break
+        cursor = await db.get(RefreshToken, next_id)
+    return revoked
+
+
 async def rotate_refresh_token(db: AsyncSession, raw_token: str) -> TokenResponse:
     token_hash = hash_refresh_token(raw_token)
     existing = await db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
 
     now = datetime.now(timezone.utc)
-    if existing is None or existing.revoked_at is not None or existing.expires_at < now:
+
+    # F-04 REUSE DETECTION. A token that EXISTS but is already revoked is not an ordinary
+    # failure -- it means this exact secret was presented twice, i.e. two parties hold it.
+    # Which party is the attacker is unknowable here, so the safe response is to invalidate
+    # the whole descendant chain and force a fresh login. Deliberately checked BEFORE the
+    # generic 401 below, and the response stays an indistinguishable 401 so a probing client
+    # learns nothing about which tokens exist.
+    if existing is not None and existing.revoked_at is not None:
+        revoked = await _revoke_token_family(db, existing, now)
+        await db.commit()
+        security_event(
+            "auth.refresh_token_reuse_detected",
+            user_id=existing.user_id,
+            token_id=str(existing.id),
+            revoked_descendants=revoked,
+        )
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired refresh token")
+
+    if existing is None or existing.expires_at < now:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired refresh token")
 
     user = await db.get(User, existing.user_id)

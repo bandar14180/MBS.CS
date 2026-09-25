@@ -11,6 +11,7 @@ from apps.api.ai_agent.prompts.planner import (
     PLANNER_SYSTEM,
     PLANNER_USER_TEMPLATE,
 )
+from apps.api.scanner_engine import capability_registry as cap_registry
 from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
 
 
@@ -31,7 +32,12 @@ def _tool_catalog(active_testing_allowed: bool) -> str:
             if runner_cls.applicable_target_types
             else "any"
         )
-        lines.append(f"- {key} (phase {runner_cls.phase}, {kind}, target types: {targets})")
+        capability = runner_cls.capability or "unspecified"
+        category = cap_registry.category_for_capability(runner_cls.capability)
+        lines.append(
+            f"- {key} [category: {category} | capability: {capability}] "
+            f"(phase {runner_cls.phase}, {kind}, target types: {targets})"
+        )
     return "\n".join(lines)
 
 

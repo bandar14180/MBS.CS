@@ -1,6 +1,28 @@
-FROM python:3.12-slim
+# AUDIT-005: base image pinned by IMMUTABLE DIGEST. A tag is a moving pointer the registry
+# can repoint at any time, so a rebuild months later would silently produce a different
+# base than the one that was tested and scanned. Verified real: python:3.12-slim had
+# ALREADY drifted -- the local image and the registry tag resolved to different digests.
+# Tag kept in the comment for readability. To update, run:
+#   docker buildx imagetools inspect <image>:<tag>
+# python:3.12-slim
+FROM python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 
 WORKDIR /srv
+
+# Apply Debian security updates on top of the digest-pinned base.
+#
+# The digest pin above is deliberate (AUDIT-005) and stays: it guarantees a reproducible,
+# scanned base. But a frozen layer also freezes its OS packages, so any CVE published against
+# them after the pin was taken ships forever. Trivy gates on CRITICAL+fixed, and perl-base
+# 5.40.1-6 carried three such CVEs (CVE-2026-13221, CVE-2026-42496, CVE-2026-8376), all fixed
+# in 5.40.1-6+deb13u1 -- so the gate failed on a base package this image never installs
+# directly and does not use at runtime.
+#
+# `upgrade` (not `dist-upgrade`) applies security fixes within the pinned release without
+# pulling in new packages or changing the distro version, which keeps the pin meaningful.
+# Bumping the digest instead would fix today's three CVEs and silently re-accumulate the next
+# ones; this step re-applies current fixes on every build.
+RUN apt-get update     && apt-get upgrade -y --no-install-recommends     && apt-get clean     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -33,15 +55,26 @@ RUN --mount=type=secret,id=extra_ca \
 COPY apps/__init__.py ./apps/__init__.py
 COPY apps/api ./apps/api
 
+COPY infra/docker/api_healthcheck.py /usr/local/bin/api_healthcheck.py
+
 # Run as an unprivileged user (defense in depth for the internet-facing service).
 RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /srv
 USER appuser
 
 EXPOSE 8000
 
-# Liveness probe (no external tooling: uses the stdlib against /health).
+# Liveness probe. Stdlib only (the runtime image ships no curl/wget), no DNS, no external
+# service -- it connects to 127.0.0.1 inside this container.
+#
+# The probe MUST send a Host the app's TrustedHostMiddleware accepts. The previous one-liner
+# called urlopen('http://localhost:8000/health'), i.e. `Host: localhost:8000`, which a
+# production TRUSTED_HOSTS of ["mbs.example.com"] rejects with 400 BEFORE the route runs --
+# so Docker reported a healthy API as `unhealthy`. api_healthcheck.py derives the Host from
+# the SAME TRUSTED_HOSTS value the app is configured with (so the two can never drift) and
+# still traverses the full middleware stack. See that file for the measured evidence and for
+# why /health (liveness) is correct here rather than /ready (readiness).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
+    CMD ["python", "/usr/local/bin/api_healthcheck.py"]
 
 # Production default: no --reload, multiple workers. The dev compose override
 # replaces this with a hot-reloading single-worker command.

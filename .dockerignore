@@ -35,6 +35,12 @@ htmlcov/
 
 # Node (web app deps are installed in its own image layer)
 **/node_modules/
+# Next.js build output. The web image BUILDS this itself in its `builder` stage, so a
+# developer's local `.next` must never ride into the build context: before the multi-stage
+# rework, `COPY apps/web ./` copied it verbatim and the image's BUILD_ID was byte-identical
+# to the host's -- i.e. the "built" app in the image was whatever happened to be on one
+# machine. Excluding it also keeps the context small and the layer cache honest.
+**/.next/
 
 # Docs / planning (not needed at runtime)
 docs/

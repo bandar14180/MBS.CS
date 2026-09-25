@@ -59,12 +59,36 @@ def test_malformed_addresses_blocked():
 # --- explicit on-prem allowlist ---
 
 def test_private_allowlisted_range(monkeypatch):
+    """MBS.SC: the global allowlist is the OUTER BOUNDARY, and a scan policy is the GRANT.
+
+    This test previously asserted that the two global settings ALONE made 10.20.5.5
+    scannable. That was the cross-tenant defect: the settings are process-wide, so one
+    on-prem customer's allowlist authorized every workspace in the deployment. The
+    outer-boundary half of its intent is preserved exactly (an address outside the global
+    allowlist is still refused); what changed is that clearing the boundary is no longer
+    sufficient on its own.
+    """
+    import uuid
+
+    from apps.api.scanner_engine import net_policy
+
     s = get_settings()
     monkeypatch.setattr(s, "scan_allow_private_targets", True)
     monkeypatch.setattr(s, "scan_allowed_cidrs", ["10.20.0.0/16"])
-    assert is_ip_allowed("10.20.5.5") is True
-    assert is_ip_allowed("10.99.0.1") is False    # outside the allowlist
-    assert is_ip_allowed("192.168.1.1") is False  # different private range
+
+    # KEY 1 alone (global config, no scan policy bound) now grants NOTHING.
+    assert is_ip_allowed("10.20.5.5") is False
+
+    # KEY 1 + KEY 2: a scan whose site authorizes the range reaches it.
+    policy = net_policy.build_private_policy(
+        workspace_id=uuid.uuid4(), scan_id=None, site_id=uuid.uuid4(),
+        authorized_cidrs=["10.20.0.0/16"],
+    )
+    with net_policy.bind(policy):
+        assert is_ip_allowed("10.20.5.5") is True
+        # Original assertions: the global boundary still bounds an authorized scan.
+        assert is_ip_allowed("10.99.0.1") is False    # outside the allowlist
+        assert is_ip_allowed("192.168.1.1") is False  # different private range
 
 
 def test_metadata_blocked_even_with_broad_allowlist(monkeypatch):
@@ -75,10 +99,30 @@ def test_metadata_blocked_even_with_broad_allowlist(monkeypatch):
 
 
 def test_metadata_allowed_only_with_explicit_host(monkeypatch):
+    """A metadata endpoint needs an explicit /32 AND the scan's own authorization.
+
+    Same MBS.SC change as test_private_allowlisted_range: the explicit-host requirement
+    is unchanged and still necessary, but it is no longer sufficient by itself. A cloud
+    metadata address is the single most valuable SSRF destination in the stack, so it
+    requires both keys like every other non-public address.
+    """
+    import uuid
+
+    from apps.api.scanner_engine import net_policy
+
     s = get_settings()
     monkeypatch.setattr(s, "scan_allow_private_targets", True)
     monkeypatch.setattr(s, "scan_allowed_cidrs", ["169.254.169.254/32"])
-    assert is_ip_allowed("169.254.169.254") is True
+
+    # Explicit global host entry alone -> still refused (no scan authorization).
+    assert is_ip_allowed("169.254.169.254") is False
+
+    policy = net_policy.build_private_policy(
+        workspace_id=uuid.uuid4(), scan_id=None, site_id=uuid.uuid4(),
+        authorized_cidrs=["169.254.169.254/32"],
+    )
+    with net_policy.bind(policy):
+        assert is_ip_allowed("169.254.169.254") is True
 
 
 def test_allowlist_ignored_when_flag_off(monkeypatch):
@@ -98,6 +142,16 @@ def test_hostname_resolving_private_blocked(monkeypatch):
 def test_hostname_resolving_public_ok(monkeypatch):
     monkeypatch.setattr(net_guard.socket, "getaddrinfo", _fake_dns({"ok.test": ["93.184.216.34"]}))
     assert resolve_and_validate("ok.test") == "93.184.216.34"
+
+
+def test_resolve_and_validate_strips_scheme_before_resolving(monkeypatch):
+    # A `domain` target's stored value can carry a scheme (a user entered "https://ok.test" at
+    # creation; validate_target_value is best-effort and doesn't reject it). Every tool runner
+    # hands its target value straight through here -- getaddrinfo must never be asked to
+    # resolve the literal string "https://ok.test" (always fails, not a real hostname).
+    monkeypatch.setattr(net_guard.socket, "getaddrinfo", _fake_dns({"ok.test": ["93.184.216.34"]}))
+    assert resolve_and_validate("https://ok.test") == "93.184.216.34"
+    assert resolve_and_validate("https://ok.test:8443/some/path") == "93.184.216.34"
 
 
 def test_rebinding_mixed_public_private_blocked(monkeypatch):

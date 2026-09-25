@@ -3,13 +3,13 @@
     {
       "name": "DS_PROMETHEUS",
       "label": "Prometheus",
-      "description": "MBS.CS Prometheus data source",
+      "description": "MBS.PT Prometheus data source",
       "type": "datasource",
       "pluginId": "prometheus",
       "pluginName": "Prometheus"
     }
   ],
-  "title": "MBS.CS - AI Operations",
+  "title": "MBS.PT - AI Operations",
   "description": "AI-2.5: AI spend, throughput, latency (p50/p95), error rate, failover, and budget blocks. Import as an artifact; no Grafana service is bundled.",
   "tags": ["mbs", "ai"],
   "timezone": "utc",

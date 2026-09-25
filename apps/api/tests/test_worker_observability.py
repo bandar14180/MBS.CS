@@ -123,6 +123,26 @@ def test_create_scan_propagates_request_correlation_id(client, monkeypatch):
 
     monkeypatch.setattr(scan_tasks.run_scan_task, "delay", _fake_delay)
 
+    # MBS.SC: create_scan dispatches via apply_async(args=[scan_id],
+    # kwargs={"correlation_id": ...}, queue=...). The correlation id therefore arrives in
+    # `kwargs`, not as a direct keyword -- unwrap it so this test still asserts the real
+    # propagation path rather than an obsolete call shape.
+    def _fake_apply_async(args=None, kwargs=None, **opts):
+        return _fake_delay(args[0] if args else None, **(kwargs or {}))
+
+    monkeypatch.setattr(scan_tasks.run_scan_task, "apply_async", _fake_apply_async)
+
+    # MBS.SC: `celery_scan_dispatch_enabled` defaults to OFF, because the deployed model is
+    # the LEASE model -- the scan ROW is the queue and create_scan deliberately enqueues
+    # nothing (see modules/scans/service.py's dispatch comment). This test is specifically
+    # about the CELERY dispatch path's correlation-id propagation, so it must opt that path
+    # in explicitly, exactly as test_reliability.py and test_queued_relay.py do. Without
+    # this the mock is never called and the assertion below dies on KeyError instead of
+    # testing anything.
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "celery_scan_dispatch_enabled", True, raising=False)
+
     headers = _auth(_register(client, "CorrProp"))
     ws, project, target = _make_target(client, headers)
     _verify_target(client, headers, ws, project, target)

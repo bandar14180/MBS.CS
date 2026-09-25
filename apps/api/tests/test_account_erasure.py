@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 
 _PW = "correct horse battery staple"
@@ -44,10 +45,7 @@ async def _insert_audit_event(workspace_id: str, user_id: str, email: str) -> No
     eng = create_async_engine(get_settings().database_url, poolclass=StaticPool)
     try:
         async with eng.begin() as c:
-            await c.execute(
-                text("SELECT set_config('app.current_workspace_id', :wid, true)"),
-                {"wid": workspace_id},
-            )
+            tenancy.bind_workspace(workspace_id)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             await c.execute(
                 text(
                     "INSERT INTO audit_events "
@@ -120,7 +118,10 @@ def test_delete_erases_pii_and_blocks_auth(client: TestClient) -> None:
     assert email.startswith("deleted+") and email.endswith("@deleted.invalid")
     assert full_name == "Deleted User"
     assert status_ == "deleted"
-    assert mfa_enabled is False
+    # Phase 0 MySQL cutover: read through raw text() SQL (not the ORM's Boolean type
+    # decoder), PyMySQL hands back the driver-native TINYINT(1) value (0/1, an int) rather
+    # than a Python bool -- `is False` would fail on a truthy-but-correct `0`.
+    assert not mfa_enabled
 
     # 4) The denormalized audit PII is anonymized; the audit row itself survives.
     emails = asyncio.run(_read_actor_emails(u["id"]))

@@ -4,9 +4,13 @@ import { useCallback, useEffect, useState } from "react";
 
 import { scheduleApi, type ScanSchedule, type Target } from "@/lib/api";
 import { useTranslation } from "@/lib/i18n";
+import { usePipeline } from "@/lib/pipeline";
 import { Badge, Button, Card, Empty, ErrorText, Label, Select, Spinner } from "@/components/ui";
 
-const MODULES = ["subfinder", "httpx", "naabu", "nmap", "nuclei"];
+// Selectable tools come from the backend registry (lib/pipeline.ts). This panel used to
+// hardcode 5 of the 12 registered tools -- an even narrower copy than the scan form's --
+// so most of the pipeline could never be put on a schedule at all.
+const DEFAULT_MODULES = ["subfinder", "httpx", "naabu", "nmap"];
 const FREQUENCIES = [
   { minutes: 60, key: "schedules.hourly" },
   { minutes: 360, key: "schedules.every6h" },
@@ -19,10 +23,11 @@ const TARGET_SCAN_TYPE: Record<string, string> = {
 
 export function SchedulesPanel({ projectId, targets }: { projectId: string; targets: Target[] }) {
   const { t } = useTranslation();
+  const pipeline = usePipeline();
   const [schedules, setSchedules] = useState<ScanSchedule[] | null>(null);
   const [error, setError] = useState("");
   const [targetId, setTargetId] = useState("");
-  const [modules, setModules] = useState<string[]>(["subfinder", "httpx", "naabu", "nmap"]);
+  const [modules, setModules] = useState<string[]>(DEFAULT_MODULES);
   const [interval, setInterval] = useState(1440);
   const [busy, setBusy] = useState(false);
 
@@ -53,7 +58,7 @@ export function SchedulesPanel({ projectId, targets }: { projectId: string; targ
     try {
       const target = targets.find((x) => x.id === targetId);
       const scanType = TARGET_SCAN_TYPE[target?.type ?? ""] ?? "web";
-      const ordered = MODULES.filter((m) => modules.includes(m));
+      const ordered = pipeline.map((p) => p.name).filter((m) => modules.includes(m));
       await scheduleApi.create(projectId, targetId, scanType, ordered, interval, false);
       await load();
     } catch (e: any) {
@@ -119,10 +124,18 @@ export function SchedulesPanel({ projectId, targets }: { projectId: string; targ
             </Button>
           </div>
           <div className="flex flex-wrap gap-3">
-            {MODULES.map((m) => (
-              <label key={m} className="flex items-center gap-2 text-sm text-slate-300">
-                <input type="checkbox" checked={modules.includes(m)} onChange={() => toggleModule(m)} />
-                <span dir="ltr">{m}</span>
+            {pipeline.map((p) => (
+              <label
+                key={p.name}
+                className="flex items-center gap-2 text-sm text-slate-300"
+                title={p.binary_available === false ? t("scans.toolUnavailableHint", { binary: p.binary }) : undefined}
+              >
+                <input type="checkbox" checked={modules.includes(p.name)} onChange={() => toggleModule(p.name)} />
+                <span dir="ltr" className={p.binary_available === false ? "text-slate-500 line-through" : undefined}>
+                  {p.name}
+                </span>
+                {p.requires_active_testing && <span className="text-xs text-amber-400">({t("scans.active")})</span>}
+                {p.produces_vulnerabilities && <span className="text-xs text-rose-300">({t("scans.findsVulns")})</span>}
               </label>
             ))}
           </div>

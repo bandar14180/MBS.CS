@@ -1,8 +1,13 @@
 """Phase 1.6 -- disaster-recovery orchestration.
 
-Ties the postgres + objects components together with checksums, a set-level MANIFEST.json,
+Ties the mysql + objects components together with checksums, a set-level MANIFEST.json,
 age-based retention that ALWAYS keeps >= min_keep newest sets and never the newest, metrics,
 and structured logging. Pure-Python around injectable seams -> fully testable.
+
+Phase 0 MySQL cutover: the DB component was `postgres` (pg_dump/pg_restore, db.dump); it is now
+`mysql` (mysqldump/mysql client, db.sql) -- see apps/api/dr/mysql.py. This is a clean cutover
+(no dual-support): a pre-cutover backup set (manifest component key "postgres", db.dump in
+pg_dump custom format) is NOT restorable by this code and must be treated as archival-only.
 """
 import hashlib
 import json
@@ -13,8 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from apps.api.dr import metrics as m
+from apps.api.dr import mysql as db
 from apps.api.dr import objects as obj
-from apps.api.dr import postgres as pg
 
 MANIFEST = "MANIFEST.json"
 _CHUNK = 1 << 20
@@ -77,22 +82,27 @@ def run_backup(settings, *, store=None, runner=None, offsite=None) -> BackupResu
 
     manifest: dict = {"timestamp": set_dir.name, "components": {}, "status": "in_progress"}
     ok = True
-    runner = runner or pg.PgRunner(settings.backup_pg_dump_cmd, settings.backup_pg_restore_cmd)
+    runner = runner or db.MySQLRunner(
+        settings.backup_mysqldump_cmd,
+        settings.backup_mysql_cmd,
+        settings.backup_mysql_ssl_mode,
+        settings.backup_mysql_ssl_ca,
+    )
 
-    # 1) PostgreSQL
+    # 1) MySQL
     t0 = time.monotonic()
     try:
-        info = pg.backup_postgres(set_dir, database_url=settings.database_url, runner=runner)
-        info["sha256"] = _write_checksum(set_dir / pg.DB_DUMP)
-        manifest["components"]["postgres"] = info
-        m.record_backup("postgres", success=True, duration_s=time.monotonic() - t0)
+        info = db.backup_mysql(set_dir, database_url=settings.database_url, runner=runner)
+        info["sha256"] = _write_checksum(set_dir / db.DB_DUMP)
+        manifest["components"]["mysql"] = info
+        m.record_backup("mysql", success=True, duration_s=time.monotonic() - t0)
     except Exception as exc:  # noqa: BLE001
         ok = False
-        manifest["components"]["postgres"] = {"error": str(exc)[:500]}
-        m.record_backup("postgres", success=False, duration_s=time.monotonic() - t0)
+        manifest["components"]["mysql"] = {"error": str(exc)[:500]}
+        m.record_backup("mysql", success=False, duration_s=time.monotonic() - t0)
         m.logger.error(
-            "backup.failed component=postgres set=%s", set_dir.name,
-            extra={"event": "backup.failed", "component": "postgres", "set": set_dir.name,
+            "backup.failed component=mysql set=%s", set_dir.name,
+            extra={"event": "backup.failed", "component": "mysql", "set": set_dir.name,
                    "reason": type(exc).__name__},
             exc_info=True,
         )
@@ -125,8 +135,8 @@ def run_backup(settings, *, store=None, runner=None, offsite=None) -> BackupResu
         from apps.api.dr import crypto
 
         key = crypto.load_backup_key(settings)
-        crypto.encrypt_file(set_dir / pg.DB_DUMP, key)
-        _write_checksum(set_dir / pg.DB_DUMP)
+        crypto.encrypt_file(set_dir / db.DB_DUMP, key)
+        _write_checksum(set_dir / db.DB_DUMP)
         objs = manifest["components"].get("objects")
         if settings.backup_include_objects and objs and "error" not in objs:
             arc = obj.archive_path(set_dir)
@@ -234,12 +244,12 @@ def _decrypt_objects_view(set_dir, key):
     return view
 
 
-def _verify_postgres_component(set_dir, encrypted, key) -> bool:
-    dump = set_dir / pg.DB_DUMP
+def _verify_mysql_component(set_dir, encrypted, key) -> bool:
+    dump = set_dir / db.DB_DUMP
     if not _checksum_matches(dump):  # at-rest integrity of the bytes actually stored
         return False
     if not encrypted:
-        return pg.verify_postgres_archive(dump)
+        return db.verify_mysql_archive(dump)
     from apps.api.dr import crypto
 
     try:
@@ -247,7 +257,7 @@ def _verify_postgres_component(set_dir, encrypted, key) -> bool:
     except crypto.DecryptionError:
         return False
     try:
-        return pg.verify_postgres_archive(tmp)
+        return db.verify_mysql_archive(tmp)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -287,9 +297,9 @@ def verify_backup(set_dir, *, settings=None) -> bool:
     key = _backup_key(settings) if encrypted else None
     ok = True
 
-    if "postgres" in comps and "error" not in comps["postgres"]:
-        db_ok = _verify_postgres_component(set_dir, encrypted, key)
-        m.record_verification("postgres", success=db_ok)
+    if "mysql" in comps and "error" not in comps["mysql"]:
+        db_ok = _verify_mysql_component(set_dir, encrypted, key)
+        m.record_verification("mysql", success=db_ok)
         ok = ok and db_ok
 
     if "objects" in comps and "error" not in comps["objects"]:
@@ -310,7 +320,7 @@ def verify_backup(set_dir, *, settings=None) -> bool:
 def run_restore(settings, set_dir, *, target_database_url=None, store=None, runner=None,
                 include_objects=False) -> bool:
     """Restore a backup set. Verifies the set exists and (if enabled) passes verification
-    BEFORE mutating anything, restores PostgreSQL (and optionally objects), logs, and
+    BEFORE mutating anything, restores MySQL (and optionally objects), logs, and
     returns True/False (the CLI maps this to an exit code)."""
     set_dir = Path(set_dir)
     m.logger.info(
@@ -339,26 +349,31 @@ def run_restore(settings, set_dir, *, target_database_url=None, store=None, runn
     key = _backup_key(settings) if encrypted else None
 
     ok = True
-    runner = runner or pg.PgRunner(settings.backup_pg_dump_cmd, settings.backup_pg_restore_cmd)
+    runner = runner or db.MySQLRunner(
+        settings.backup_mysqldump_cmd,
+        settings.backup_mysql_cmd,
+        settings.backup_mysql_ssl_mode,
+        settings.backup_mysql_ssl_ca,
+    )
     try:
-        dump = set_dir / pg.DB_DUMP
+        dump = set_dir / db.DB_DUMP
         if encrypted:
             from apps.api.dr import crypto
 
             tmp = crypto.decrypt_to_temp(dump, key)  # DecryptionError -> caught below (fail closed)
             try:
-                pg.restore_postgres(tmp, database_url=target_database_url or settings.database_url, runner=runner)
+                db.restore_mysql(tmp, database_url=target_database_url or settings.database_url, runner=runner)
             finally:
                 tmp.unlink(missing_ok=True)
         else:
-            pg.restore_postgres(dump, database_url=target_database_url or settings.database_url, runner=runner)
-        m.record_restore("postgres", success=True)
+            db.restore_mysql(dump, database_url=target_database_url or settings.database_url, runner=runner)
+        m.record_restore("mysql", success=True)
     except Exception as exc:  # noqa: BLE001
         ok = False
-        m.record_restore("postgres", success=False)
+        m.record_restore("mysql", success=False)
         m.logger.error(
-            "restore.failed component=postgres set=%s error=%s", set_dir.name, exc,
-            extra={"event": "restore.failed", "component": "postgres", "set": set_dir.name,
+            "restore.failed component=mysql set=%s error=%s", set_dir.name, exc,
+            extra={"event": "restore.failed", "component": "mysql", "set": set_dir.name,
                    "reason": type(exc).__name__, "error": str(exc)},
             exc_info=True,
         )
@@ -369,7 +384,7 @@ def run_restore(settings, set_dir, *, target_database_url=None, store=None, runn
             if encrypted:
                 view = _decrypt_objects_view(set_dir, key)
                 if view is None:
-                    raise pg.BackupError("objects decryption failed (wrong key or corruption)")
+                    raise db.BackupError("objects decryption failed (wrong key or corruption)")
                 try:
                     obj.restore_objects(view, store)
                 finally:
@@ -456,29 +471,47 @@ def latest_backup_set(settings):
 
 def _same_database(a: str, b: str) -> bool:
     """True if two DB URLs point at the same database (ignoring the SQLAlchemy driver tag)."""
-    return pg.pg_uri(a or "") == pg.pg_uri(b or "")
+    try:
+        return db.db_url_identity(a or "") == db.db_url_identity(b or "")
+    except Exception:  # noqa: BLE001 -- an unparseable URL is never "the same" as anything
+        return False
 
 
 def default_smoke_checks(target_database_url: str) -> dict:
-    """Post-restore smoke checks proving the restored DB is real and policy-complete. Runs
-    synchronously via psycopg2 (already a dependency) against the SCRATCH target. Best-effort:
+    """Post-restore smoke checks proving the restored DB is real and structurally intact. Runs
+    synchronously via PyMySQL (already a dependency) against the SCRATCH target. Best-effort:
     any error is reported as a failed check rather than raising, so the drill still yields
-    evidence. Never connects to anything but the caller-provided scratch URL."""
-    checks = {"connect": False, "has_tables": False, "rls_policies_present": False, "force_rls_present": False}
-    try:
-        import psycopg2
+    evidence. Never connects to anything but the caller-provided scratch URL.
 
-        conn = psycopg2.connect(pg.pg_uri(target_database_url))
+    Phase 0 MySQL cutover: the old checks (`rls_policies_present` / `force_rls_present`) proved
+    Postgres Row-Level Security survived the restore. There is no MySQL equivalent -- tenant
+    isolation is enforced in application code (apps.api.core.tenancy), not database schema/policy,
+    so it cannot be smoke-tested via SQL alone. Replaced with `core_tables_present`: a restored
+    database is only useful if the application's own tables came back, which a raw table count
+    can't distinguish from an empty/foreign schema."""
+    checks = {"connect": False, "has_tables": False, "core_tables_present": False}
+    try:
+        import pymysql
+        from sqlalchemy.engine import make_url
+
+        url = make_url(target_database_url)
+        conn = pymysql.connect(
+            host=url.host or "localhost", port=url.port or 3306,
+            user=url.username, password=url.password or "", database=url.database,
+            connect_timeout=5,
+        )
         try:
-            conn.autocommit = True
+            conn.autocommit(True)
             cur = conn.cursor()
-            cur.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
+            cur.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema = DATABASE()")
             checks["connect"] = True
             checks["has_tables"] = (cur.fetchone()[0] or 0) > 0
-            cur.execute("SELECT count(*) FROM pg_policies")
-            checks["rls_policies_present"] = (cur.fetchone()[0] or 0) > 0
-            cur.execute("SELECT count(*) FROM pg_class WHERE relkind='r' AND relforcerowsecurity")
-            checks["force_rls_present"] = (cur.fetchone()[0] or 0) > 0
+            cur.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name IN "
+                "('workspaces', 'users', 'projects', 'scans')"
+            )
+            checks["core_tables_present"] = (cur.fetchone()[0] or 0) == 4
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 -- record as failed checks; never abort the drill

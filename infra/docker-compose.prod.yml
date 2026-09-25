@@ -8,9 +8,20 @@
 services:
   api:
     environment:
+      # Clears the base file's `unconfigured` stack-mode sentinel for the production merge.
+      # Production is the case where the image's BAKED-IN code is the correct source -- there
+      # is no bind mount and must never be one -- so this asserts that intent explicitly
+      # rather than leaving the API unable to start. See docker-compose.yml for the full
+      # rationale; the sentinel exists to catch an INCOMPLETE -f list, and the production -f
+      # list names this file, so production is unaffected either way.
+      MBS_STACK_MODE: production
       ENVIRONMENT: production
       RATE_LIMIT_ENABLED: "true"
       ENABLE_HSTS: "true"
+      # F-08: the refresh token is an HttpOnly cookie carrying a 7-day credential. Secure is
+      # mandatory in production (validate_production refuses to start without it) so the cookie
+      # can never travel over plaintext http; production terminates TLS at nginx (F-01).
+      REFRESH_COOKIE_SECURE: "true"
       # /metrics is token-gated in prod ("public" is rejected at startup).
       METRICS_MODE: token
       METRICS_TOKEN_FILE: /run/secrets/metrics_token
@@ -37,6 +48,12 @@ services:
       # `env_file: ../.env`, so a value set in .env is silently ignored for this service.
       TRUSTED_PROXY_COUNT: "1"
       AI_PROVIDER: openrouter
+      # F-06: a metered provider in production MUST carry a spend cap -- validate_production()
+      # refuses to start otherwise. RATE_LIMIT_AI bounds request RATE, never COST, so without
+      # these two a runaway agent loop or an abusive tenant bills without limit. BOTH are
+      # required: enforcement without a positive cap is inert. Tune the figure to your budget.
+      AI_BUDGET_ENFORCE: "true"
+      AI_DAILY_BUDGET_USD: "25"
       # Secrets come from files (Docker Secrets / Vault Agent), not inline env. The base file
       # loads `env_file: ../.env` into this service and a compose overlay CANNOT unset an
       # env_file-sourced variable -- so these files must WIN over whatever .env supplies.
@@ -47,8 +64,11 @@ services:
       S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
       S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
       # B2: the DSN carries the application role's password, so it is a secret. Point it at a
-      # LEAST-PRIVILEGED, NON-SUPERUSER role -- startup_checks.py refuses to run in production
-      # on a superuser role because that bypasses FORCE RLS. See docs/runbooks/deployment.md.
+      # LEAST-PRIVILEGED, non-root MySQL user -- unlike the pre-cutover Postgres/RLS design,
+      # there is no database-role privilege that bypasses workspace isolation any more (see
+      # apps/api/core/tenancy.py), but a least-privileged role is still good practice: it
+      # should be able to read/write application tables and nothing more (no GRANT, no
+      # SUPER, no access to other schemas). See docs/runbooks/deployment.md.
       DATABASE_URL_FILE: /run/secrets/database_url
       # B3: Redis now requires a password, so the URL carries it and is likewise a secret
       # (redis://:<password>@redis:6379/0). Broker, DLQ, rate-limit / AI-budget / MFA-lockout
@@ -72,24 +92,103 @@ services:
       - database_url
       - redis_url
 
+  # MBS.SC -- SCANNER EXECUTION PLANE.
+  #
+  # This block used to grant the scan worker "the same credentials as the API" (its own
+  # former comment). That meant the process executing untrusted scanner binaries against
+  # customer infrastructure held the database DSN, the Redis URL, the MinIO credentials and
+  # the OpenRouter key -- so a single scanner RCE yielded every tenant's data at once.
+  #
+  # ALL of those are now withheld. The worker reaches the control plane ONLY through the
+  # scanner-manager (mbs-dispatch), which authorizes every request against the worker's own
+  # identity. What it keeps is exactly what it needs to authenticate and to scan.
+  #
+  # The base file also switches this service off `env_file: ../.env` onto `../.env.scanner`,
+  # which is load-bearing: compose CANNOT unset an env_file-sourced variable from an
+  # overlay, so simply omitting the *_FILE entries here would still leave .env's values in
+  # the container. Withholding requires not loading the file at all.
   worker:
     environment:
       ENVIRONMENT: production
-      AI_PROVIDER: openrouter
-      OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
-      # The scan worker writes evidence to object storage and reads/writes scan rows, and it
-      # takes every task off the authenticated broker -- so it needs the same credentials as
-      # the API. Without the *_FILE vars it would silently inherit .env's dev defaults.
+      # Refuses to start if a control-plane credential is present (startup_security).
+      SCANNER_EXECUTION_PLANE: "true"
+      SCANNER_MANAGER_URL: http://scanner-manager:8100
+      # The worker's OWN credential, delivered as a file (Docker secret / Vault) exactly
+      # like every other secret in this stack -- core/config.py resolves *_FILE with the
+      # file winning over any inherited value.
+      SCANNER_WORKER_TOKEN_FILE: /run/secrets/scanner_worker_token
+      # Identity. Must match the registered `scanner_workers` row; the manager authorizes
+      # every request against THAT row, so a mismatch simply fails closed.
+      SCANNER_WORKER_ID: ${SCANNER_WORKER_ID:-worker-public-1}
+      SCANNER_POOL_ID: public-default
+      # NO DATABASE_URL / REDIS_URL / S3_* / JWT_SECRET_KEY / OPENROUTER_API_KEY.
+      # If you find yourself adding one back, the right fix is almost certainly a new
+      # narrowly-scoped manager endpoint instead.
+    secrets:
+      # The worker's OWN bootstrap credential, scoped to this worker id alone. Presenting
+      # it authorizes nothing beyond this worker's own pool/site.
+      - scanner_worker_token
+    # MBS.SC Phase 14 -- runtime hardening on the host that runs untrusted tool binaries.
+    #
+    # cap_drop ALL: a scanner needs no Linux capability for the PUBLIC pool. Note that this
+    # deliberately removes CAP_NET_RAW, which nmap uses for SYN scanning -- nmap falls back
+    # to TCP connect scans without it. That is an accepted, explicit trade for the public
+    # pool; a deployment that genuinely needs SYN scans should add CAP_NET_RAW back HERE,
+    # alone, rather than dropping this block.
+    cap_drop:
+      - ALL
+    security_opt:
+      # Blocks setuid/setgid escalation inside the container -- a compromised tool cannot
+      # gain privileges it was not started with.
+      - no-new-privileges:true
+    read_only: true
+    # read_only makes the root filesystem immutable, so the few genuinely-writable paths
+    # are explicit tmpfs mounts. A scanner that is compromised cannot persist anything
+    # across a restart, and cannot rewrite its own tooling.
+    tmpfs:
+      # /run/prometheus-multiproc is NOT listed here: the base file already provides it as
+      # a tmpfs `volumes:` entry (W1, for prefork metric aggregation), and declaring the
+      # same target in both `volumes:` and `tmpfs:` is a hard compose error --
+      # "target /run/prometheus-multiproc already mounted". One tmpfs, declared once.
+      - /tmp:rw,noexec,nosuid,size=2g
+    user: "10001:10001"
+
+  # MBS.SC -- the control-plane boundary. This is the service that DOES hold the
+  # credentials the worker gave up, because it is the one performing validated persistence
+  # on the worker's behalf. It is not reachable from outside the compose network.
+  scanner-manager:
+    environment:
+      ENVIRONMENT: production
+      # No AI credentials: the manager persists and authorizes; it never calls a model.
       S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
       S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
       DATABASE_URL_FILE: /run/secrets/database_url
       REDIS_URL_FILE: /run/secrets/redis_url
     secrets:
-      - openrouter_api_key
       - s3_access_key
       - s3_secret_key
       - database_url
       - redis_url
+    # MBS.SC P8-D -- runtime emergency kill switch. Same mount as the base file; repeated
+    # here because the production service overrides nothing else about volumes and a compose
+    # overlay must restate a list to be sure of it.
+    #
+    # Deliberately NOT `infra/secrets/`: the sentinel is an OPERATIONAL control, not a
+    # credential, and filing it with the secrets would put an on-call toggle under
+    # secret-handling rules (rotation, backup, restricted access) that make an emergency
+    # slower to use. `:ro`, so the manager cannot write its own kill switch even though it
+    # can read it.
+    volumes:
+      - ./runtime:/run/mbs:ro
+    # The manager holds real credentials, so it is hardened too -- it is the component an
+    # attacker would pivot to next after the worker.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
 
   # F1: the dedicated default-queue worker needs the same production config -- backup.run and
   # retention.purge touch object storage (s3_secret_key), and all tasks run in production mode.
@@ -100,6 +199,12 @@ services:
     environment:
       ENVIRONMENT: production
       AI_PROVIDER: openrouter
+      # F-06: a metered provider in production MUST carry a spend cap -- validate_production()
+      # refuses to start otherwise. RATE_LIMIT_AI bounds request RATE, never COST, so without
+      # these two a runaway agent loop or an abusive tenant bills without limit. BOTH are
+      # required: enforcement without a positive cap is inert. Tune the figure to your budget.
+      AI_BUDGET_ENFORCE: "true"
+      AI_DAILY_BUDGET_USD: "25"
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
       # Same credential set as `worker`: this one runs the reaper, relay, scheduler, backup and
       # retention tasks, all of which touch the database, object storage and the broker.
@@ -189,24 +294,29 @@ services:
     secrets:
       - redis_password
 
-  # B2: PostgreSQL credentials from a Docker Secret instead of the base file's literal `mbs`.
-  # Setting POSTGRES_PASSWORD to null UNSETS the base value (verified: a null `environment` key
-  # removes a base literal), so only POSTGRES_PASSWORD_FILE remains and the image reads the
-  # secret. POSTGRES_USER stays as-is: it is the instance SUPERUSER and is deliberately NOT the
-  # role the application connects with -- DATABASE_URL points at a least-privileged role.
+  # B2: MySQL credentials from a Docker Secret instead of the base file's literal `mbs`.
+  # Setting MYSQL_ROOT_PASSWORD/MYSQL_PASSWORD to null UNSETS the base value (verified: a null
+  # `environment` key removes a base literal), so only the *_FILE variants remain and the
+  # image reads the secrets. MYSQL_ROOT_PASSWORD is the instance root credential and is
+  # deliberately NOT what the application connects with -- DATABASE_URL (above) points at the
+  # least-privileged `mbs` application user instead, whose own password is set here too.
   #
-  # !! ROTATION IS NOT AUTOMATIC !! `initdb` runs only on an EMPTY data directory, so on an
-  # existing postgres_data volume this changes nothing about the stored password. Rotating a
-  # live database requires an explicit ALTER ROLE -- see docs/runbooks/deployment.md.
-  postgres:
+  # !! ROTATION IS NOT AUTOMATIC !! The official mysql image only applies MYSQL_USER/
+  # MYSQL_PASSWORD/MYSQL_ROOT_PASSWORD on an EMPTY data directory (first start), so on an
+  # existing mysql_data volume this changes nothing about stored passwords. Rotating a live
+  # database requires an explicit `ALTER USER` -- see docs/runbooks/deployment.md.
+  mysql:
     environment:
-      POSTGRES_PASSWORD:
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      MYSQL_ROOT_PASSWORD:
+      MYSQL_PASSWORD:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_password
     secrets:
-      - postgres_password
+      - mysql_root_password
+      - mysql_password
 
   # B2: MinIO root credentials from Docker Secrets instead of `minioadmin`/`minioadmin`. Same
-  # null-unset mechanism as postgres. Like postgres, these apply at FIRST START; an existing
+  # null-unset mechanism as mysql. Like mysql, these apply at FIRST START; an existing
   # minio_data volume keeps its current root credentials until rotated explicitly.
   minio:
     environment:
@@ -235,7 +345,10 @@ services:
   # mounted metrics_token secret) and worker:9100 over the internal compose network. Config in
   # ./prometheus/. Published to LOCALHOST ONLY -- never exposed publicly.
   prometheus:
-    image: prom/prometheus:v2.54.1
+    # AUDIT-005: pinned by IMMUTABLE DIGEST -- see the rationale in docker-compose.yml.
+    # Tag kept in the comment for readability; the digest is what is deployed.
+    # prom/prometheus:v2.54.1
+    image: prom/prometheus@sha256:f6639335d34a77d9d9db382b92eeb7fc00934be8eae81dbc03b31cfe90411a94
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -244,6 +357,26 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
+    # MBS.SC PHASE 8 (P8-C -- Blocker B). Prometheus declared NO networks, so compose put it
+    # on `default` -- a network none of its targets are on. Verified against compose's own
+    # resolved config: it shared zero networks with api, worker, worker-default OR
+    # scanner-manager, so BOTH pre-existing scrape jobs were already dead in this overlay.
+    #
+    # `mbs-core` is the CONTROL plane: mysql, redis, minio, api, worker-default, beat,
+    # scanner-manager. It is the minimum attachment that reaches the intended targets.
+    #
+    # THIS GRANTS NO EXECUTION-PLANE ACCESS, and that was verified rather than assumed. The
+    # scanner-manager is the one service on both `mbs-core` and `mbs-dispatch`, but it is a
+    # tunnel/API ENDPOINT, not a router: a container on `mbs-core` alone cannot route through
+    # it to a dispatch-only host. Tested directly -- worker-default (mbs-core only) to the
+    # scan worker's dispatch address was refused at the socket. (`/proc/sys/net/ipv4/ip_forward`
+    # reads 1 in EVERY container here, including mysql and api; it is the shared Docker host
+    # kernel value surfaced into each netns, not a capability granted to the manager.)
+    #
+    # Prometheus is deliberately NOT attached to mbs-dispatch, mbs-scan-egress, or any
+    # mbs-site-<slug> network. The private workers stay unaware it exists.
+    networks:
+      - mbs-core
     secrets:
       - metrics_token
     ports:
@@ -257,7 +390,10 @@ services:
   # placeholder smarthost/from/to in alertmanager.yml and provide ./secrets/smtp_password.txt before
   # use. Published to LOCALHOST ONLY -- never exposed publicly.
   alertmanager:
-    image: prom/alertmanager:v0.27.0
+    # AUDIT-005: pinned by IMMUTABLE DIGEST -- see the rationale in docker-compose.yml.
+    # Tag kept in the comment for readability; the digest is what is deployed.
+    # prom/alertmanager:v0.27.0
+    image: prom/alertmanager@sha256:e13b6ed5cb929eeaee733479dce55e10eb3bc2e9c4586c705a4e8da41e5eacf5
     restart: unless-stopped
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
@@ -270,14 +406,107 @@ services:
     ports:
       - "127.0.0.1:9093:9093"
 
+  # F-01 (TRANSPORT SECURITY): nginx terminates TLS in production.
+  #
+  # Before this block the production overlay defined every service EXCEPT nginx, so the
+  # production merge inherited the base file's plaintext `80:80` and the entire application
+  # -- login, JWTs, scan evidence, reports -- crossed the network in cleartext, while
+  # ENABLE_HSTS=true above advertised a TLS guarantee that did not exist.
+  #
+  # `ports` are APPENDED across -f files and can never be withdrawn by an overlay, so the
+  # base file's :80 necessarily remains. That is fine and intended HERE: nginx.tls.conf
+  # serves nothing on :80 but a 308 to https:// (plus the ACME challenge path), so the
+  # inherited publication becomes the redirect listener rather than an insecure entrypoint.
+  # PRODUCTION WEB.
+  #
+  # THE BUG THIS CLOSES. The dev stack's `target: builder`, `command: ["npm","run","dev"]` and
+  # `../apps/web:/srv` bind-mount used to live in the SHARED docker-compose.yml. The production
+  # merge (`-f docker-compose.yml -f docker-compose.prod.yml`) includes that shared file, so
+  # production inherited all three: the effective production web service ran the Next.js
+  # DEVELOPMENT server against a read-write host source mount, with NODE_ENV unset. Verified on
+  # the running stack -- process tree `npm run dev` -> `next dev` -> `next-server`, and GET
+  # /login returned HTTP 500 (MODULE_NOT_FOUND from the dev bundler's half-written .next cache).
+  #
+  # THE FIX IS STRUCTURAL, NOT A COUNTER-OVERRIDE. Those dev-only settings now live in
+  # docker-compose.override.yml, which is auto-merged for a bare `docker compose up` (dev) and
+  # EXCLUDED from the production -f list. Production therefore inherits nothing to undo:
+  # infra/docker/Dockerfile.web's final `runtime` stage runs `next start` over a real
+  # `npm run build`, with production dependencies only and no sources.
+  #
+  # Deliberately no `!reset` here: Compose understands that tag, but this file is also parsed by
+  # the deployment tests with plain PyYAML, which cannot construct an unknown tag. Removing the
+  # inheritance is both safer and more portable than cancelling it.
+  web:
+    environment:
+      # Next.js selects production behaviour from NODE_ENV. `next start` sets it itself, but
+      # declaring it makes the container's mode explicit and correct for any child process.
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      # F-08 (unchanged): EMPTY = the browser calls the API SAME-ORIGIN through nginx, which is
+      # what makes the refresh cookie's SameSite=strict workable and is itself the CSRF control
+      # for the cookie-authenticated /auth routes. Restated here because this `environment:`
+      # mapping merges with the base file's -- keeping it visible prevents a future edit from
+      # silently dropping it.
+      NEXT_PUBLIC_API_URL: ""
+      API_INTERNAL_URL: http://api:8000
+    # No `ports:` -- deliberately. nginx proxies `/` to `web:3000` in-network, so the app is
+    # reached only through the single public entrypoint. Publishing 3000 would bypass nginx and
+    # its TLS/security headers entirely. Host access lives in docker-compose.override.yml (dev).
+
+  nginx:
+    # Replaces the base file's plaintext config with the TLS one. Same mount PATH, different
+    # SOURCE -- compose merges `volumes` by container path, so this substitutes rather than
+    # appends, and the plaintext server block is simply not present in production.
+    volumes:
+      - ./nginx/nginx.tls.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - certbot_www:/var/www/certbot
+    ports:
+      - "443:443"
+    secrets:
+      - tls_cert
+      - tls_key
+    # FAIL CLOSED. Without this, a missing/empty certificate file makes nginx exit with a
+    # generic SSL error under `restart: unless-stopped`, i.e. a crash loop whose cause is
+    # buried -- and an operator's temptation is then to "fix" it by reverting to the
+    # plaintext config, silently reopening F-01. This refuses to start with a message that
+    # names the actual problem, and never falls back to serving plaintext.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        set -e;
+        for f in /run/secrets/tls_cert /run/secrets/tls_key; do
+          if [ ! -s "$$f" ]; then
+            echo "FATAL: $$f is missing or empty. Production nginx terminates TLS and refuses to serve plaintext. Provide infra/secrets/tls_cert.pem (full chain) and infra/secrets/tls_key.pem from a real CA, or -- if TLS is terminated upstream -- use the plaintext nginx.conf and raise TRUSTED_PROXY_COUNT for that extra hop." >&2;
+            exit 1;
+          fi;
+        done;
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
 volumes:
   prometheus_data:
   # R4: durable Alertmanager state (silences, notification log) across recreation.
   alertmanager_data:
+  # F-01: ACME http-01 webroot, shared between nginx (serves the challenge over :80)
+  # and whatever renewal client writes into it. Empty until a renewal runs.
+  certbot_www:
 
 # Every file below lives in infra/secrets/, which is gitignored -- generate them on the host
 # before the first `up` and never commit them. See docs/runbooks/deployment.md.
 secrets:
+  # MBS.SC: the scanner execution plane's ONLY credential. Scoped to one worker id; the
+  # manager authorizes every request against that worker's own pool/site binding, so
+  # holding this grants nothing beyond that one worker's authorized work. Rotate by
+  # registering a new worker and revoking the old row (revocation is control-plane side,
+  # so it does not require reaching the scanner host).
+  scanner_worker_token:
+    file: ./secrets/scanner_worker_token.txt
   jwt_secret_key:
     file: ./secrets/jwt_secret_key.txt
   openrouter_api_key:
@@ -290,12 +519,16 @@ secrets:
   s3_access_key:
     file: ./secrets/s3_access_key.txt
   # B2: full DSN for the least-privileged application role, e.g.
-  #   postgresql+asyncpg://mbs_app:<password>@postgres:5432/mbs
+  #   mysql+aiomysql://mbs:<password>@mysql:3306/mbs
   database_url:
     file: ./secrets/database_url.txt
-  # B2: PostgreSQL SUPERUSER password, consumed by the postgres image at FIRST START only.
-  postgres_password:
-    file: ./secrets/postgres_password.txt
+  # B2: MySQL root password, consumed by the mysql image at FIRST START only.
+  mysql_root_password:
+    file: ./secrets/mysql_root_password.txt
+  # B2: the `mbs` application user's password -- must match the credential embedded in
+  # database_url above (two views of one credential, same as redis_password/redis_url).
+  mysql_password:
+    file: ./secrets/mysql_password.txt
   # B2: MinIO root credentials, consumed by the minio image at FIRST START only.
   minio_root_user:
     file: ./secrets/minio_root_user.txt
@@ -313,3 +546,16 @@ secrets:
   # E1 / R4: SMTP password shared by the app's email tasks and Alertmanager alert delivery.
   smtp_password:
     file: ./secrets/smtp_password.txt
+  # F-01: TLS material for the production nginx listener. Like every other entry here these
+  # live in infra/secrets/ (gitignored) and are NEVER committed.
+  #   tls_cert.pem -- the FULL CHAIN (leaf + intermediates), PEM. A leaf-only file makes
+  #                   clients that lack the intermediate fail to validate.
+  #   tls_key.pem  -- the matching PRIVATE KEY, PEM, unencrypted (nginx starts
+  #                   non-interactively and cannot prompt for a passphrase). Keep it 0600
+  #                   and owned by root on the host.
+  # Obtain them from a real CA (Let's Encrypt or your internal PKI). A self-signed pair is
+  # not a production answer -- see the header of infra/nginx/nginx.tls.conf.
+  tls_cert:
+    file: ./secrets/tls_cert.pem
+  tls_key:
+    file: ./secrets/tls_key.pem

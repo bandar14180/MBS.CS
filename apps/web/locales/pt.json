@@ -1,5 +1,7 @@
 {
-  "common": { "language": "Idioma" },
+  "common": {
+    "language": "Idioma"
+  },
   "nav": {
     "services": "Serviços",
     "agents": "Agentes de IA",
@@ -22,22 +24,58 @@
   "services": {
     "title": "Segurança corporativa, automatizada",
     "subtitle": "Uma plataforma de avaliação completa impulsionada por IA — em web, API, nuvem e rede.",
-    "aiPentest": { "title": "Teste de intrusão com IA", "desc": "Agentes autônomos planejam, executam e validam avaliações de ponta a ponta." },
-    "web": { "title": "Segurança de aplicações web", "desc": "Detecte o OWASP Top 10 e falhas de lógica de negócio nas suas aplicações web." },
-    "api": { "title": "Avaliação de segurança de API", "desc": "Descubra e teste endpoints REST quanto a riscos de autenticação, exposição e injeção." },
-    "cloud": { "title": "Avaliação de segurança em nuvem", "desc": "Avalie contas de nuvem quanto a configurações incorretas e exposição na AWS." },
-    "network": { "title": "Teste de segurança de rede", "desc": "Descoberta de portas, serviços e versões com reconhecimento de rede aprofundado." },
-    "vuln": { "title": "Análise de vulnerabilidades", "desc": "A IA correlaciona, prioriza e deduplica descobertas pelo risco real de negócio." },
-    "reporting": { "title": "Relatórios de segurança", "desc": "Relatórios executivos e técnicos com CVSS, evidências e etapas de remediação." }
+    "aiPentest": {
+      "title": "Teste de intrusão com IA",
+      "desc": "Agentes autônomos planejam, executam e validam avaliações de ponta a ponta."
+    },
+    "web": {
+      "title": "Segurança de aplicações web",
+      "desc": "Detecte o OWASP Top 10 e falhas de lógica de negócio nas suas aplicações web."
+    },
+    "api": {
+      "title": "Avaliação de segurança de API",
+      "desc": "Descubra e teste endpoints REST quanto a riscos de autenticação, exposição e injeção."
+    },
+    "cloud": {
+      "title": "Avaliação de segurança em nuvem",
+      "desc": "Avalie contas de nuvem quanto a configurações incorretas e exposição na AWS."
+    },
+    "network": {
+      "title": "Teste de segurança de rede",
+      "desc": "Descoberta de portas, serviços e versões com reconhecimento de rede aprofundado."
+    },
+    "vuln": {
+      "title": "Análise de vulnerabilidades",
+      "desc": "A IA correlaciona, prioriza e deduplica descobertas pelo risco real de negócio."
+    },
+    "reporting": {
+      "title": "Relatórios de segurança",
+      "desc": "Relatórios executivos e técnicos com CVSS, evidências e etapas de remediação."
+    }
   },
   "agents": {
     "title": "Cinco agentes de IA autônomos. Um único pipeline.",
     "subtitle": "Cada avaliação percorre uma cadeia coordenada de agentes de IA especializados — da descoberta a um relatório pronto para a diretoria.",
-    "recon": { "title": "Agente de reconhecimento", "desc": "Descoberta de ativos, análise de domínio, detecção de tecnologia e mapeamento da superfície de ataque." },
-    "vulnAnalysis": { "title": "Agente de análise de vulnerabilidades", "desc": "Analisa fraquezas, identifica vulnerabilidades e as prioriza por risco." },
-    "validation": { "title": "Agente de validação de segurança", "desc": "Valida descobertas e reduz falsos positivos antes que cheguem a você." },
-    "risk": { "title": "Agente de avaliação de risco", "desc": "Calcula o risco e explica o impacto no negócio em linguagem clara." },
-    "report": { "title": "Agente de geração de relatórios", "desc": "Gera automaticamente relatórios de segurança profissionais alinhados aos frameworks." },
+    "recon": {
+      "title": "Agente de reconhecimento",
+      "desc": "Descoberta de ativos, análise de domínio, detecção de tecnologia e mapeamento da superfície de ataque."
+    },
+    "vulnAnalysis": {
+      "title": "Agente de análise de vulnerabilidades",
+      "desc": "Analisa fraquezas, identifica vulnerabilidades e as prioriza por risco."
+    },
+    "validation": {
+      "title": "Agente de validação de segurança",
+      "desc": "Valida descobertas e reduz falsos positivos antes que cheguem a você."
+    },
+    "risk": {
+      "title": "Agente de avaliação de risco",
+      "desc": "Calcula o risco e explica o impacto no negócio em linguagem clara."
+    },
+    "report": {
+      "title": "Agente de geração de relatórios",
+      "desc": "Gera automaticamente relatórios de segurança profissionais alinhados aos frameworks."
+    },
     "flow": {
       "target": "Alvo",
       "recon": "Reconhecimento",
@@ -51,10 +89,22 @@
   "trust": {
     "title": "Feito para empresas que não podem errar em segurança",
     "subtitle": "Segurança e confiança são projetadas no núcleo — não adicionadas depois.",
-    "isolation": { "title": "Isolamento no nível do banco de dados", "desc": "A segurança em nível de linha impõe isolamento rígido de inquilinos em cada registro." },
-    "authorization": { "title": "Autorização em primeiro lugar", "desc": "Nenhuma varredura é executada sem prova verificada de propriedade do alvo." },
-    "evidence": { "title": "Comprovado por evidências", "desc": "Cada descoberta é rastreada até evidências brutas armazenadas e protegidas por checksums." },
-    "frameworks": { "title": "Alinhado a frameworks", "desc": "As descobertas são mapeadas para controles OWASP, NIST, ISO 27001 e PCI DSS." }
+    "isolation": {
+      "title": "Isolamento no nível do banco de dados",
+      "desc": "A segurança em nível de linha impõe isolamento rígido de inquilinos em cada registro."
+    },
+    "authorization": {
+      "title": "Autorização em primeiro lugar",
+      "desc": "Nenhuma varredura é executada sem prova verificada de propriedade do alvo."
+    },
+    "evidence": {
+      "title": "Comprovado por evidências",
+      "desc": "Cada descoberta é rastreada até evidências brutas armazenadas e protegidas por checksums."
+    },
+    "frameworks": {
+      "title": "Alinhado a frameworks",
+      "desc": "As descobertas são mapeadas para controles OWASP, NIST, ISO 27001 e PCI DSS."
+    }
   },
   "cta": {
     "title": "Pronto para automatizar suas avaliações de segurança?",
@@ -137,7 +187,10 @@
     "back": "Projetos",
     "tabTargets": "Alvos",
     "tabScans": "Varreduras",
+    "tabAssets": "Ativos",
     "tabVulnerabilities": "Vulnerabilidades",
+    "tabRemediation": "Remediação",
+    "tabAssessments": "Avaliações",
     "tabReports": "Relatórios"
   },
   "targets": {
@@ -160,45 +213,62 @@
     "verify": "Verificar propriedade"
   },
   "scans": {
-    "newScan": "Nova varredura",
-    "target": "Alvo",
-    "modules": "Módulos",
     "active": "ativo",
     "activeNote": "Módulos ativos exigem um alvo com autorização de teste ativo.",
-    "useAiPlanner": "Usar planejador de IA",
-    "aiPlannerHint": "Requer uma ANTHROPIC_API_KEY; deixe desligado para varrer sem IA.",
-    "startScan": "Iniciar varredura",
-    "starting": "Iniciando…",
     "addVerifyFirst": "Adicione e verifique um alvo primeiro.",
-    "noScans": "Nenhuma varredura ainda.",
-    "progress": "Progresso",
+    "aiPlannerHint": "Requer uma ANTHROPIC_API_KEY; deixe desligado para varrer sem IA.",
+    "clearAll": "Limpar tudo",
+    "findsVulns": "detecta vulnerabilidades",
+    "fixDns": "O nome do host do alvo não pôde ser resolvido. Verifique se o domínio/host está escrito corretamente e é resolvível publicamente (tem registros DNS).",
+    "fixGeneric": "Revise o erro da ferramenta acima e a configuração do alvo, depois execute a varredura novamente.",
+    "fixRefused": "O alvo recusou a conexão ou está inacessível a partir do scanner. Confirme que está online e acessível.",
+    "fixTimeout": "A ferramenta expirou. O alvo pode estar lento, limitando a taxa ou filtrando o tráfego — tente novamente ou reduza o escopo.",
     "hide": "Ocultar",
-    "started": "iniciado",
     "live": "Ao vivo — atualizando a cada 3s",
-    "total": "Total",
-    "scanFailedShort": "Varredura falhou",
-    "scanFailed": "Varredura Falhou",
-    "tool": "Ferramenta",
-    "reason": "Motivo",
-    "suggestedFix": "Correção sugerida",
+    "modules": "Módulos",
+    "newScan": "Nova varredura",
+    "noScans": "Nenhuma varredura ainda.",
     "pipelineStopped": "O pipeline parou aqui — as etapas seguintes não foram executadas e nenhum relatório foi gerado.",
+    "progress": "Progresso",
+    "progressUnavailable": "O progresso em direto não está disponível.",
+    "reason": "Motivo",
+    "sCancelled": "Não executado (análise cancelada)",
     "sCompleted": "Concluído",
-    "sRunning": "Em execução…",
     "sFailed": "Falhou",
-    "sWaiting": "Aguardando",
-    "sSkipped": "Ignorado",
     "sNotApplicable": "Não aplicável a este tipo de alvo",
     "sNotRun": "Não executado (uma etapa anterior falhou)",
+    "sPartial": "Parcial — cobertura incompleta",
+    "sRunning": "Em execução…",
+    "sSkipped": "Ignorado",
     "sSkippedUnauth": "Ignorado (não autorizado)",
-    "stageSubfinder": "Reconhecimento — Subdomínios",
+    "sWaiting": "Aguardando",
+    "scanCancelledShort": "Análise cancelada",
+    "scanFailed": "Varredura Falhou",
+    "scanFailedShort": "Varredura falhou",
+    "selectAll": "Selecionar tudo",
+    "stageAmass": "Reconhecimento — Superfície de Ataque",
+    "stageArjun": "Descoberta de Parâmetros",
+    "stageDnsx": "Resolução DNS",
+    "stageFfuf": "Fuzzing de Diretórios",
     "stageHttpx": "Hosts Ativos",
+    "stageKatana": "Descoberta de Conteúdo",
     "stageNaabu": "Varredura de Portas",
     "stageNmap": "Detecção de Serviços",
     "stageNuclei": "Varredura de Vulnerabilidades",
-    "fixDns": "O nome do host do alvo não pôde ser resolvido. Verifique se o domínio/host está escrito corretamente e é resolvível publicamente (tem registros DNS).",
-    "fixTimeout": "A ferramenta expirou. O alvo pode estar lento, limitando a taxa ou filtrando o tráfego — tente novamente ou reduza o escopo.",
-    "fixRefused": "O alvo recusou a conexão ou está inacessível a partir do scanner. Confirme que está online e acessível.",
-    "fixGeneric": "Revise o erro da ferramenta acima e a configuração do alvo, depois execute a varredura novamente."
+    "stageNucleiDast": "Testes Web Ativos",
+    "stageSubfinder": "Reconhecimento — Subdomínios",
+    "stageWhatweb": "Impressão Tecnológica",
+    "startScan": "Iniciar varredura",
+    "started": "iniciado",
+    "starting": "Iniciando…",
+    "suggestedFix": "Correção sugerida",
+    "target": "Alvo",
+    "tool": "Ferramenta",
+    "toolUnavailable": "não instalado",
+    "toolUnavailableHint": "O binário `{binary}` não está no PATH do worker de varredura. Selecionar esta ferramenta registará uma execução falhada e não produzirá resultados.",
+    "total": "Total",
+    "useAiPlanner": "Usar planejador de IA",
+    "vulnToolsNote": "Apenas o nuclei e o nuclei-dast podem reportar vulnerabilidades; as outras ferramentas inventariam ativos (subdomínios, portas, URLs). Uma varredura sem eles termina com uma lista de vulnerabilidades vazia porque nada foi testado — e não porque o alvo esteja limpo."
   },
   "vulns": {
     "severity": "Gravidade",
@@ -322,5 +392,92 @@
     "active": "Ativo",
     "inactive": "Não configurado",
     "configureHint": "Defina ANTHROPIC_API_KEY para habilitar a IA ao vivo. A varredura funciona sem ela."
+  },
+  "assessment": {
+    "affectedAssets": "Ativos afetados",
+    "affectedEndpoints": "Endpoints afetados",
+    "comparedTo": "em comparação com a avaliação anterior",
+    "create": "Nova avaliação",
+    "creating": "A criar…",
+    "declined": "Piorou",
+    "empty": "Ainda não há avaliações",
+    "endpointCount": "Endpoints",
+    "findings": "Constatações",
+    "frozenNote": "congelado na data de emissão",
+    "improved": "Melhorou",
+    "issue": "Emitir",
+    "issueHint": "A emissão congela os números permanentemente.",
+    "issuedOn": "Emitida em",
+    "issuing": "A emitir…",
+    "name": "Nome da avaliação",
+    "noFindings": "Sem constatações neste período",
+    "noPrevious": "Não há avaliação anterior para comparar",
+    "noTopRisks": "Nenhum risco principal registado",
+    "overdue": "Em atraso",
+    "periodEnd": "Fim do período",
+    "periodStart": "Início do período",
+    "points": "pontos",
+    "preview": "Pré-visualizar",
+    "previewHint": "Um rascunho ainda não mediu nada.",
+    "progressOpen": "Em aberto",
+    "progressResolved": "Resolvidos",
+    "progressTotal": "Total",
+    "recommendations": "Recomendações",
+    "remediationProgress": "Progresso da remediação",
+    "riskAccepted": "Risco aceite",
+    "securityScore": "Pontuação de segurança",
+    "severityPosture": "Distribuição de severidade",
+    "topRisks": "Principais riscos",
+    "trend": "Tendência",
+    "unchanged": "Sem alteração",
+    "unresolvedIssues": "Problemas por resolver"
+  },
+  "remediation": {
+    "acceptRisk": "Aceitar risco",
+    "all": "Todos",
+    "apply": "Aplicar",
+    "assignee": "Responsável",
+    "conflict": "Este item foi alterado por outra pessoa. Recarregue e tente novamente.",
+    "dueDate": "Data limite",
+    "empty": "Ainda não há itens de remediação",
+    "evidence": "Evidências",
+    "evidenceHint": "Anexe prova de que a correção está aplicada.",
+    "expiresAt": "Expira em",
+    "justification": "Justificação",
+    "liveLocations": "Localizações ativas",
+    "noAcceptances": "Sem riscos aceites",
+    "noEvidence": "Sem evidências anexadas",
+    "noVerification": "Ainda não verificado",
+    "notes": "Notas",
+    "notesBy": "Nota de",
+    "notesPlaceholder": "Adicionar uma nota…",
+    "overdue": "Em atraso",
+    "overdueOnly": "Apenas em atraso",
+    "priority": "Prioridade",
+    "progress": "Progresso",
+    "progressComplete": "concluído",
+    "progressOpen": "Em aberto",
+    "progressResolved": "Resolvidos",
+    "progressTotal": "Total",
+    "requestVerification": "Pedir verificação",
+    "revoke": "Revogar",
+    "riskHint": "Aceitar um risco regista uma decisão; não corrige o problema.",
+    "riskTreatment": "Tratamento do risco",
+    "save": "Guardar",
+    "sourceAi": "Gerado por IA",
+    "sourceHuman": "Adicionado por uma pessoa",
+    "status": "Estado",
+    "sync": "Sincronizar a partir das constatações",
+    "syncHint": "Cria itens de remediação a partir das constatações atuais.",
+    "syncing": "A sincronizar…",
+    "timeline": "Cronologia",
+    "transition": "Alterar estado",
+    "unassigned": "Sem responsável",
+    "verification": "Verificação",
+    "verificationFailed": "Verificação falhou",
+    "verificationHint": "A verificação testa novamente a constatação para confirmar a correção.",
+    "verificationPassed": "Verificação aprovada",
+    "verificationResult": "Resultado da verificação",
+    "version": "Versão"
   }
 }

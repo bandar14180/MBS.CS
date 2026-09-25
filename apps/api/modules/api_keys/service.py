@@ -55,7 +55,7 @@ async def revoke_key(db: AsyncSession, workspace_id: uuid.UUID, key_id: uuid.UUI
 async def authenticate_key(db: AsyncSession, raw: str) -> ApiKey | None:
     """Resolve a raw API key to its (non-revoked) row and stamp last_used_at.
     Returns None if unknown or revoked. Runs during auth, before any workspace
-    RLS context (api_keys is RLS-exempt by design)."""
+    workspace context (api_keys is in tenancy.EXEMPT_TABLES by design)."""
     key = await db.scalar(
         select(ApiKey).where(ApiKey.key_hash == _hash(raw), ApiKey.revoked.is_(False))
     )

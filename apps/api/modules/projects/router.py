@@ -79,8 +79,13 @@ async def delete_project(project_id: uuid.UUID, db: DbDep, ctx: WorkspaceContext
     dependencies=[Depends(require_permission("target:create"))],
 )
 async def create_target(project_id: uuid.UUID, payload: TargetCreate, db: DbDep, ctx: WorkspaceContextDep) -> TargetRead:
+    # P7-2: `ctx.workspace_id` is the AUTHENTICATED workspace (from the path + membership
+    # check), never a body field -- so `payload.site_id` is resolved against the caller's
+    # own workspace inside the service. `network_zone` is not accepted at all; the service
+    # derives it.
     target = await service.create_target(
-        db, ctx.workspace_id, project_id, ctx.member.user_id, payload.type, payload.value, payload.criticality
+        db, ctx.workspace_id, project_id, ctx.member.user_id, payload.type, payload.value,
+        payload.criticality, site_id=payload.site_id,
     )
     return TargetRead.model_validate(target)
 

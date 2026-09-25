@@ -1,14 +1,22 @@
+import asyncio
 import hashlib
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
-from sqlalchemy import select, text
+from sqlalchemy import case, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.core import tenancy
 from apps.api.core.events import ScanCompleted, emit as emit_event, subscribe as subscribe_event
-from apps.api.core.observability import record_ai_decision, record_scan_result, record_tool_failure
+from apps.api.core.observability import (
+    record_ai_decision,
+    record_evidence_processed,
+    record_scan_result,
+    record_tool_failure,
+)
 from apps.api.modules.assets.models import Asset
 from apps.api.modules.assets.service import upsert_asset
 from apps.api.modules.attack.service import sync_attack_mappings
@@ -16,8 +24,10 @@ from apps.api.modules.authorization_scope.service import require_verified_target
 from apps.api.modules.compliance.service import sync_mappings
 from apps.api.modules.risk.service import upsert_risk_score
 from apps.api.modules.scans.models import Scan
+from apps.api.modules.vulnerabilities.remediation_service import sync_remediation
 from apps.api.modules.vulnerabilities.service import ingest_finding
 from apps.api.scanner_engine import evidence_store
+from apps.api.scanner_engine.location_normalize import normalize_url
 from apps.api.scanner_engine.models import Evidence, ToolRun
 from apps.api.scanner_engine.tool_registry import TOOL_REGISTRY
 from apps.api.scanner_engine.tool_runners.base import CommonFinding, classify_run
@@ -41,8 +51,8 @@ class ExecutionRevoked(Exception):
 
 
 async def _load_scan(db: AsyncSession, scan_id: uuid.UUID) -> Scan:
-    # scans is intentionally not RLS-protected; we read it by trusted id first,
-    # THEN set the workspace RLS var so every subsequent read/write on
+    # scans is intentionally in tenancy.EXEMPT_TABLES (not auto-filtered); we read it by
+    # trusted id first, THEN bind the workspace so every subsequent read/write on
     # projects/targets/assets/authorization_scopes is correctly scoped.
     scan = await db.get(Scan, scan_id)
     if scan is None:
@@ -65,22 +75,47 @@ async def _claim_scan(db: AsyncSession, scan_id: uuid.UUID, execution_token: uui
     ownership-sensitive write can be fenced against a superseded executor. The token is
     REQUIRED: an execution that did not record who it is could never fence its own terminal
     write, which is precisely the defect this exists to prevent."""
+    # Phase 0 MySQL cutover: MySQL has no RETURNING clause at all (not even MariaDB's
+    # extension -- this codebase targets stock MySQL). The claim/fencing semantics don't
+    # actually need the returned row, only "did exactly my UPDATE match a row": that's
+    # `result.rowcount`, which is dialect-portable and was already computable under
+    # Postgres too -- RETURNING was never load-bearing here, just how this originally got
+    # written. `result.rowcount` for an UPDATE with a WHERE clause under InnoDB reflects
+    # rows actually MATCHED (not just changed) by default for this driver stack, which is
+    # what "did I win the claim" needs.
     result = await db.execute(
         text(
             "UPDATE scans SET status = 'running', started_at = now(), execution_token = :tok "
-            "WHERE id = :id AND status IN ('queued', 'failed') RETURNING id"
+            "WHERE id = :id AND status IN ('queued', 'failed')"
         ),
         {"id": str(scan_id), "tok": str(execution_token)},
     )
-    claimed = result.first() is not None
+    claimed = result.rowcount == 1
     await db.commit()  # make the claim durable + visible to other workers
     return claimed
 
 
-async def reap_orphaned_scans(db: AsyncSession, timeout_seconds: int) -> int:
-    """Recover scans stuck in 'running' past `timeout_seconds` -- a worker that claimed
-    the scan (M4.6.2) then crashed/was lost, so acks_late redelivery just skips it and
-    the scan would otherwise stay 'running' forever (Phase 1.2 / F3b).
+async def reap_orphaned_scans(
+    db: AsyncSession, timeout_seconds: int, stale_heartbeat_seconds: int | None = None
+) -> int:
+    """Recover scans whose executor is genuinely DEAD -- a worker that claimed the scan
+    (M4.6.2) then crashed/was lost, so acks_late redelivery just skips it and the scan
+    would otherwise stay 'running' forever (Phase 1.2 / F3b).
+
+    LIVENESS, NOT RUNTIME. This used to key on `started_at` age alone, which cannot tell a
+    healthy 5-hour scan from a dead one -- so the threshold had to be either short enough to
+    recover dead scans (killing legitimate long ones) or long enough to protect them
+    (leaving dead ones running for hours). It now keys on the executor's heartbeat
+    (`last_heartbeat_at`, refreshed ~every 30s by `_run_with_progress` for as long as a tool
+    is running): silence for `stale_heartbeat_seconds` means dead, at ANY runtime. A scan
+    that is alive is never reaped no matter how long it has been running, and a scan whose
+    worker was SIGKILLed is recovered in minutes rather than hours -- strictly better on
+    both axes.
+
+    `timeout_seconds` is retained as the fallback for a scan that has NEVER stamped a
+    heartbeat -- claimed but died before its first tick, or started by a pre-heartbeat
+    build. COALESCE(last_heartbeat_at, started_at) applies one rule to both cases, so a NULL
+    heartbeat can never make a scan immortal.
 
     A SINGLE atomic conditional UPDATE marks them 'failed': it touches ONLY over-threshold
     'running' scans -- never completed/failed/cancelled or recently-started ones -- with
@@ -107,30 +142,147 @@ async def reap_orphaned_scans(db: AsyncSession, timeout_seconds: int) -> int:
     running_timeout_seconds) in the SAME atomic statement -- additive JSONB, no schema or
     API change (ScanRead already exposes config), so the orphaned outcome is queryable and
     visible without altering the lifecycle."""
+    stale = int(stale_heartbeat_seconds if stale_heartbeat_seconds is not None else timeout_seconds)
     reason = (
-        f"orphaned: scan remained RUNNING beyond the {int(timeout_seconds)}s recovery "
-        f"threshold with no worker completion; worker/process presumed dead"
+        f"orphaned: no executor heartbeat for {stale}s (falling back to a {int(timeout_seconds)}s "
+        f"age limit for a scan that never heartbeat); worker/process presumed dead"
     )
-    # Explicit ::text/::int casts are REQUIRED: params used only inside jsonb_build_object
-    # (which accepts "any") have no inferable type for asyncpg. A distinct :timeout_val
-    # (vs :secs for make_interval) avoids one param serving two type contexts.
+    # Phase 0 MySQL cutover, three changes from the original Postgres statement:
+    #   1. jsonb_build_object + `||` merge -> JSON_OBJECT + JSON_MERGE_PATCH. MySQL's
+    #      JSON_MERGE_PATCH(target, patch) has the same "shallow-merge, patch keys win"
+    #      semantics Postgres's jsonb `||` has for two objects, which is exactly what this
+    #      statement relies on (config keeps every other key, only `recovery` is added/
+    #      replaced).
+    #   2. `::text`/`::int` casts dropped -- asyncpg needed them to disambiguate a
+    #      parameter used only inside jsonb_build_object; aiomysql has no such ambiguity.
+    #   3. `now() - make_interval(secs => :secs)` -> the cutoff is computed in Python and
+    #      bound directly as `:cutoff`. Safer than relying on MySQL's parameter binding
+    #      inside an INTERVAL expression, and identical in effect.
+    #   4. No RETURNING (MySQL has none) -- `result.rowcount` replaces `len(fetchall())`,
+    #      made exact by CLIENT_FOUND_ROWS (see core/db.py's _mysql_connect_args).
+    #   5. Liveness: the WHERE now compares COALESCE(last_heartbeat_at, started_at) against a
+    #      heartbeat-staleness cutoff, with the old started_at-age rule kept ONLY for rows
+    #      that never heartbeat. Two cutoffs are bound rather than one so a heartbeating scan
+    #      is judged solely on its silence, never on its total runtime.
+    now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(seconds=stale)
+    age_cutoff = now - timedelta(seconds=int(timeout_seconds))
     result = await db.execute(
         text(
-            "UPDATE scans SET status = 'failed', completed_at = now(), execution_token = NULL, "
-            "config = coalesce(config, '{}'::jsonb) || jsonb_build_object("
-            "  'recovery', jsonb_build_object("
-            "    'reason', :reason ::text, 'recovered_at', now(), "
-            "    'running_timeout_seconds', :timeout_val ::int"
+            "UPDATE scans SET status = 'failed', completed_at = now(6), execution_token = NULL, "
+            "config = JSON_MERGE_PATCH(COALESCE(config, JSON_OBJECT()), JSON_OBJECT("
+            "  'recovery', JSON_OBJECT("
+            "    'reason', :reason, 'recovered_at', now(6), "
+            "    'stale_heartbeat_seconds', :stale_val, "
+            "    'running_timeout_seconds', :timeout_val"
             "  )"
-            ") "
-            "WHERE status = 'running' AND started_at < now() - make_interval(secs => :secs) "
-            "RETURNING id"
+            ")) "
+            "WHERE status = 'running' AND ("
+            # Heartbeating executor: judged ONLY on how long it has been silent.
+            "  (last_heartbeat_at IS NOT NULL AND last_heartbeat_at < :stale_cutoff)"
+            # Never heartbeat (died before its first tick / pre-heartbeat build): fall back
+            # to the original age rule so such a row can still be recovered.
+            "  OR (last_heartbeat_at IS NULL AND started_at < :age_cutoff)"
+            ")"
         ),
-        {"reason": reason, "timeout_val": int(timeout_seconds), "secs": int(timeout_seconds)},
+        {
+            "reason": reason,
+            "stale_val": stale,
+            "timeout_val": int(timeout_seconds),
+            "stale_cutoff": stale_cutoff,
+            "age_cutoff": age_cutoff,
+        },
     )
-    reaped = len(result.fetchall())
+    reaped = result.rowcount or 0
     await db.commit()
     return reaped
+
+
+# Terminal scan statuses. A tool_run still 'running' under ANY of these is orphaned by
+# definition: the scan is over, so nothing will ever report that tool's outcome again.
+# Listed explicitly rather than derived as "not running/queued" so that adding a new
+# non-terminal status later cannot silently widen what the reconciler sweeps.
+TERMINAL_SCAN_STATUSES = ("completed", "failed", "cancelled", "completed_with_errors")
+
+# What an orphaned tool_run becomes. `failed` is an EXISTING ToolRun status (see the
+# manager's _ALLOWED_TOOL_STATUSES: completed/partial/failed/skipped_unauthorized) -- no new
+# lifecycle state is invented here, because a status that only some layers understand is
+# worse than an imprecise one every layer already renders. The `error_message` carries the
+# nuance that the status cannot.
+_ORPHAN_TOOLRUN_STATUS = "failed"
+
+
+async def reconcile_orphaned_tool_runs(db: AsyncSession, grace_seconds: int) -> int:
+    """Repair tool_runs left 'running' under a scan that has already finished.
+
+    WHY THIS EXISTS. A ToolRun's terminal status and its scan's terminal status are written
+    by different components at different times, so a crash, a rolled-back transaction or a
+    lost submission between the two leaves a row that says a tool is still executing when
+    its scan ended hours ago. Incident 615d0e0b is the worked example: the manager's asset
+    INSERT raised DataError(1406), the shared transaction rolled the ToolRun status write
+    back with it, and katana stayed 'running' permanently -- the UI faithfully rendered a
+    live, ticking timer for a process that had already been OOM-killed. 14 such rows existed
+    across the deployment when that incident was investigated.
+
+    The transactional fix in the manager stops NEW ones being created by that route. This
+    reconciles rows that are already stranded, and any arriving by a route not yet foreseen.
+
+    SAFETY -- what this deliberately CANNOT touch:
+
+      * a tool_run under a scan that is still `running` or `queued`. That is a LIVE tool,
+        and reconciling it would erase a genuine in-flight execution. The join to `scans`
+        restricts the sweep to terminal parents only.
+      * a tool_run whose scan finished within `grace_seconds`. Scan finalization and a
+        tool's own result submission are separate writes, so a result legitimately in
+        flight can land just AFTER its scan goes terminal; without the grace period this
+        statement would race that write and mark a tool failed that was about to report
+        success. The window is keyed off the SCAN's completion, not the tool's start, so a
+        legitimately long tool is never penalised for its runtime.
+      * any row that is not `running`. A tool that already reported completed/partial/
+        failed/skipped_unauthorized is authoritative and is never rewritten.
+
+    IDEMPOTENT AND RACE-FREE by construction: it is ONE conditional UPDATE whose source
+    state is `status = 'running'`, so a second pass matches nothing, and two reapers running
+    concurrently cannot both claim the same row -- InnoDB serialises the row locks and the
+    loser's WHERE no longer matches. No row is deleted and no history is discarded; the only
+    mutation is running -> failed plus an explanatory reason.
+
+    Returns how many rows were reconciled.
+    """
+    # COALESCE(completed_at, started_at): a scan reaped or cancelled before it ever stamped
+    # `completed_at` would otherwise have a NULL on the left of the comparison, which is
+    # never true in SQL -- so its orphans would be immortal, exactly the bug this fixes.
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=int(grace_seconds))
+    reason = (
+        f"orphaned: parent scan reached a terminal status more than {int(grace_seconds)}s "
+        "ago while this tool run was still 'running'; no result was ever recorded for it"
+    )
+    placeholders = ", ".join(f":st{i}" for i in range(len(TERMINAL_SCAN_STATUSES)))
+    params: dict = {
+        "new_status": _ORPHAN_TOOLRUN_STATUS,
+        "reason": reason,
+        "cutoff": cutoff,
+    }
+    params.update({f"st{i}": s for i, s in enumerate(TERMINAL_SCAN_STATUSES)})
+    result = await db.execute(
+        text(
+            "UPDATE tool_runs tr JOIN scans s ON s.id = tr.scan_id "
+            "SET tr.status = :new_status, "
+            # Stamped so the row stops reporting an ever-growing duration in the UI, which
+            # renders elapsed time from started_at for as long as completed_at is NULL.
+            "    tr.completed_at = COALESCE(tr.completed_at, now(6)), "
+            # Never overwrite a message the tool itself recorded -- that one is closer to
+            # the truth than anything this sweep can say.
+            "    tr.error_message = COALESCE(tr.error_message, :reason) "
+            "WHERE tr.status = 'running' "
+            f"  AND s.status IN ({placeholders}) "
+            "  AND COALESCE(s.completed_at, s.started_at) < :cutoff"
+        ),
+        params,
+    )
+    reconciled = result.rowcount or 0
+    await db.commit()
+    return reconciled
 
 
 async def _finalize_status(
@@ -150,15 +302,18 @@ async def _finalize_status(
     owner's scan with its own stale outcome. On success the token is cleared -- a terminal
     scan is owned by nobody. The token is REQUIRED: there is deliberately no way to disable
     the fence, so a caller cannot silently perform an unowned terminal write."""
+    # Phase 0 MySQL cutover: dropped the `::uuid` cast (Postgres-only cast syntax; the
+    # column is CHAR(36) now -- see core/db_types.GUID -- and a plain string bind compares
+    # fine) and RETURNING (MySQL has none) in favor of `result.rowcount`, exact here because
+    # of CLIENT_FOUND_ROWS (core/db.py's _mysql_connect_args).
     result = await db.execute(
         text(
             "UPDATE scans SET status = :st, completed_at = now(), execution_token = NULL "
-            "WHERE id = :id AND status = 'running' AND execution_token = :tok ::uuid "
-            "RETURNING id"
+            "WHERE id = :id AND status = 'running' AND execution_token = :tok"
         ),
         {"st": new_status, "id": str(scan.id), "tok": str(execution_token)},
     )
-    won = result.first() is not None
+    won = result.rowcount == 1
     await db.commit()
     await db.refresh(scan)
     return won
@@ -232,10 +387,15 @@ async def run_scan(
         logger.info("scan.skip_not_claimable scan=%s status=%s", scan.id, scan.status)
         return
 
-    await db.execute(
-        text("SELECT set_config('app.current_workspace_id', :wid, false)"),
-        {"wid": str(scan.workspace_id)},
-    )
+    # Phase 0 MySQL cutover: bind workspace-isolation context (tenancy.py). scans
+    # itself stays deliberately EXEMPT from the auto-filter (see tenancy.EXEMPT_TABLES);
+    # this bootstraps it for every table this scan run touches from here on.
+    # AUDIT-004 classification: INTENTIONALLY PERSISTENT. This is the ENTRY POINT of a single
+    # scan's Celery task: it bootstraps the tenancy context for everything the run touches
+    # from here on, and the task processes exactly ONE workspace (unlike the retention and
+    # schedule sweeps, which loop over tenants and are therefore scoped). The context dies
+    # with the task's Context; there is no subsequent caller in this Task to leak into.
+    tenancy.bind_workspace(scan.workspace_id)
     # status='running' + started_at were set atomically by _claim_scan above.
 
     scan_started = time.monotonic()
@@ -257,6 +417,70 @@ async def run_scan(
         target_row = await db.get(Target, scan.target_id)
         if target_row is None:
             raise ValueError("Target disappeared")
+
+        # MBS.SC -- DERIVE THIS SCAN'S NETWORK POLICY from persisted authorization,
+        # then run the ENTIRE pipeline inside it (see the `with` block below).
+        #
+        # A public target yields a public-only policy, which authorizes no private range
+        # whatever the global on-prem settings say -- so an ordinary scan is unaffected by
+        # this change. A private target must resolve to an ACTIVE site owned by THIS scan's
+        # workspace, or the scan is refused here, before any tool runs.
+        #
+        # `network_zone`/`site_id` come from the TARGET row (persisted), never from
+        # scan.config, so a caller who could influence the scan request cannot promote a
+        # target into a private zone it was not registered in.
+        from apps.api.modules.private_sites import service as _sites_service
+        from apps.api.scanner_engine import net_policy as _net_policy
+
+        target_zone = getattr(target_row, "network_zone", "public") or "public"
+        target_site_id = getattr(target_row, "site_id", None)
+        try:
+            scan_policy = await _sites_service.build_scan_network_policy(
+                db,
+                workspace_id=scan.workspace_id,
+                scan_id=scan.id,
+                network_zone=target_zone,
+                site_id=target_site_id,
+            )
+        except _sites_service.PrivateSiteNotAuthorized as exc:
+            # A refusal here is a hard, explicit failure with a stable reason code -- never
+            # a downgrade to "scan it as public", which would silently send an internal
+            # engagement out to the internet.
+            logger.warning(
+                "scan.private_authz_denied scan=%s workspace=%s site=%s reason=%s",
+                scan.id, scan.workspace_id, target_site_id, exc.reason,
+                extra={"event": "scan.private_authz_denied", "scan_id": str(scan.id),
+                       "workspace_id": str(scan.workspace_id), "reason": exc.reason},
+            )
+            raise ValueError(f"Private scanning refused ({exc.reason}): {exc.message}")
+
+        # BIND the policy for the rest of this scan. A ContextVar token (rather than a
+        # `with` block) avoids reindenting the entire pipeline below, and the matching
+        # reset lives in this function's `finally` -- so the policy cannot outlive the
+        # scan even if a tool raises. Each asyncio task/thread gets its own copy of the
+        # context, which is what keeps two concurrent scans in one worker isolated.
+        _policy_token = _net_policy.set_policy(scan_policy)
+
+        # DERIVED-SCOPE RESOLUTION CACHE. Same lifetime as the policy above, and bound the
+        # same way (a token + the `finally` below) rather than a `with` block, for the same
+        # reason: it avoids reindenting the entire pipeline. Memoizes the DNS lookups that
+        # `scope_guard.host_in_scope` performs per (finding x authorized host) -- both
+        # successes and failures -- which is a pure performance boundary and changes no
+        # scope verdict. Tied to the scan, not the process, so a name is re-resolved fresh
+        # on the next scan. See scope_guard.resolution_cache_scope.
+        from apps.api.scanner_engine import scope_guard as _scope_guard
+
+        _scope_cache_cm = _scope_guard.resolution_cache_scope()
+        _scope_cache_cm.__enter__()
+        logger.info(
+            "scan.policy_bound scan=%s zone=%s site=%s cidrs=%d",
+            scan.id, scan_policy.network_zone, scan_policy.site_id,
+            len(scan_policy.authorized_cidrs),
+            extra={"event": "scan.policy_bound", "scan_id": str(scan.id),
+                   "workspace_id": str(scan.workspace_id),
+                   "network_zone": scan_policy.network_zone,
+                   "site_id": str(scan_policy.site_id) if scan_policy.site_id else None},
+        )
 
         # SSRF re-check at execution time (defense in depth): the target may
         # predate the creation-time guard, or its DNS may now resolve to a
@@ -410,6 +634,27 @@ async def run_scan(
         return
     except Exception as exc:
         _duration = time.monotonic() - scan_started
+        # ROLL BACK FIRST. The exception may be a failed flush (observed: a duplicate
+        # vulnerability_evidence PK during ingest), which leaves this Session in
+        # PendingRollbackError state -- every subsequent statement on it, and even a lazy
+        # attribute load like `scan.id`, re-raises until the transaction is rolled back.
+        # Without this, `_finalize_status` below crashed instead of marking the scan failed,
+        # so the task died and the scan sat 'running' until the reaper recovered it hours
+        # later. Rolling back discards only the failed, uncommitted ingest work (already lost
+        # anyway); the atomic terminal write is its own statement and is unaffected. Best-
+        # effort: if the connection itself is gone, the terminal write below will surface
+        # that, and the reaper remains the final backstop.
+        try:
+            await db.rollback()
+            # rollback() EXPIRES every ORM object on the session, so `scan.status` /
+            # `scan.execution_token` below and `_finalize_status`'s own `db.refresh(scan)`
+            # would otherwise trigger a lazy reload at an awkward moment. Re-load `scan`
+            # explicitly against the now-clean session so those reads (and the revocation
+            # check) see current, committed state -- which for a requeue is exactly the
+            # cleared token they must observe.
+            scan = await _load_scan(db, scan_id)
+        except Exception:  # noqa: BLE001 -- rollback/reload is recovery; never mask `exc`
+            logger.debug("scan.finalize_rollback_failed scan_id=%s", scan_id, exc_info=True)
         # Atomic terminal write: only running -> failed, and only while WE still own it. If a
         # cancel landed concurrently (Phase 1.5), we lose the race and MUST NOT overwrite
         # 'cancelled'; if ownership was revoked, we lose it too and must not report anything.
@@ -447,6 +692,29 @@ async def run_scan(
         )
         await _publish_scan_completed(db, scan)
         raise
+
+    finally:
+        # MBS.SC: the per-scan network policy must not outlive the scan, on ANY exit path
+        # -- success, failure, cancellation or ExecutionRevoked. A leaked policy in a
+        # long-lived prefork worker process would carry one tenant's private authorization
+        # into whatever scan ran next in the same context, which is precisely the
+        # cross-tenant leak this whole change exists to prevent. Guarded because the token
+        # is only created after the claim succeeds.
+        try:
+            _net_policy.reset_policy(_policy_token)
+        except (NameError, ValueError, LookupError):
+            # NameError: we failed before the policy was bound (e.g. the claim was lost).
+            # ValueError/LookupError: the token belongs to a different Context (the reset
+            # is then unnecessary -- that context is already gone).
+            pass
+        # The scope-resolution cache must not outlive the scan either: a stale address for
+        # an authorized host carried into the NEXT scan would be a scope decision made on
+        # data this scan never verified. Guarded identically -- the cache is only entered
+        # after the claim succeeds.
+        try:
+            _scope_cache_cm.__exit__(None, None, None)
+        except (NameError, ValueError, LookupError):
+            pass
 
     _duration = time.monotonic() - scan_started
     # Atomic terminal write: only running -> terminal, so a scan cancelled mid-run (or
@@ -489,7 +757,7 @@ async def run_scan(
 
 async def _emit_scan_notification(db: AsyncSession, scan: Scan) -> None:
     """Best-effort in-app notification for a finished scan -- a failure here must
-    never affect the scan outcome. Runs with the workspace RLS GUC already set."""
+    never affect the scan outcome. Runs with the workspace already bound."""
     try:
         from apps.api.modules.notifications.service import notify_scan_finished
 
@@ -870,6 +1138,93 @@ async def _graph_findings(db: AsyncSession, scan: Scan) -> list:
     ]
 
 
+async def _maybe_capture_screenshot(
+    db: AsyncSession,
+    *,
+    vuln,
+    matched_at: str | None,
+    tool_run_id,
+    target_type: str,
+    target_value: str,
+    extra_authorized_hosts,
+) -> None:
+    """Capture and persist a screenshot of a finding's affected URL. BEST EFFORT.
+
+    Uses the EXISTING evidence model -- one Evidence row with evidence_type='screenshot'
+    (a free-form varchar; no schema change) linked to this vulnerability through the
+    EXISTING VulnerabilityEvidence M:N table. That gives the report a per-FINDING image
+    rather than the per-tool-run log excerpt every finding currently shares.
+
+    Every failure mode -- feature off, ineligible URL, blocked scope/SSRF, browser missing,
+    timeout, oversize image, storage outage -- leaves the finding, its existing evidence and
+    the scan completely untouched. Nothing is written unless a real image was captured and
+    stored, so no empty or placeholder screenshot evidence can ever exist."""
+    from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+    from apps.api.modules.vulnerabilities.models import VulnerabilityEvidence
+    from apps.api.scanner_engine import screenshot as screenshot_mod
+
+    if not screenshot_mod.is_enabled():
+        return
+
+    eligibility = screenshot_mod.check_eligibility(
+        matched_at,
+        vuln.severity,
+        target_type,
+        target_value,
+        extra_authorized_hosts=extra_authorized_hosts,
+    )
+    if not eligibility.eligible:
+        logger.debug(
+            "screenshot.skipped vuln=%s reason=%s", vuln.id, eligibility.reason
+        )
+        return
+
+    try:
+        image = await screenshot_mod.capture_screenshot(
+            eligibility.url,
+            target_type,
+            target_value,
+            extra_authorized_hosts=extra_authorized_hosts,
+        )
+    except Exception:  # noqa: BLE001 -- capture_screenshot already swallows, belt and braces
+        logger.warning("screenshot.capture_raised vuln=%s", vuln.id, exc_info=True)
+        return
+    if not image:
+        return  # failure already logged; never fabricate evidence
+
+    try:
+        # Storage is blocking boto3 -> off the event loop, like the raw-output path.
+        storage_uri, checksum = await asyncio.to_thread(
+            evidence_store.store_screenshot, vuln.id, image
+        )
+    except Exception:  # noqa: BLE001 -- a storage outage must not fail the scan
+        # Unlike the raw-output path this writes NO sentinel row -- it returns, so the finding
+        # simply has no screenshot. Counted so the two failure modes stay distinguishable.
+        record_evidence_processed("screenshot", "storage_failed")
+        logger.warning("screenshot.store_failed vuln=%s", vuln.id, exc_info=True)
+        return
+
+    shot = Evidence(
+        tool_run_id=tool_run_id,
+        evidence_type="screenshot",
+        storage_uri=storage_uri,
+        checksum=checksum,
+    )
+    db.add(shot)
+    await db.flush()  # need shot.id for the link row
+
+    # Idempotent link, mirroring ingest_finding: a re-scan that recaptures the same page
+    # writes the same (vulnerability, evidence) pair rather than raising a duplicate key.
+    stmt = mysql_insert(VulnerabilityEvidence.__table__).values(
+        vulnerability_id=vuln.id, evidence_id=shot.id, tool_run_id=tool_run_id
+    )
+    stmt = stmt.on_duplicate_key_update(tool_run_id=VulnerabilityEvidence.tool_run_id)
+    await db.execute(stmt)
+    record_evidence_processed("screenshot", "stored")
+    logger.info("screenshot.captured vuln=%s bytes=%d uri=%s", vuln.id, len(image), storage_uri)
+
+
 async def _run_exploitation_phase(db: AsyncSession, scan: Scan, target_row, roe, base_step_no: int) -> list:
     """Deterministic, gated exploitation of this scan's confirmed findings using
     curated modules. Non-destructive by construction. Every attempt is triple-gated:
@@ -935,7 +1290,7 @@ async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:
 
     FAIL-SOFT: any failure (no AI key, provider down, parse/rate-limit error)
     logs a warning and leaves the deterministic mappings intact -- it must never
-    change the scan status or abort. Runs with the workspace RLS GUC already set."""
+    change the scan status or abort. Runs with the workspace already bound."""
     try:
         import asyncio
 
@@ -1027,6 +1382,100 @@ async def _synthesize_attack_narrative(db: AsyncSession, scan: Scan) -> None:
         logger.warning("scan.attack_narrative_failed scan=%s", scan.id, exc_info=True)
 
 
+# How often a still-running tool reports that it is alive. Long enough not to spam a
+# log, short enough that `docker compose logs -f worker` never looks frozen.
+TOOL_PROGRESS_INTERVAL_SECONDS = 30
+
+
+async def _stamp_heartbeat(db: AsyncSession, scan_id: uuid.UUID, execution_token) -> None:
+    """Refresh `scans.last_heartbeat_at` -- the liveness signal the orphan reaper keys on.
+
+    BEST-EFFORT BY DESIGN, and never allowed to affect the scan: a failed or slow heartbeat
+    must not fail a scan that is otherwise running fine. It is bounded (so a stalled DB
+    cannot wedge the progress loop that calls it) and every exception is swallowed. Missing
+    a few beats is harmless -- scan_stale_heartbeat_seconds is ~30 beats wide precisely so
+    transient blips cannot cause a false reap.
+
+    FENCED on execution_token, like every other ownership-sensitive write here: an executor
+    that was superseded by the graceful-shutdown requeue must not keep a scan looking alive
+    on behalf of the new owner. A token-less caller (direct `run_scan`) stamps unfenced,
+    matching how the rest of this module treats that case."""
+    try:
+        if execution_token is None:
+            sql = "UPDATE scans SET last_heartbeat_at = now(6) WHERE id = :id AND status = 'running'"
+            params = {"id": str(scan_id)}
+        else:
+            sql = (
+                "UPDATE scans SET last_heartbeat_at = now(6) "
+                "WHERE id = :id AND status = 'running' AND execution_token = :tok"
+            )
+            params = {"id": str(scan_id), "tok": str(execution_token)}
+        # now(6), not now(): the column is DATETIME(6) and bare now() would truncate to whole
+        # seconds (see db_types.UTCDateTime). Harmless for a staleness comparison, but it
+        # keeps this consistent with the precision the schema actually declares.
+        await asyncio.wait_for(
+            _commit_heartbeat(db, sql, params), timeout=HEARTBEAT_WRITE_TIMEOUT_SECONDS
+        )
+    except Exception:  # noqa: BLE001 -- liveness reporting must never break the scan
+        logger.debug("scan.heartbeat_failed scan=%s", scan_id, exc_info=True)
+
+
+async def _commit_heartbeat(db: AsyncSession, sql: str, params: dict) -> None:
+    await db.execute(text(sql), params)
+    await db.commit()
+
+
+# How long a single heartbeat UPDATE may take before it is abandoned. Bounds the progress
+# loop, nothing else -- it is not a scan or tool timeout.
+HEARTBEAT_WRITE_TIMEOUT_SECONDS = 10
+
+
+async def _run_with_progress(
+    runner, scan, target_value, config, scoped_prior, started: float,
+    db: AsyncSession | None = None, execution_token=None,
+):
+    """Run a tool while emitting a heartbeat, then return its RawToolOutput.
+
+    Without this the log goes silent between `tool.start` and `tool.done`. That is
+    fine for subfinder (3s) but not for the fan-out tools: a real scan showed ffuf
+    at 550s and still going, with nothing whatsoever logged in between -- from the
+    outside indistinguishable from a hung worker, and giving no clue as to WHY it
+    was slow. The heartbeat makes elapsed time visible as it accumulates.
+
+    Purely observational -- it only ever logs, so it cannot change the outcome of the
+    tool it reports on. The tool itself runs as a task so that a cancellation of THIS
+    coroutine (scan revoked, worker warm shutdown) propagates into the tool instead of
+    orphaning a running subprocess."""
+    task = asyncio.ensure_future(runner.run(target_value, config, scoped_prior))
+    ticks = 0
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=TOOL_PROGRESS_INTERVAL_SECONDS)
+            if done:
+                return task.result()
+            ticks += 1
+            elapsed = time.monotonic() - started
+            logger.info(
+                "tool.progress scan=%s tool=%s elapsed=%.0fs target=%s still_running",
+                scan.id, runner.name, elapsed, target_value,
+                extra={"event": "tool.progress", "scan_id": str(scan.id), "tool": runner.name,
+                       "elapsed_s": round(elapsed, 1), "ticks": ticks},
+            )
+            # LIVENESS. This tick is what tells the orphan reaper the executor is alive, so a
+            # legitimately long tool (a 3-5h nuclei/ffuf run) is never mistaken for a dead
+            # worker. Crucially this loop does NOT await the subprocess -- it awaits
+            # asyncio.wait(..., timeout=...) on a separate Task, which returns on the timeout
+            # no matter what the tool is doing -- so the beat keeps landing for the tool's
+            # entire lifetime (verified against a real long-running subprocess, not assumed).
+            if db is not None:
+                await _stamp_heartbeat(db, scan.id, execution_token)
+    finally:
+        # Covers cancellation and any unexpected exit from the loop. A no-op once the
+        # task has completed; without it a revoked scan could leave the tool running.
+        if not task.done():
+            task.cancel()
+
+
 async def _run_single_tool(
     db: AsyncSession,
     scan: Scan,
@@ -1052,9 +1501,18 @@ async def _run_single_tool(
     # scope; out-of-scope or indeterminable-host findings are recorded as observations
     # (see the in_scope tagging below) but NEVER actively probed -- FAIL CLOSED. The
     # primary target is always probed: it is passed as target_value, not a finding.
+    #
+    # Computed once, unconditionally (cheap: a no-op for ip_range targets, and the tagging
+    # loop below wants the exact same set regardless of the kill-switch) and reused by both
+    # the gating filter and the tagging loop -- both must agree on what counts as in-scope,
+    # and computing it twice would mean two separate rounds of live DNS resolution for the
+    # same hosts.
+    extra_scope_hosts = scope_guard.derived_scope_roots(target_type, target_value, prior_findings)
     scoped_prior = prior_findings
     if get_settings().scan_enforce_derived_scope:
-        scoped_prior, out_of_scope = scope_guard.partition_in_scope(target_type, target_value, prior_findings)
+        scoped_prior, out_of_scope = scope_guard.partition_in_scope(
+            target_type, target_value, prior_findings, extra_authorized_hosts=extra_scope_hosts
+        )
         if out_of_scope:
             logger.info(
                 "scan.out_of_scope_skipped scan=%s tool=%s blocked=%d hosts=%s",
@@ -1096,7 +1554,10 @@ async def _run_single_tool(
     # A crash/timeout in the runner is a failed tool run, NOT a failed scan: record
     # it (with evidence of the exception) and let the pipeline continue.
     try:
-        raw = await runner.run(target_value, config, scoped_prior)
+        raw = await _run_with_progress(
+            runner, scan, target_value, config, scoped_prior, started,
+            db=db, execution_token=execution_token,
+        )
     except Exception as exc:
         tool_run.status = "failed"
         tool_run.completed_at = datetime.now(timezone.utc)
@@ -1114,6 +1575,13 @@ async def _run_single_tool(
         return [], "failed"
 
     tool_run.command_hash = hashlib.sha256(raw.command.encode()).hexdigest()
+    # PROMPT 10: the RECONSTRUCTIBLE command, not just its digest -- see models.py's
+    # ToolRun.effective_command docstring for why the hash alone cannot answer "what
+    # arguments actually ran". `raw.command` is built entirely from scan.config tuning
+    # knobs, resolved targets/ports and tool flags; no runner ever receives a credential
+    # as a CLI argument (see tool_runners/*.py), so this is safe to persist verbatim.
+    tool_run.effective_command = raw.command
+    tool_run.timed_out = bool(getattr(raw, "timed_out", False))
     tool_run.exit_code = raw.exit_code
 
     # Every finding must trace to raw evidence (blueprint §1) -- store the raw
@@ -1130,9 +1598,13 @@ async def _run_single_tool(
     storage_failed = False
     try:
         storage_uri, checksum = evidence_store.store_raw_output(tool_run.id, blob)
+        record_evidence_processed("raw_output", "stored")
     except Exception as exc:  # noqa: BLE001 -- storage outage must not fail the scan
         storage_failed = True
         storage_uri, checksum = f"unavailable://evidence-storage-failed/{tool_run.id}", ""
+        # Prompt 33: make the fail-soft path VISIBLE. It was previously a log line only, yet
+        # it suppresses corroboration in every report that reads the resulting sentinel row.
+        record_evidence_processed("raw_output", "storage_failed")
         logger.warning(
             "tool.evidence_store_failed scan=%s tool=%s error=%s",
             scan.id, runner.name, exc, exc_info=True,
@@ -1189,7 +1661,24 @@ async def _run_single_tool(
     for finding in findings:
         finding.metadata = {
             **(finding.metadata or {}),
-            "in_scope": scope_guard.finding_in_scope(target_type, target_value, finding),
+            "in_scope": scope_guard.finding_in_scope(
+                target_type, target_value, finding, extra_authorized_hosts=extra_scope_hosts
+            ),
+            # SOURCE PROVENANCE (Prompt E): which tool run actually discovered this asset.
+            # Stamped HERE, not in the runners, because this is the only place the tool
+            # identity is authoritative -- a runner cannot be trusted to label itself, and six
+            # of the twelve did not (httpx/naabu wrote no source at all).
+            #
+            # WHY NOT the existing `source` key. It is already taken, and it means two
+            # DIFFERENT things depending on the runner: katana/ffuf/arjun/whatweb use it for
+            # the discovering tool, while subfinder uses it for the upstream OSINT provider
+            # the subdomain came from ("crtsh", ...). Overwriting it would destroy subfinder's
+            # provenance AND break _web.param_discovery_targets, which selects DAST fuzz
+            # targets with `metadata.get("source") == "arjun"`. These keys are therefore
+            # additive and unambiguous, and every existing consumer is untouched.
+            "discovered_by_tool": runner.name,
+            "discovered_by_tool_version": runner.version,
+            "discovered_in_tool_run": str(tool_run.id),
         }
 
     for finding in findings:
@@ -1207,20 +1696,17 @@ async def _run_single_tool(
     # CVSS by asset criticality, the Compliance Engine maps the finding's category
     # to framework controls, and the Attack Engine maps it to MITRE ATT&CK
     # techniques + Cyber Kill Chain phases (blueprint §7 steps 7 & later).
-    for vuln_finding in vuln_findings:
-        asset_id = await _resolve_asset_id(db, scan, vuln_finding.matched_at)
-        vuln = await ingest_finding(
-            db,
-            project_id=scan.project_id,
-            scan_id=scan.id,
-            finding=vuln_finding,
-            tool_run_id=tool_run.id,
-            evidence_id=evidence.id,
-            asset_id=asset_id,
-        )
-        await upsert_risk_score(db, vuln.id, vuln.cvss_score, criticality)
-        await sync_mappings(db, vuln.id, vuln.category)
-        await sync_attack_mappings(db, vuln.id, vuln.category, vuln_finding.metadata)
+    await ingest_vulnerability_findings(
+        db,
+        scan=scan,
+        vuln_findings=vuln_findings,
+        tool_run_id=tool_run.id,
+        evidence_id=evidence.id,
+        criticality=criticality,
+        target_type=target_type,
+        target_value=target_value,
+        extra_scope_hosts=extra_scope_hosts,
+    )
 
     tool_run.status = status
     tool_run.completed_at = datetime.now(timezone.utc)
@@ -1237,17 +1723,234 @@ async def _run_single_tool(
     return findings, status
 
 
+async def ingest_vulnerability_findings(
+    db: AsyncSession,
+    *,
+    scan: Scan,
+    vuln_findings: list,
+    tool_run_id: uuid.UUID,
+    evidence_id: uuid.UUID,
+    criticality: str,
+    target_type: str,
+    target_value: str,
+    extra_scope_hosts=None,
+    capture_screenshots: bool = True,
+) -> int:
+    """THE security pipeline for parsed vulnerability findings. Returns how many were ingested.
+
+    Extracted from `_run_single_tool` verbatim so that the ISOLATED SCANNER PATH can reuse
+    it instead of growing a second, simpler one. That mattered concretely: the remote
+    worker path persisted nothing at all, and the obvious repair -- writing vulnerability
+    rows directly from the manager endpoint -- would have produced findings with no risk
+    score, no compliance mapping and no ATT&CK mapping, i.e. rows that look ingested and
+    silently skip four engines. One function, called from both paths, makes that class of
+    divergence impossible rather than merely discouraged.
+
+    Order is deliberate and load-bearing: ingest (dedup + lifecycle) must come first
+    because everything after keys off the resulting `vuln.id`, and the screenshot is last
+    because it is best-effort and must never hold up the rows that matter.
+
+    `capture_screenshots=False` for the manager path: screenshot capture drives a browser
+    at the finding's URL, which is EXECUTION-PLANE work. Doing it from the control plane
+    would have the manager make outbound connections to customer targets -- exactly the
+    egress the MBS.SC segmentation exists to prevent (scanner-manager is not on
+    mbs-scan-egress). The findings, their risk/compliance/ATT&CK mappings and their raw
+    evidence are all unaffected; only the optional screenshot is skipped.
+    """
+    for vuln_finding in vuln_findings:
+        asset_id = await _resolve_asset_id(db, scan, vuln_finding.matched_at)
+        vuln = await ingest_finding(
+            db,
+            project_id=scan.project_id,
+            scan_id=scan.id,
+            finding=vuln_finding,
+            tool_run_id=tool_run_id,
+            evidence_id=evidence_id,
+            asset_id=asset_id,
+        )
+        await upsert_risk_score(db, vuln.id, vuln.cvss_score, criticality)
+        await sync_mappings(db, vuln.id, vuln.category)
+        await sync_attack_mappings(db, vuln.id, vuln.category, vuln_finding.metadata)
+        # Deterministic remediation guidance, written at the SAME boundary as the risk,
+        # compliance and ATT&CK enrichments above. Before this the `remediations` table was
+        # only ever written by the on-demand AI endpoint, so a completed scan produced zero
+        # rows and every finding in the report read "no remediation available". A catalogue
+        # lookup with no reviewed entry writes nothing -- see remediation_service for why an
+        # unsupported finding type gets no row rather than filler text.
+        await sync_remediation(db, vuln.id, vuln.fingerprint, vuln.category)
+        if capture_screenshots:
+            # Visual evidence for non-info web findings (best effort -- never fails the scan).
+            await _maybe_capture_screenshot(
+                db,
+                vuln=vuln,
+                matched_at=vuln_finding.matched_at,
+                tool_run_id=tool_run_id,
+                target_type=target_type,
+                target_value=target_value,
+                extra_authorized_hosts=extra_scope_hosts,
+            )
+    return len(vuln_findings)
+
+
+# Asset types that can represent a web location a finding was observed at, in the order
+# they are preferred when several tiers could match. `http_service` first because it is
+# what the pre-existing exact-match tier used, so its results are bit-for-bit unchanged.
+_WEB_ASSET_TYPES = ("http_service", "url")
+
+
+def _finding_origin(location: str) -> str | None:
+    """`scheme://host[:port]` for an http(s) URL, or None when `location` is not one.
+
+    The origin is derived from the ALREADY-NORMALIZED url (see `normalize_url`), so the
+    default port is folded exactly the way asset values were folded when they were
+    stored -- `https://h:443/x` and `https://h/x` produce the same origin, while an
+    explicit NON-default port is preserved and therefore never collapses into it.
+
+    Only the authority is kept. Path, query and fragment are dropped deliberately: an
+    injected payload lives in the query (`?id=1'` / `?x=|dir`), and it is precisely
+    because those bytes are attacker-controlled that they must not participate in
+    choosing which asset row a finding is attributed to."""
+    try:
+        parts = urlsplit(normalize_url(location))
+    except ValueError:
+        return None
+    # `normalize_url` lowercases the scheme and authority and strips a default port, but
+    # returns its input untouched for anything that is not an http(s) URL -- so re-check
+    # rather than assume the parse succeeded.
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    # Userinfo is credentials, not identity: `https://user@h/` and `https://h/` are the
+    # same origin, and keeping it would let a credential in the finding's URL prevent a
+    # match. `normalize_url` leaves it in place, so strip it here.
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    if not netloc:
+        return None
+    return f"{parts.scheme}://{netloc}"
+
+
+async def _origin_index(db: AsyncSession, scan: Scan) -> dict[str, uuid.UUID | None]:
+    """Map `scheme://host[:port]` -> the id of the single asset representing that origin,
+    or None where the origin is ambiguous. Built once per ingest batch and cached on the
+    Scan instance.
+
+    WHY CACHED. This runs once per FINDING during ingestion, and the fallback it serves
+    cannot be an indexed lookup: `uq_assets_target_type_value` is keyed on a hash of the
+    WHOLE value, so there is no index that answers "assets whose origin is X" -- deriving
+    the origin requires parsing each value in Python. Re-reading this target's assets per
+    finding would be a 698 x 853 row scan for the scan this fix was written against. One
+    bounded query per batch, keyed by target_id (an indexed column), makes it 853 rows
+    total instead, and no schema change is needed to get there.
+
+    AN ASSET THAT *IS* THE ORIGIN OUTRANKS ONE THAT MERELY SHARES IT. This distinction is
+    the whole difference between the fix working and not working. `https://reg.ftu.ac.th`
+    and `https://reg.ftu.ac.th/registrar/home.asp` are both http_service rows sharing one
+    origin, but they are not interchangeable candidates: the first IS the origin, the
+    second is one page that happens to live under it. Treating that as a tie left all 274
+    critical/high findings on that host unattributed even though the right row was sitting
+    in the inventory. So each origin is resolved in two ranks -- assets equal to the origin
+    first, assets merely under it second -- and a lower rank never competes with a higher.
+
+    AMBIGUITY WITHIN A RANK IS RECORDED, NOT RESOLVED. When two assets of the same type
+    AND the same rank claim one origin -- e.g. `https://www.google.com/accounts/...` and
+    `https://www.google.com/a/...`, two deep pages, neither of which is the origin -- the
+    entry is None and the caller returns None. Picking one would be a coin flip, and
+    attributing a critical finding to the wrong row is worse than leaving it unattributed.
+
+    The one benign tie is `https://ftu.ac.th` vs `https://ftu.ac.th/`, which are the SAME
+    location in two spellings and both rank-0. Collapsing them on the normalized value
+    makes that a single candidate rather than a false conflict."""
+    cached = getattr(scan, "_mbs_origin_index", None)
+    if cached is not None:
+        return cached
+
+    index: dict[str, uuid.UUID | None] = {}
+    # (origin -> (asset_type, rank)) of whatever currently owns the entry, so a less
+    # preferred type or a lower rank never overwrites or falsely invalidates it.
+    claimed_by: dict[str, tuple[str, int]] = {}
+    # (origin, rank) -> the normalized value that claimed it, so two spellings of one
+    # location ("https://h" / "https://h/") are not mistaken for two rival assets.
+    claimed_value: dict[tuple[str, int], str] = {}
+
+    for asset_type in _WEB_ASSET_TYPES:
+        rows = await db.execute(
+            select(Asset.id, Asset.value).where(
+                Asset.target_id == scan.target_id,
+                Asset.asset_type == asset_type,
+            )
+        )
+        for asset_id, value in rows:
+            origin = _finding_origin(value)
+            if origin is None:
+                continue
+            normalized = normalize_url(value)
+            # rank 0: this asset IS the origin (bare, or with only a "/" path).
+            # rank 1: this asset merely lives under the origin.
+            rank = 0 if normalized.rstrip("/") == origin else 1
+            current = claimed_by.get(origin)
+            if current is None or rank < current[1]:
+                claimed_by[origin] = (asset_type, rank)
+                claimed_value[(origin, rank)] = normalized
+                index[origin] = asset_id
+            elif current == (asset_type, rank) and index[origin] != asset_id:
+                # Same type, same rank: a real rival UNLESS it is the identical location
+                # spelled differently, in which case the entry already points at it.
+                if claimed_value.get((origin, rank)) != normalized:
+                    index[origin] = None  # genuine tie -> fail closed
+
+    scan._mbs_origin_index = index
+    return index
+
+
 async def _resolve_asset_id(db: AsyncSession, scan: Scan, matched_at: str | None) -> uuid.UUID | None:
-    """Best-effort: tie a vulnerability to the asset it was observed at, by
-    matching the finding's location against an http_service asset for this
-    target. Returns None if no clean match (asset_id is nullable)."""
+    """Best-effort: tie a vulnerability to the asset it was observed at. Returns None if
+    no clean match (asset_id is nullable, and an unlinked finding is strictly better than
+    a misattributed one).
+
+    Resolution is HIERARCHICAL -- the first tier that produces a single answer wins:
+
+      1. the original exact `http_service` match, byte-for-byte as it behaved before, so
+         every already-correct linkage is reproduced and none is reassigned;
+      2. the same exact match against a `url` asset, which is the type katana/ffuf/arjun
+         actually record deep endpoints as;
+      3. the finding's ORIGIN (`scheme://host[:port]`) against the origin of an existing
+         asset of this target.
+
+    Tier 3 is what this function was missing. A DAST finding is reported at the URL the
+    payload was delivered to -- `.../studentset.asp?cmd=1&order=X&campusid=1'...` -- which
+    is equal to no stored asset value, because the stored value is the clean endpoint and
+    the finding's differs by the injected bytes. 362 critical/high findings on one scan
+    were therefore left unlinked while the asset for their origin sat in the inventory.
+
+    SAFETY. Every tier is constrained to `Asset.target_id == scan.target_id`, so no
+    cross-target attribution is possible, and `select(Asset)` carries the tenancy
+    auto-filter (assets are TENANT_SCOPED via project_id), so no workspace boundary can be
+    crossed. The origin comparison keeps scheme, host AND explicit port distinct -- it is
+    never a hostname-only match -- and an origin claimed by two assets resolves to None
+    rather than a guess."""
     if not matched_at:
         return None
-    asset = await db.scalar(
+
+    # Tiers 1 and 2: exact value match, indexed by (target_id, asset_type, value_hash).
+    # `.rstrip("/")` is preserved from the original implementation -- dropping it would
+    # change which rows tier 1 already matches, which is the one thing this must not do.
+    exact = await db.scalar(
         select(Asset).where(
             Asset.target_id == scan.target_id,
-            Asset.asset_type == "http_service",
+            Asset.asset_type.in_(_WEB_ASSET_TYPES),
             Asset.value == matched_at.rstrip("/"),
+        ).order_by(
+            # Deterministic, and `http_service` before `url`, so tier 1 keeps precedence
+            # over tier 2 when a target stores the same value under both types.
+            case({"http_service": 0, "url": 1}, value=Asset.asset_type, else_=2),
+            Asset.first_seen,
+            Asset.id,
         )
     )
-    return asset.id if asset else None
+    if exact is not None:
+        return exact.id
+
+    # Tier 3: origin fallback.
+    origin = _finding_origin(matched_at)
+    if origin is None:
+        return None
+    return (await _origin_index(db, scan)).get(origin)

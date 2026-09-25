@@ -3,13 +3,13 @@
     {
       "name": "DS_PROMETHEUS",
       "label": "Prometheus",
-      "description": "MBS.CS Prometheus data source",
+      "description": "MBS.PT Prometheus data source",
       "type": "datasource",
       "pluginId": "prometheus",
       "pluginName": "Prometheus"
     }
   ],
-  "title": "MBS.CS - Reliability & Operations",
+  "title": "MBS.PT - Reliability & Operations",
   "description": "Operational health: broker/DLQ backlog, dependency liveness, backup/beat freshness, scan outcomes, and recovery activity. Import as an artifact; no Grafana service is bundled. References only metrics the app already exports.",
   "tags": ["mbs", "reliability", "operations"],
   "timezone": "utc",

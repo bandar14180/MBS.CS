@@ -58,7 +58,8 @@ def test_scan_queue_routing_configured() -> None:
     from apps.api.celery_app.worker import celery_app
 
     assert celery_app.conf.task_acks_late is True
-    assert celery_app.conf.task_routes["scans.run_scan"]["queue"] == "scans"
+    # MBS.SC: renamed "scans" -> "scans.public" (private scans use per-site queues).
+    assert celery_app.conf.task_routes["scans.run_scan"]["queue"] == "scans.public"
 
 
 def test_record_dlq_is_best_effort(monkeypatch) -> None:
@@ -112,6 +113,26 @@ def test_dlq_inspect_replay_remove(monkeypatch) -> None:
 
     calls: list = []
     monkeypatch.setattr(scan_tasks.run_scan_task, "delay", lambda sid: calls.append(sid))
+
+    # MBS.SC: dlq.replay() re-derives the scan's queue from its row and dispatches with
+    # apply_async(args=[scan_id], queue=...) -- so a failed PRIVATE scan is never replayed
+    # onto the public queue. `_queue_for_scan_id` is stubbed because these DLQ ids ("s1")
+    # are synthetic, not real scan rows: the test is about DLQ bookkeeping, not routing
+    # (routing has its own coverage in test_scan_routing/scan_routing.py).
+    monkeypatch.setattr(dlq, "_queue_for_scan_id", lambda sid: "scans.public")
+
+    # dlq.replay() enqueues only under the CELERY dispatch model; under the deployed lease
+    # model it refuses rather than enqueue onto a queue with no consumer. This test is about
+    # the Celery replay mechanism, so opt into it explicitly.
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "celery_scan_dispatch_enabled", True, raising=False)
+
+    def _fake_apply_async(args=None, kwargs=None, **opts):
+        if args:
+            calls.append(args[0])
+
+    monkeypatch.setattr(scan_tasks.run_scan_task, "apply_async", _fake_apply_async)
     assert dlq.replay("s1") is True          # re-enqueued once
     assert calls == ["s1"]
     assert [e["scan_id"] for e in dlq.inspect()] == ["s2"]   # s1 removed from DLQ

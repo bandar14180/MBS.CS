@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 
 _PW = "correct horse battery staple"
@@ -39,17 +40,20 @@ async def _seed_usage(workspace_id: str, specs: list[dict]) -> None:
     eng = create_async_engine(get_settings().database_url, poolclass=StaticPool)
     try:
         async with eng.begin() as c:
-            await c.execute(text("SELECT set_config('app.current_workspace_id', :w, true)"), {"w": workspace_id})
+            tenancy.bind_workspace(workspace_id)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             for s in specs:
+                # Phase 0 MySQL cutover: make_interval() has no MySQL equivalent; the
+                # created_at timestamp is computed in Python instead (same fix as the other
+                # seed helpers in this suite -- see test_queued_relay.py/_seed_scan).
+                created_at = datetime.now(timezone.utc) - timedelta(days=s["days_ago"])
                 await c.execute(
                     text(
                         "INSERT INTO ai_usage (id, workspace_id, provider, model, agent_role, "
                         "prompt_tokens, completion_tokens, estimated_cost_usd, created_at) "
-                        "VALUES (:id,:w,'openrouter',:model,:role,:pt,:ct,:cost, "
-                        "now() - make_interval(days => :days))"
+                        "VALUES (:id,:w,'openrouter',:model,:role,:pt,:ct,:cost,:created_at)"
                     ),
                     {"id": str(uuid.uuid4()), "w": workspace_id, "model": s["model"], "role": s["role"],
-                     "pt": s["pt"], "ct": s["ct"], "cost": s["cost"], "days": s["days_ago"]},
+                     "pt": s["pt"], "ct": s["ct"], "cost": s["cost"], "created_at": created_at},
                 )
     finally:
         await eng.dispose()

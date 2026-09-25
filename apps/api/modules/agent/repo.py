@@ -2,7 +2,7 @@
 
 Unlike ai_usage (an independent best-effort tx), a decision record is part of the
 scan's reasoning audit and is written on the ORCHESTRATOR's session -- the workspace
-RLS GUC is already session-set there, and the row must share the transaction that
+workspace is already bound on that session, and the row must share the transaction that
 created its AgentStep so `agent_step_id` is a valid FK. Kept as thin functions (no
 abstraction layer) matching the project's repo style (usage_repo / attack.service).
 """
@@ -42,7 +42,7 @@ async def persist_agent_decision(
     budget_state: dict | None = None,
 ) -> AgentDecision:
     """Insert one structured decision row for a reasoning cycle. Uses the caller's
-    session/transaction (workspace RLS GUC already set). Returns the row (flushed)."""
+    session/transaction (workspace already bound). Returns the row (flushed)."""
     row = AgentDecision(
         workspace_id=workspace_id,
         scan_id=scan_id,
@@ -70,7 +70,7 @@ async def persist_agent_decision(
 async def latest_agent_decision(db: AsyncSession, scan_id: uuid.UUID) -> AgentDecision | None:
     """The most recent decision row for a scan (highest step_no) -- the source of the
     prior observations/inferences/hypotheses fed into the NEXT reasoning cycle
-    (M4.4.2). Workspace-scoped by RLS on the caller's session."""
+    (M4.4.2). Workspace-scoped by tenancy.py's ORM filter on the caller's session."""
     return await db.scalar(
         select(AgentDecision)
         .where(AgentDecision.scan_id == scan_id)

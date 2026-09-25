@@ -8,3 +8,57 @@
 #   CVE-2024-12345  # <pkg>: accepted -- <reason>. review-by YYYY-MM-DD
 #
 # (empty = no accepted CVEs; CRITICAL fixed findings block CI)
+
+# ---------------------------------------------------------------------------------------
+# F-03: worker-image CRITICAL exceptions.
+#
+# These four are the ONLY CRITICALs left after upgrading every scanner tool to the newest
+# upstream release that ships a fixed build (see infra/docker/Dockerfile.worker). They are
+# NOT ignorable-by-category and this is NOT a blanket suppression: each is a specific CVE in
+# a Go module that upstream statically links into its release binary, so the fix is not ours
+# to apply -- it lands when the tool's maintainers rebuild against the patched module. Each
+# is listed individually with the reason it is not reachable in this image.
+#
+# The gate is real: the api and worker images both block on CRITICAL+fixed, and any CRITICAL
+# NOT on this list still fails CI. Re-check every entry on the review date -- if upstream has
+# rebuilt, bump the tool version in Dockerfile.worker (with its F-02 digest) and DELETE the
+# entry rather than extending the date.
+
+# CVE-2026-56854 -- golang.org/x/crypto v0.52.0 -> fixed 0.55.0
+#   Package/layer: golang.org/x/crypto/ssh, vendored into amass, dnsx, katana, naabu,
+#                  nuclei, subfinder (6 of 8 scanner binaries).
+#   What it is:    the SSH SERVER does not enforce the source-address critical option for
+#                  non-public-key auth callbacks.
+#   Why unfixable now: no upstream release of any of these tools yet links x/crypto >= 0.55.0.
+#   Why accepted:  none of these tools runs an SSH server. They are outbound scanners; the
+#                  ssh subpackage is transitively linked and never serves auth callbacks.
+#                  There is no code path in this image that accepts an SSH connection.
+#   Remediation:   bump each tool once upstream rebuilds against x/crypto >= 0.55.0.
+#   Review by:     2026-12-03
+CVE-2026-56854
+
+# CVE-2025-68121 -- Go stdlib -> fixed 1.24.13 / 1.25.7 / 1.26.0-rc.3
+#   Package/layer: crypto/tls in the Go stdlib, in dnsx, naabu, subfinder.
+#   What it is:    unexpected session resumption in crypto/tls -- a TLS SERVER-side issue.
+#   Why unfixable now: the tools' current releases are built with an older Go toolchain;
+#                  only a maintainer rebuild changes the embedded stdlib.
+#   Why accepted:  these binaries are TLS CLIENTS (they connect out to scan targets). They
+#                  terminate no TLS session, so there is no server session cache to resume.
+#   Remediation:   bump the tool once upstream ships a build on a patched Go toolchain.
+#   Review by:     2026-12-03
+CVE-2025-68121
+
+# CVE-2026-33815 / CVE-2026-33816 -- github.com/jackc/pgx/v5 v5.7.2 -> fixed 5.9.0
+#   Package/layer: PostgreSQL driver vendored into katana only. (Upgrading amass 4.2.0 -> 5.1.1
+#                  already REMOVED pgx from amass entirely, which is why it is not listed here.)
+#   What it is:    memory-safety vulnerabilities in the pgx PostgreSQL client.
+#   Why unfixable now: no katana release yet links pgx >= 5.9.0.
+#   Why accepted:  this project has NO PostgreSQL. The MySQL cutover removed it entirely
+#                  (apps/api/dr/postgres.py deleted, all 22 PG migrations replaced). katana
+#                  is invoked as a crawler with no database configuration, so the driver is
+#                  dead code that never opens a connection.
+#   Remediation:   bump katana once upstream rebuilds against pgx >= 5.9.0; re-check whether
+#                  the dependency can be dropped upstream at all.
+#   Review by:     2026-12-03
+CVE-2026-33815
+CVE-2026-33816

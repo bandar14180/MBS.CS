@@ -1,6 +1,6 @@
 # Runbook: Deployment, Rolling Restart & Graceful Shutdown
 
-How to deploy MBS.CS without losing in-flight scans or corrupting state. The system is built to
+How to deploy MBS.PT without losing in-flight scans or corrupting state. The system is built to
 tolerate abrupt worker loss (acks_late redelivery + orphan reaper), but a *clean* rollout avoids
 unnecessary scan restarts and downtime.
 
@@ -11,7 +11,7 @@ unnecessary scan restarts and downtime.
 | `worker` | Celery `-Q scans` (heavy scans) | warm shutdown: finishes in-flight scan, `stop_grace_period=60s` |
 | `worker-default` | Celery `-Q default` (reaper, relay, schedule, backup, retention, email) | warm shutdown, `stop_grace_period=60s` |
 | `beat` | scheduler (emits periodic ticks) | stateless emitter, `stop_grace_period=30s`; missed tick re-emits next interval |
-| `postgres` / `redis` / `minio` | stateful | see DR runbook; not restarted casually |
+| `mysql` / `redis` / `minio` | stateful | see DR runbook; not restarted casually |
 
 ## Reliability guarantees you can rely on during a deploy
 - **acks_late + reject_on_worker_lost + prefetch=1:** a scan is acknowledged only after it
@@ -52,7 +52,8 @@ openssl rand -base64 32 | tr -d '\n' > ../../.mfa_key && mv ../../.mfa_key mfa_e
 printf '%s' "$YOUR_OPENROUTER_KEY" > openrouter_api_key.txt
 
 # --- datastore credentials -----------------------------------------------------------
-openssl rand -hex 24 > postgres_password.txt      # PostgreSQL SUPERUSER password
+openssl rand -hex 24 > mysql_root_password.txt    # MySQL root password (first start only)
+openssl rand -hex 24 > mysql_password.txt         # the `mbs` application user's password
 openssl rand -hex 24 > redis_password.txt         # Redis requirepass
 printf 'mbs_s3'      > minio_root_user.txt
 openssl rand -hex 24 > minio_root_password.txt
@@ -61,7 +62,7 @@ cp minio_root_password.txt s3_secret_key.txt      # must match minio_root_passwo
 
 # --- derived URLs (must embed the passwords generated above) -------------------------
 printf 'redis://:%s@redis:6379/0' "$(cat redis_password.txt)" > redis_url.txt
-printf 'postgresql+asyncpg://mbs_app:%s@postgres:5432/mbs' "$APP_DB_PASSWORD" > database_url.txt
+printf 'mysql+aiomysql://mbs:%s@mysql:3306/mbs' "$(cat mysql_password.txt)" > database_url.txt
 
 chmod 600 *.txt
 ```
@@ -73,7 +74,8 @@ committed, so keep them right by hand):
 |---|---|
 | `redis_password.txt` ↔ password inside `redis_url.txt` | one is the server's `requirepass`, the other is how every client authenticates; drift breaks the broker, cache, rate limiter and MFA lockouts at once |
 | `minio_root_user/password.txt` ↔ `s3_access_key/s3_secret_key.txt` | MinIO root credentials *are* the S3 credentials the app uses |
-| the role in `database_url.txt` ↔ a real PostgreSQL role | see least-privilege below |
+| `mysql_password.txt` ↔ password inside `database_url.txt` | two views of ONE credential: the first is what the `mysql` image provisions for the `mbs` user at first start, the second is how the app authenticates. Drift means the app cannot connect at all |
+| the user in `database_url.txt` ↔ `MYSQL_USER` (`mbs`) | the image provisions exactly this one non-root user; see least-privilege below |
 
 > Verifying Redis by hand: `redis-cli -u redis://:PASS@host` reports `WRONGPASS` because it
 > sends a two-argument `AUTH` with an empty username. That is a redis-cli quirk, not a
@@ -82,41 +84,52 @@ committed, so keep them right by hand):
 
 ## Least-privileged application database role
 
-`DATABASE_URL` must **not** point at the `mbs` superuser. `startup_checks.py` refuses to start in
-production on a superuser role, because a superuser bypasses FORCE Row-Level Security and with it
-every workspace-isolation guarantee. Create a dedicated role once:
+`DATABASE_URL` must **not** point at `root`. The official `mysql:8.0` image already provisions a
+dedicated non-root user from `MYSQL_USER`/`MYSQL_PASSWORD` (`mbs`, password from
+`mysql_password.txt`) and grants it full rights on the `mbs` database only — so the default
+compose is already least-privileged for the application, and `database_url.txt` should name that
+user, never `root`.
+
+> Workspace isolation does **not** depend on the database role. Under PostgreSQL it relied on
+> FORCE Row-Level Security, which a superuser bypassed; MySQL has no RLS, so isolation is
+> enforced in the application by `apps/api/core/tenancy.py`. Using a non-root user remains good
+> practice (it bounds the blast radius of an application compromise), but it is no longer the
+> mechanism that keeps tenants apart.
+
+To tighten further — e.g. deny DDL to the runtime user so only migrations can alter the schema:
 
 ```sql
--- as the superuser, against the mbs database
-CREATE ROLE mbs_app LOGIN PASSWORD 'the-value-you-put-in-database_url.txt';
-GRANT CONNECT ON DATABASE mbs TO mbs_app;
-GRANT USAGE ON SCHEMA public TO mbs_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mbs_app;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mbs_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mbs_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO mbs_app;
+-- as root, against the mbs database
+REVOKE ALL PRIVILEGES ON mbs.* FROM 'mbs'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mbs.* TO 'mbs'@'%';
+FLUSH PRIVILEGES;
 ```
 
-Migrations still run as the owner/superuser (`alembic upgrade head` via `compose run api`), which
-is why the schema grants above use `ALTER DEFAULT PRIVILEGES` — new tables added by a later
-migration are then usable by `mbs_app` without a follow-up grant.
+If you do this, run migrations as `root` instead (`alembic upgrade head` needs DDL):
+
+```bash
+docker compose $COMPOSE run --rm \
+  -e DATABASE_URL="mysql+aiomysql://root:$(cat infra/secrets/mysql_root_password.txt)@mysql:3306/mbs" \
+  api alembic upgrade head
+```
 
 ## ⚠️ Rotating credentials on an EXISTING deployment
 
 **Changing a password in compose does not rotate anything on a volume that already exists.**
-`initdb` and MinIO's first-start provisioning run only against an *empty* data directory, so on a
-live `postgres_data` / `minio_data` volume the new secret file is simply ignored and the services
-keep their original credentials — while the application starts using the new value and fails to
-connect. Rotate deliberately:
+The MySQL image's `MYSQL_USER`/`MYSQL_PASSWORD` provisioning and MinIO's first-start
+provisioning run only against an *empty* data directory, so on a live `mysql_data` / `minio_data`
+volume the new secret file is simply ignored and the services keep their original credentials —
+while the application starts using the new value and fails to connect. Rotate deliberately:
 
-**PostgreSQL**
+**MySQL**
 ```bash
-# 1) change the role's password IN the database (superuser session)
-docker compose $COMPOSE exec postgres \
-  psql -U mbs -d mbs -c "ALTER ROLE mbs_app WITH PASSWORD 'new-password';"
-# 2) update the secret file to match, then restart the consumers
-printf 'postgresql+asyncpg://mbs_app:new-password@postgres:5432/mbs' > infra/secrets/database_url.txt
+# 1) change the user's password IN the database (root session)
+docker compose $COMPOSE exec mysql \
+  mysql -u root -p"$(cat infra/secrets/mysql_root_password.txt)" \
+  -e "ALTER USER 'mbs'@'%' IDENTIFIED BY 'new-password'; FLUSH PRIVILEGES;"
+# 2) update BOTH views of the credential to match, then restart the consumers
+printf 'new-password' > infra/secrets/mysql_password.txt
+printf 'mysql+aiomysql://mbs:new-password@mysql:3306/mbs' > infra/secrets/database_url.txt
 docker compose $COMPOSE up -d --no-deps api worker worker-default beat
 ```
 
@@ -144,7 +157,7 @@ network by service name.
 | `nginx` | `80` | anywhere — the only public entrypoint |
 | `api` | `127.0.0.1:8000` | the host only (`curl http://127.0.0.1:8000/ready`) |
 | `prometheus` / `alertmanager` | `127.0.0.1:9090` / `127.0.0.1:9093` | the host only |
-| `postgres` / `redis` / `minio` / `web` | **none** | in-network only (`postgres:5432`, `redis:6379`, `minio:9000`, `web:3000`) |
+| `mysql` / `redis` / `minio` / `web` | **none** | in-network only (`mysql:3306`, `redis:6379`, `minio:9000`, `web:3000`) |
 
 Dev keeps direct access to all of them via `docker-compose.override.yml`, which compose
 auto-merges for a bare `docker compose up` and which the production `-f` list excludes.
@@ -179,9 +192,22 @@ docker compose $COMPOSE up -d --no-deps --build beat
 docker compose $COMPOSE up -d --no-deps --build api
 
 # 5) Web/nginx if changed.
+#    `--build` is REQUIRED for web, not optional: infra/docker/Dockerfile.web is multi-stage
+#    and runs `next build` inside the image, so the deployed bundle is produced at build time.
+#    There is no source bind-mount in production -- the container serves only what the image
+#    contains, so shipping a frontend change without rebuilding deploys the OLD bundle.
 docker compose $COMPOSE up -d --no-deps --build web nginx
 ```
 Notes:
+- **The production `web` service runs `next start`, not `next dev`.** Dockerfile.web's final
+  (`runtime`) stage carries the built `.next` output plus production dependencies only -- no
+  sources, no eslint/typescript/vitest -- runs as the unprivileged `appuser`, and sets
+  `NODE_ENV=production`. `docker-compose.prod.yml` resets the dev stack's `target: builder`
+  and its `command: ["npm","run","dev"]`, and resets `volumes` to drop the base file's
+  `../apps/web:/srv` bind-mount. Verify after a deploy with:
+  `docker compose $COMPOSE exec web sh -c 'cat /proc/1/cmdline | tr " " " "'` (expect
+  `npm run start ...`) and `docker inspect <web container> --format '{{json .Mounts}}'`
+  (expect `[]`).
 - A scan longer than `stop_grace_period` (60s) at shutdown is SIGKILLed and **redelivered**
   (acks_late) or recovered by the reaper — no data loss, just a restart of that scan.
 - Only **one** `beat` must run (it's the scheduler). Do not scale it to >1.
@@ -195,7 +221,7 @@ docker compose $COMPOSE stop -t 60 worker           # -t >= stop_grace_period
 `beat` can be stopped anytime (`-t 30`); the schedule resumes when it restarts.
 
 ## Health / readiness
-- API liveness: `GET /health` (process up). Readiness: `GET /ready` (probes Postgres + Redis; 503
+- API liveness: `GET /health` (process up). Readiness: `GET /ready` (probes MySQL + Redis; 503
   if either is down) — gate load-balancer traffic on `/ready`.
 - Workers expose Prometheus metrics on `:9100` (scraped by Prometheus). There is no per-container
   compose healthcheck on workers yet (tracked as a reliability follow-up); `restart: unless-stopped`
@@ -253,8 +279,36 @@ the API port yourself, put it back behind a firewall or return `TRUSTED_PROXY_CO
 `apps/api/tests/test_deployment_config.py` fails the build if any file in the production merge
 publishes the API on a routable interface while the hop count is non-zero.
 
-Note the bundled `nginx.conf` listens on `:80` with no TLS directives. If you serve HTTPS,
-something upstream terminates TLS — and that hop counts.
+### TLS (F-01)
+
+The production merge terminates TLS **at nginx**. `docker-compose.prod.yml` mounts
+`infra/nginx/nginx.tls.conf` over `/etc/nginx/nginx.conf` and publishes `:443`; the inherited
+`:80` publication serves nothing but a `308` to `https://` (plus `/.well-known/acme-challenge/`
+so renewal keeps working). TLS 1.2/1.3 only, ECDHE+AEAD suites only, and HSTS is asserted on
+the 443 listener — never over plaintext.
+
+**Before the first production `up`, provide both files (never commit them; `infra/secrets/`
+is gitignored):**
+
+```bash
+# CA-issued — Let's Encrypt or your internal PKI. A self-signed pair is NOT a production answer.
+cp /path/to/fullchain.pem infra/secrets/tls_cert.pem   # leaf + intermediates
+cp /path/to/privkey.pem   infra/secrets/tls_key.pem    # unencrypted (nginx cannot prompt)
+chmod 600 infra/secrets/tls_key.pem
+```
+
+nginx **fails closed**: if either file is missing or empty the container prints a FATAL
+message naming the problem and exits instead of falling back to plaintext. Do not "fix" that
+crash loop by reverting to `nginx.conf` — `apps/api/tests/test_deployment_config.py` fails the
+build if the production overlay mounts the plaintext config.
+
+`ENABLE_HSTS: "true"` in the overlay is now truthful: there is a real https:// origin for a
+browser to pin to.
+
+**If you terminate TLS upstream instead** (ALB / CloudFront / Cloudflare / an ingress
+controller), that is supported but is *not* the bundled path: keep the plaintext `nginx.conf`,
+put the terminator in front, and **raise `TRUSTED_PROXY_COUNT`** — that terminator appends
+another `X-Forwarded-For` hop, so the correct value becomes 2 or more.
 
 ## Post-deploy verification
 - `GET /ready` → `ready`.

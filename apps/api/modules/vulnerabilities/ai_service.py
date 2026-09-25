@@ -2,7 +2,7 @@ import uuid
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.modules.vulnerabilities.models import Vulnerability
@@ -54,7 +54,10 @@ async def generate_remediation(
     except RuntimeError as exc:  # no provider key configured
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
 
-    stmt = pg_insert(Remediation.__table__).values(
+    # Phase 0 MySQL cutover: pg_insert(...).on_conflict_do_update(constraint=...) ->
+    # mysql_insert(...).on_duplicate_key_update(...) -- see risk/service.py's
+    # upsert_risk_score for the fuller explanation of why no constraint name is needed.
+    stmt = mysql_insert(Remediation.__table__).values(
         vulnerability_id=vuln_id,
         summary=result.summary,
         steps=result.steps,
@@ -63,16 +66,13 @@ async def generate_remediation(
         model_version=result.model_version,
         prompt_version=result.prompt_version,
     )
-    stmt = stmt.on_conflict_do_update(
-        constraint="uq_remediations_vulnerability",
-        set_={
-            "summary": result.summary,
-            "steps": result.steps,
-            "reference_links": result.references,
-            "generated_by": "ai",
-            "model_version": result.model_version,
-            "prompt_version": result.prompt_version,
-        },
+    stmt = stmt.on_duplicate_key_update(
+        summary=result.summary,
+        steps=result.steps,
+        reference_links=result.references,
+        generated_by="ai",
+        model_version=result.model_version,
+        prompt_version=result.prompt_version,
     )
     await db.execute(stmt)
     await db.commit()

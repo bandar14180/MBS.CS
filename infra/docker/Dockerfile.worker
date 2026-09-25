@@ -1,9 +1,26 @@
-FROM python:3.12-slim
+# AUDIT-005: base image pinned by IMMUTABLE DIGEST. A tag is a moving pointer the registry
+# can repoint at any time, so a rebuild months later would silently produce a different
+# base than the one that was tested and scanned. Verified real: python:3.12-slim had
+# ALREADY drifted -- the local image and the registry tag resolved to different digests.
+# Tag kept in the comment for readability. To update, run:
+#   docker buildx imagetools inspect <image>:<tag>
+# python:3.12-slim
+FROM python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 
 WORKDIR /srv
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+
+# Apply Debian security updates on top of the digest-pinned base -- same rationale as
+# Dockerfile.api: the digest pin (AUDIT-005) freezes OS packages, so CVEs published
+# against them after the pin was taken would ship forever and fail the Trivy
+# CRITICAL+fixed gate. `upgrade`, not `dist-upgrade`: security fixes within the
+# pinned release only, so the pin keeps its meaning.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Security tool binaries (recon phase per build order §12). Versions are pinned
 # to match each runner's `.version` in scanner_engine/tool_runners/. The three
@@ -12,21 +29,58 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # library on PATH. nmap comes from apt. libpcap0.8 is only needed for naabu SYN
 # scans (we default to connect scans, no root) but is kept for future use.
 #
-# DR: the postgres client MAJOR must match the server (postgres:16-alpine). Debian
-# trixie ships only postgresql-client-17, and pg_dump 17 writes `SET transaction_timeout`
-# -- a PG17-only GUC -- into every dump preamble, which a 16.x server rejects. pg_restore
-# counts that as an error and exits 1 even though the restore completed, so every DR
-# drill/restore reported a false failure. Pull client 16 from PGDG instead. The signing
-# key ships offline in Debian's `postgresql-client-common` (which `postgresql-common`
-# pulls in below) -- so there is no fetch from postgresql.org, a host the local AV severs.
-# The repo is plain http because apt authenticates packages by GPG signature, so no TLS
-# trust is involved and the interception CA is not needed. `postgresql-common` is purged
-# once the key is extracted; `postgresql-client-common` stays because it is a dependency
-# of postgresql-client-16 and provides the `pg_wrapper` that /usr/bin/pg_dump resolves to.
+# DR (Phase 0 MySQL cutover): apps/api/dr/mysql.py shells out to `mysqldump`/`mysql`
+# (settings.backup_mysqldump_cmd / backup_mysql_cmd, both default to the bare command name
+# resolved via PATH) to back up and restore the mysql:8.0 server. `default-mysql-client` is
+# Debian's MariaDB-client-backed package providing both binaries; unlike the old Postgres
+# major-version pinning (pg_dump's on-disk format is version-sensitive), MariaDB's mysqldump/
+# mysql clients speak MySQL 8's wire protocol and SQL dump format without needing a matched
+# major version, so no PGDG-style pinned external repo is needed here.
 ARG NAABU_VERSION=2.6.1
-ARG SUBFINDER_VERSION=2.14.0
-ARG HTTPX_VERSION=1.10.0
-ARG NUCLEI_VERSION=3.11.0
+ARG SUBFINDER_VERSION=2.16.0
+ARG HTTPX_VERSION=1.11.0
+ARG NUCLEI_VERSION=3.11.1
+ARG DNSX_VERSION=1.3.1
+# F-02 (SUPPLY CHAIN): SHA-256 of each release archive, verified BEFORE it is unpacked.
+#
+# WHY A PINNED CONSTANT AND NOT A FETCHED CHECKSUM FILE: downloading <tool>_checksums.txt
+# from the same release, over the same connection, at the same moment proves only that the
+# archive matches whatever that host served -- an attacker who can replace the binary can
+# replace its checksum file in the same breath. The trust anchor has to live somewhere the
+# attacker does not control, so it lives HERE, in the reviewed, version-controlled tree: a
+# changed digest is a visible diff in code review, and a swapped upstream artifact fails the
+# build instead of shipping.
+#
+# PROVENANCE -- each value below was taken from the project's OFFICIAL upstream checksum
+# asset for that exact tag AND independently recomputed from the downloaded artifact before
+# being pinned (both agreed for all eight tools):
+#   naabu     v2.6.1  naabu-checksums.txt
+#   subfinder v2.16.0 subfinder_2.16.0_checksums.txt
+#   httpx     v1.11.0 httpx_1.11.0_checksums.txt
+#   nuclei    v3.11.1 nuclei_3.11.1_checksums.txt
+#   dnsx      v1.3.1  dnsx_1.3.1_checksums.txt
+#   katana    v1.7.0  katana-1.7.0-checksums.txt
+#   amass     v5.1.1  amass_checksums.txt
+#   ffuf      v2.2.1  ffuf_2.2.1_checksums.txt
+#
+# F-03 (version bump, 2026-09-03): seven of these were bumped to the newest upstream release
+# to clear vendored-Go CVEs -- the worker image now BLOCKS CI on CRITICAL, so the exposure had
+# to be reduced before the gate could be enabled honestly. Measured effect on the image:
+# 317 -> 223 HIGH/CRITICAL findings (63 -> 53 distinct CVEs), 19 -> 11 CRITICAL findings
+# (6 -> 4 distinct CRITICAL CVEs). Upgrading amass 4.2.0 -> 5.1.1
+# also removed github.com/jackc/pgx/v5 (a PostgreSQL driver, dead weight since the MySQL
+# cutover) from that binary entirely. naabu stays at 2.6.1 -- it is already the latest release.
+# Note amass 5.x renamed its asset to amass_linux_amd64.tar.gz (was amass_Linux_amd64.zip) and
+# katana 1.7.0 renamed its checksum file to katana-1.7.0-checksums.txt.
+#
+# BUMPING A VERSION: change the ARG *and* its SHA in the same commit, taking the new digest
+# from the upstream checksum asset for the new tag. A version bump without a matching digest
+# bump fails the build loudly -- which is the intended behaviour, not an inconvenience.
+ARG NAABU_SHA256=018c4c9884dea971eda860435ede3021d1150732f34cfd245498c6726d8cab90
+ARG SUBFINDER_SHA256=1b7f9c608e9a5bd59e609a5e09710d63c5485e92d3d49dc2c16eb4fdbe10cb60
+ARG HTTPX_SHA256=5dce96e7315cff24be7aab3b032f23f7a71b7711a17f8189ebe601f2588f2f87
+ARG NUCLEI_SHA256=ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6
+ARG DNSX_SHA256=438b964653056dd51dcfe614b1a16f8bced3cc48a1d27bc07cc6fdf2ef2a9533
 # Local TLS-interception support (BUILD-TIME ONLY) -- applied to every HTTPS step
 # in this file (curl -> GitHub, pip -> PyPI, nuclei -> template repo).
 # Where an AV/proxy terminates TLS (e.g. Norton), those hosts present a locally-
@@ -45,29 +99,62 @@ RUN --mount=type=secret,id=extra_ca \
     fi; \
     apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip libpcap0.8 nmap \
-    && apt-get install -y --no-install-recommends postgresql-common \
-    && install -D /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg /etc/apt/keyrings/pgdg.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
-       > /etc/apt/sources.list.d/pgdg.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client-16 \
-    && apt-get purge -y postgresql-common \
+    # MBS.SC NOTE -- default-mysql-client and the scanner execution plane.
+    #
+    # `mysqldump`/`mysql` are required by the DR BACKUP task (apps/api/dr/mysql.py), which
+    # runs on `worker-default` (the CONTROL-PLANE worker), never on the scan worker. Both
+    # services are built from this one image, so the client binaries are present in the
+    # scanner container too.
+    #
+    # This is ACCEPTED, and it is not what made the old design unsafe. A database client
+    # with no reachable database and no credentials is inert: the scan worker is on neither
+    # `mbs-core` (no route to mysql:3306 -- see docker-compose.yml) nor holds DATABASE_URL
+    # (see docker-compose.prod.yml and .env.scanner.example), and the runtime guard
+    # `enforce_execution_plane_credentials` refuses to start it if a DSN ever reappears.
+    # Removing the binary would be defence-in-depth theatre while the real controls -- no
+    # route, no credential -- are the ones doing the work.
+    #
+    # SPLITTING THE IMAGE is the cleaner end state (a scanner stage without the DR client,
+    # a control-plane stage with it) and is recorded as a follow-up rather than done here:
+    # it changes the build topology for every worker service and is not required for any
+    # security property claimed by this remediation.
+    && apt-get install -y --no-install-recommends default-mysql-client \
+    # whatweb: packaged directly in Debian (Ruby script + fingerprint DB) -- no
+    # build-from-source step needed, unlike the Go/Python tools below.
+    # dirb: pulled in ONLY for its bundled small wordlists (/usr/share/dirb/wordlists/),
+    # used as the ffuf runner's default content-discovery wordlist -- no network fetch,
+    # no license-uncertain third-party list baked in.
+    && apt-get install -y --no-install-recommends whatweb dirb \
+    # F-02: verify BEFORE unpacking. `sha256sum -c` exits non-zero on any mismatch and
+    # the `&&` chain aborts the layer, so a tampered or truncated archive never reaches
+    # `unzip`, let alone /usr/local/bin. Deliberately no `|| true`, no retry-without-
+    # verification, and no unverified fallback path.
     && curl -sSfL "https://github.com/projectdiscovery/naabu/releases/download/v${NAABU_VERSION}/naabu_${NAABU_VERSION}_linux_amd64.zip" -o /tmp/naabu.zip \
+    && echo "${NAABU_SHA256}  /tmp/naabu.zip" | sha256sum -c - \
     && unzip -o /tmp/naabu.zip -d /tmp/naabu && mv /tmp/naabu/naabu /usr/local/bin/naabu \
     && curl -sSfL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/subfinder_${SUBFINDER_VERSION}_linux_amd64.zip" -o /tmp/subfinder.zip \
+    && echo "${SUBFINDER_SHA256}  /tmp/subfinder.zip" | sha256sum -c - \
     && unzip -o /tmp/subfinder.zip -d /tmp/subfinder && mv /tmp/subfinder/subfinder /usr/local/bin/subfinder \
     && curl -sSfL "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VERSION}/httpx_${HTTPX_VERSION}_linux_amd64.zip" -o /tmp/httpx.zip \
+    && echo "${HTTPX_SHA256}  /tmp/httpx.zip" | sha256sum -c - \
     && unzip -o /tmp/httpx.zip -d /tmp/httpx && mv /tmp/httpx/httpx /usr/local/bin/httpx-pd \
     && curl -sSfL "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" -o /tmp/nuclei.zip \
+    && echo "${NUCLEI_SHA256}  /tmp/nuclei.zip" | sha256sum -c - \
     && unzip -o /tmp/nuclei.zip -d /tmp/nuclei && mv /tmp/nuclei/nuclei /usr/local/bin/nuclei \
-    && chmod +x /usr/local/bin/naabu /usr/local/bin/subfinder /usr/local/bin/httpx-pd /usr/local/bin/nuclei \
-    && rm -rf /tmp/naabu* /tmp/subfinder* /tmp/httpx* /tmp/nuclei* \
+    && curl -sSfL "https://github.com/projectdiscovery/dnsx/releases/download/v${DNSX_VERSION}/dnsx_${DNSX_VERSION}_linux_amd64.zip" -o /tmp/dnsx.zip \
+    && echo "${DNSX_SHA256}  /tmp/dnsx.zip" | sha256sum -c - \
+    && unzip -o /tmp/dnsx.zip -d /tmp/dnsx && mv /tmp/dnsx/dnsx /usr/local/bin/dnsx \
+    && chmod +x /usr/local/bin/naabu /usr/local/bin/subfinder /usr/local/bin/httpx-pd /usr/local/bin/nuclei /usr/local/bin/dnsx \
+    && rm -rf /tmp/naabu* /tmp/subfinder* /tmp/httpx* /tmp/nuclei* /tmp/dnsx* \
     && apt-get purge -y curl unzip \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /tmp/ca-build.pem
 
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
+# Worker-only extras (playwright). Kept in a separate file so the API image, which never
+# captures screenshots, does not pull a browser driver.
+COPY apps/api/requirements-worker.txt ./apps/api/requirements-worker.txt
 # PyPI over HTTPS -- same optional-secret pattern as above.
 RUN --mount=type=secret,id=extra_ca \
     if [ -f /run/secrets/extra_ca ]; then \
@@ -76,7 +163,47 @@ RUN --mount=type=secret,id=extra_ca \
                REQUESTS_CA_BUNDLE=/tmp/ca-build.pem; \
     fi; \
     pip install --no-cache-dir -r apps/api/requirements.txt \
+    && pip install --no-cache-dir -r apps/api/requirements-worker.txt \
     && rm -f /tmp/ca-build.pem
+
+# Chromium for screenshot evidence. `chromium` alone (not "all") keeps Firefox/WebKit out of
+# the image. Runs as root because it installs OS packages, before the USER appuser switch.
+#
+# The system libraries are installed EXPLICITLY rather than via `playwright install
+# --with-deps`. That flag hardcodes Ubuntu package names, two of which (ttf-unifont,
+# ttf-ubuntu-font-family) do not exist in this image's Debian base -- apt then exits 100 and
+# aborts the WHOLE dependency install, so Chromium's real libraries never land. The list below
+# is the same set of runtime libraries under their Debian names, verified to let Chromium
+# launch (v131).
+#
+# `--only-shell` installs ONLY chromium_headless_shell and skips the full headed Chromium.
+# That is not a guess: from Playwright 1.49, `chromium.launch(headless=True)` -- exactly what
+# screenshot.py calls -- executes chromium_headless_shell/headless_shell, verified by reading
+# /proc/*/exe of the live browser process. The headed build (549MB) is never executed by this
+# application, while the shell (309MB) is; deleting the shell instead breaks launch outright.
+# Using the supported flag rather than deleting directories keeps the install self-consistent,
+# so Playwright never tries to re-download what was pruned.
+#
+# This step is deliberately NOT best-effort: if Chromium cannot be installed the build FAILS.
+# A worker image that silently lacks a browser would report a successful build while every
+# capture failed soft at runtime, producing no evidence and no obvious cause.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN --mount=type=secret,id=extra_ca \
+    set -eux; \
+    if [ -f /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
+        export SSL_CERT_FILE=/tmp/ca-build.pem REQUESTS_CA_BUNDLE=/tmp/ca-build.pem; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libxcb1 libxkbcommon0 libatspi2.0-0 libx11-6 libxcomposite1 \
+        libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+        libcairo2 libasound2 fonts-liberation fonts-dejavu-core; \
+    rm -rf /var/lib/apt/lists/*; \
+    playwright install --only-shell chromium; \
+    chmod -R a+rX /ms-playwright; \
+    rm -f /tmp/ca-build.pem
 
 # Run scans as an unprivileged user. The default recon config uses connect scans
 # (naabu/nmap) which do NOT need root/raw sockets, so no capabilities are lost.
@@ -87,7 +214,11 @@ RUN --mount=type=secret,id=extra_ca \
 # root-owned 0755 and `dr backup` fails with PermissionError.
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /srv/backups \
-    && chown appuser:appuser /srv/backups
+    && chown appuser:appuser /srv/backups \
+    && chown appuser:appuser /srv
+    # /srv itself (the WORKDIR) is chowned too, not just its subdirs: `celery beat` writes its
+    # schedule state to a relative `celerybeat-schedule` file in the CWD, so appuser needs write
+    # access on /srv directly or the beat service fails at startup with EACCES and crash-loops.
 USER appuser
 
 # Docker does NOT reset $HOME when USER changes -- it stays at the builder default
@@ -175,11 +306,22 @@ SH
 #   katana  -- crawler (release zip), feeds discovered URLs to the fuzzer.
 #   arjun   -- HTTP parameter discovery (pip), turns crawled endpoint paths into
 #              fuzzable param URLs so nuclei-dast can inject SQLi/XSS/LFI probes.
+#   amass   -- passive subdomain enumeration (release zip); alternate/complementary
+#              `subdomain_discovery` implementation alongside subfinder.
+#   ffuf    -- content/directory discovery (release tar.gz); its own `content_discovery`
+#              capability, fuzzing paths katana's crawl never links to.
 # Installed as their OWN layer AFTER the slow nuclei-templates layer so adding
 # them never busts that (large) cache. Needs root for /usr/local/bin + site-packages.
 USER root
-ARG KATANA_VERSION=1.1.2
-# GitHub (katana) + PyPI (arjun) over HTTPS -- same optional-secret pattern.
+ARG KATANA_VERSION=1.7.0
+ARG AMASS_VERSION=5.1.1
+ARG FFUF_VERSION=2.2.1
+# F-02: pinned release-archive digests -- same trust model and provenance as the block above
+# (official upstream checksum asset for the exact tag, independently recomputed before pinning).
+ARG KATANA_SHA256=fe1142d92f418549338ea46d67a472124878482e225d279e9a42700c75d76a4d
+ARG AMASS_SHA256=5e22b5f0239e7eb79439d60d43d3cd20dca2478588bc2242e91ab0c4f8fa40dd
+ARG FFUF_SHA256=86307885810d3c36ba4a3e9ba5178c2d9027bba0dd7f4ea39e39e7c972b62396
+# GitHub (katana/amass/ffuf) + PyPI (arjun) over HTTPS -- same optional-secret pattern.
 RUN --mount=type=secret,id=extra_ca \
     if [ -f /run/secrets/extra_ca ]; then \
         cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-build.pem; \
@@ -189,13 +331,77 @@ RUN --mount=type=secret,id=extra_ca \
     apt-get update \
     && apt-get install -y --no-install-recommends curl unzip \
     && curl -sSfL "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_amd64.zip" -o /tmp/katana.zip \
+    && echo "${KATANA_SHA256}  /tmp/katana.zip" | sha256sum -c - \
     && unzip -o /tmp/katana.zip -d /tmp/katana && mv /tmp/katana/katana /usr/local/bin/katana \
-    && chmod +x /usr/local/bin/katana \
-    && rm -rf /tmp/katana* \
+    && curl -sSfL "https://github.com/owasp-amass/amass/releases/download/v${AMASS_VERSION}/amass_linux_amd64.tar.gz" -o /tmp/amass.tar.gz \
+    && echo "${AMASS_SHA256}  /tmp/amass.tar.gz" | sha256sum -c - \
+    && mkdir -p /tmp/amass && tar -xzf /tmp/amass.tar.gz -C /tmp/amass \
+    && find /tmp/amass -type f -name amass -exec mv {} /usr/local/bin/amass \; \
+    && curl -sSfL "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_amd64.tar.gz" -o /tmp/ffuf.tar.gz \
+    && echo "${FFUF_SHA256}  /tmp/ffuf.tar.gz" | sha256sum -c - \
+    && mkdir -p /tmp/ffuf && tar -xzf /tmp/ffuf.tar.gz -C /tmp/ffuf && mv /tmp/ffuf/ffuf /usr/local/bin/ffuf \
+    && chmod +x /usr/local/bin/katana /usr/local/bin/amass /usr/local/bin/ffuf \
+    && rm -rf /tmp/katana* /tmp/amass* /tmp/ffuf* \
     && pip install --no-cache-dir arjun==2.2.7 \
     && apt-get purge -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* \
     && rm -f /tmp/ca-build.pem
 USER appuser
+
+# MBS.SC -- WireGuard client tooling for the PRIVATE worker pool.
+#
+# WHY THESE TWO, AND ONLY THESE TWO:
+#   wireguard-tools  provides `wg`   -- read handshake state (SystemTunnelProbe) and apply
+#                                       the peer configuration produced by
+#                                       scanner_engine/wireguard.render_worker_config.
+#   iproute2         provides `ip`   -- create wg0, assign its address, bring it up, and
+#                                       install the site's authorized route(s).
+#
+# `wireguard-tools` deliberately pulls NO kernel module: the tunnel uses the host kernel's
+# WireGuard, which is why the private worker needs CAP_NET_ADMIN and nothing more. No
+# wg-quick dependency chain (openresolv/iptables) is installed -- wg-quick is exactly what
+# the design avoids, because its `DNS=` handling rewrites the whole namespace resolver and
+# its automatic routing is what `Table = off` exists to prevent. Routes are installed
+# explicitly by the entrypoint instead.
+#
+# PRESENT IN THE SHARED IMAGE, USED ONLY BY PRIVATE WORKERS. The public scan worker never
+# creates an interface (it holds no CAP_NET_ADMIN, so it could not), and `wg`/`ip` are inert
+# without one. Splitting a separate private image was considered and rejected for now: it
+# would double the (large, slow) scanner-tool build for ~1.5 MB of binaries, and the real
+# controls are the capability set and the network topology, not the absence of a binary.
+#
+# P7-1: `util-linux` (setpriv) and `libcap2-bin` (capsh/getcap) are PINNED HERE ON PURPOSE.
+# The private-site compose entrypoint drops from root to uid 10001 with `setpriv`, raising
+# CAP_NET_ADMIN into the ambient set so the non-root worker can still create wg0 and read
+# `wg show`. Both packages happen to be present as transitive dependencies of the base image
+# today, which is exactly why they are named explicitly: an undeclared dependency can vanish
+# in a base-image bump, and the failure mode would be a private worker that cannot start.
+# Declaring them makes the dependency visible and keeps apt from removing them.
+#
+# Needs root to install; drops back to appuser immediately after.
+#
+# DEDICATED VPN EGRESS: `iptables` is added for the VPN-egress worker's KILL-SWITCH.
+# It is not optional and not defence-in-depth theatre. `egress_guard` is in-process and
+# explicitly cannot intercept the scanner tool binaries' own sockets (nuclei, katana, ffuf
+# each do their own socket work in another process and follow their own redirects), so the
+# fail-closed guarantee for VPN egress has to be enforced by the kernel: a default-DROP
+# OUTPUT policy whose only path to a target is `-o wg-egress`. When the tunnel drops that
+# rule stops matching and target traffic is dropped, rather than silently falling back to
+# direct Internet. `egress_setup.assert_tooling_present` refuses to start a VPN-egress
+# worker if this binary is missing, so an image regression fails loudly at boot.
+#
+# Like wg/ip above, it is present in the shared image but inert for every other worker: a
+# worker without CAP_NET_ADMIN cannot modify a firewall, and only the VPN-egress service
+# grants it.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        wireguard-tools iproute2 util-linux libcap2-bin iptables \
+    && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+USER appuser
+
+# Default ffuf wordlist: dirb's small bundled common.txt (installed above), so
+# content discovery works out of the box without a runtime network fetch.
+ENV FFUF_WORDLIST_PATH=/usr/share/dirb/wordlists/common.txt
 
 # Warm httpx's tech-detection ("dit") model into the image so scans don't download
 # ~92MB at runtime (P2-15). Best-effort: if the build network can't fetch it, we

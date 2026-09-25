@@ -34,6 +34,14 @@ class ScanCreate(BaseModel):
         description="Human pre-approval: hosts the agent may attempt exploitation on ('*' = all in "
         "scope). Unapproved hosts are modeled only, never exploited.",
     )
+    tool_config: dict = Field(
+        default_factory=dict,
+        description="Optional per-tool runtime knobs (e.g. {'timeout_seconds': 900, 'nuclei_tags': "
+        "'cve'}), merged into scan config. Restricted server-side to a known-safe allowlist "
+        "(scans.service.ALLOWED_TOOL_CONFIG_KEYS) -- it can only tune existing runner behavior "
+        "(timeouts/rates/tags/ports/wordlist path), never override orchestration or safety keys "
+        "like requested_modules/use_agent/exploitation_enabled.",
+    )
 
 
 class ScanRead(BaseModel):
@@ -61,6 +69,13 @@ class ToolRunRead(BaseModel):
     tool_version: str
     status: str
     command_hash: str
+    # Prompt 10: the reconstructible command line, alongside the pre-existing digest. NULL
+    # for rows recorded before this field existed, or where a worker never reported one.
+    effective_command: str | None = None
+    # Prompt 10: whether this run's own wall-clock budget was exceeded -- a first-class
+    # fact distinct from a general failure, so a trace consumer need not string-match
+    # error_message/stderr for the word "timed out".
+    timed_out: bool = False
     started_at: datetime
     completed_at: datetime | None
     exit_code: int | None
@@ -125,3 +140,49 @@ class AgentDecisionTraceRead(BaseModel):
     rationale: str | None = None      # short reasoning summary (model output, bounded)
     stop_reason: str | None = None
     created_at: datetime
+
+
+class CoverageSurfaceRead(BaseModel):
+    """One discovered surface's coverage for its expected next test capability (Prompt 14).
+    No secrets -- asset type/value + a derived state and reason string only."""
+
+    asset_type: str
+    value: str
+    expected_capability: str | None = None
+    state: str
+    in_scope: bool
+    reason: str = ""
+
+
+class ScanCoverageRead(BaseModel):
+    """Engagement-wide coverage projection for one scan (Prompt 14). Read-only, derived
+    deterministically from persisted assets + tool_runs; makes 'no finding != no
+    vulnerability' visible by naming the coverage debt."""
+
+    has_debt: bool
+    debt_summary: str
+    capability_states: dict[str, str] = Field(default_factory=dict)
+    debt: list[CoverageSurfaceRead] = Field(default_factory=list)
+    surfaces: list[CoverageSurfaceRead] = Field(default_factory=list)
+
+
+class AdaptiveCandidateRead(BaseModel):
+    """One eligible next detection step the Adaptive Detection Engine selected (Prompt 21).
+    A CANDIDATE / signal -- NOT a finding. It names the capability + concrete tool + canonical
+    target, a machine-checkable reason trace, and evidence provenance."""
+
+    capability: str
+    tool: str
+    target: str
+    reasons: list[str] = Field(default_factory=list)
+    reason_trace: str
+    provenance: dict = Field(default_factory=dict)
+
+
+class ScanNextStepsRead(BaseModel):
+    """The deterministic, evidence-driven adaptive next-step candidates for a scan (Prompt 21).
+    Read-only observability over the intelligence from Prompts 14-20; every entry is a signal,
+    not a verified finding, and nothing here schedules or executes work."""
+
+    count: int
+    candidates: list[AdaptiveCandidateRead] = Field(default_factory=list)

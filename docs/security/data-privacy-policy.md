@@ -1,6 +1,6 @@
 # Data Privacy Policy (Backend)
 
-This document describes how the MBS.CS backend collects, protects, retains, and
+This document describes how the MBS.PT backend collects, protects, retains, and
 disposes of personal data, and the data-subject rights it implements. It reflects the
 behavior of the `apps/api` service and is kept in sync with the code it describes.
 
@@ -36,7 +36,8 @@ run through centralized redaction (see §2) so secrets and emails do not reach l
 - **Recovery codes / refresh tokens / API keys** — stored only as **SHA-256** hashes;
   the plaintext is shown exactly once and never recoverable.
 - **Tenant isolation** — PostgreSQL **FORCE row-level security** (`workspace_isolation`)
-  on tenant tables; the production DB role is non-superuser so RLS is enforced.
+  on tenant tables, applied by the application-layer filter in `apps/api/core/tenancy.py`
+  (MySQL 8 has no row-level security; isolation is enforced in the ORM, not by a DB role).
 - **Secrets delivery** — secrets support the `<NAME>_FILE` convention (Docker Secrets /
   Vault); `validate_production()` blocks placeholder secrets, wildcard CORS, and disabled TLS.
 - **Log redaction** — `apps/api/core/log_redaction.py` scrubs passwords, tokens, API
@@ -70,7 +71,7 @@ Because several foreign keys into `users` are `ON DELETE RESTRICT`
 erasure is performed by **crypto-shred / anonymization** rather than a row delete:
 
 1. **Audit PII anonymized** — `audit_events.actor_email` is overwritten with `[deleted]`
-   for the user, per-workspace under the RLS GUC. `actor_user_id` is preserved so the
+   for the user, in a single global UPDATE matched on `actor_user_id`. `actor_user_id` is preserved so the
    trail stays attributable to the (now anonymized) record.
 2. **Credentials destroyed** — all refresh tokens and MFA recovery codes are deleted.
 3. **API keys revoked** — every key the user created is revoked (unusable immediately).
@@ -82,7 +83,7 @@ After erasure the account cannot authenticate (status check + tombstoned email),
 personal data remains beyond the non-PII audit skeleton.
 
 **Known residual.** Audit events in a workspace the user has already left are anonymized
-on the next retention pass (bounded by the 730-day audit window), because RLS scopes the
+on the next retention pass (bounded by the 730-day audit window), because the tenancy filter scopes the
 immediate anonymization to the user's current memberships.
 
 ## 5. Export (right of access & portability)
@@ -103,7 +104,7 @@ data as JSON (GDPR Art. 15/20):
 
 The export contains **metadata only**; password hashes, MFA secrets, token/key hashes, and
 internal storage paths are structurally excluded and never serialized. Scans/reports/audit are
-scoped to the user's **own** ownership and their **workspace memberships under RLS**, so a
+scoped to the user's **own** ownership and their **workspace memberships under the tenancy filter**, so a
 data-subject export can never surface another tenant's data. The access itself is audited
 (`account.exported`, counts only). Additive/back-compatible: the fields default to empty.
 

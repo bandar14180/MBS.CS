@@ -1,0 +1,14 @@
+{
+  "root": true,
+  "extends": ["next/core-web-vitals"],
+  "ignorePatterns": [".next/", "node_modules/", "next-env.d.ts", "coverage/"],
+  "rules": {
+    "no-console": ["error", { "allow": ["warn", "error"] }]
+  },
+  "overrides": [
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx", "vitest.setup.ts", "vitest.config.ts"],
+      "env": { "node": true }
+    }
+  ]
+}

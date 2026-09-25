@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from apps.api.core import tenancy
 from apps.api.core.config import get_settings
 from apps.api.modules.scans.models import Scan
 from apps.api.modules.vulnerabilities.models import Vulnerability
@@ -37,7 +38,7 @@ async def _seed(ws: str, project: str, target: str, user_id: str, *, completed_s
     scan_id = None
     try:
         async with maker() as s:
-            await s.execute(text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": ws})
+            tenancy.bind_workspace(ws)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             if completed_scan:
                 now = datetime.now(timezone.utc)
                 scan = Scan(
@@ -229,7 +230,7 @@ def test_run_due_schedules_launches_and_advances(client, no_celery_dispatch):
             async with maker() as s:
                 # make the schedule due
                 await s.execute(
-                    text("UPDATE scan_schedules SET next_run_at = now() - interval '1 minute' WHERE id = :i"),
+                    text("UPDATE scan_schedules SET next_run_at = now() - INTERVAL 1 MINUTE WHERE id = :i"),
                     {"i": uuid.UUID(sid)},
                 )
                 await s.commit()
@@ -244,7 +245,10 @@ def test_run_due_schedules_launches_and_advances(client, no_celery_dispatch):
 
     launched, advanced = asyncio.run(_run())
     assert launched >= 1          # the due schedule fired a scan
-    assert advanced is True       # next_run_at was pushed into the future
+    # Phase 0 MySQL cutover: `next_run_at > now()` read back via raw text() SQL comes back
+    # as MySQL's native 0/1 (an int), not a Python bool -- see the identical fix in
+    # test_account_erasure.py / test_scan_shutdown.py.
+    assert advanced               # next_run_at was pushed into the future
 
 
 # --- Auth: login / bad password / logout / revoked refresh --------------------------------
@@ -299,6 +303,13 @@ def test_dlq_inspect_replay_remove_purge(monkeypatch):
     assert any(e.get("scan_id") == sid for e in entries)
 
     monkeypatch.setattr(scan_tasks.run_scan_task, "delay", lambda *a, **k: None)   # no real dispatch
+    monkeypatch.setattr(scan_tasks.run_scan_task, "apply_async", lambda *a, **k: None)
+    # dlq.replay() enqueues only under the CELERY dispatch model; under the deployed lease
+    # model it refuses rather than enqueue onto a queue with no consumer. This test covers
+    # the Celery replay bookkeeping, so opt into that model explicitly.
+    from apps.api.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "celery_scan_dispatch_enabled", True, raising=False)
     assert dlq.replay(sid) is True          # found + re-enqueued + removed
     assert dlq.replay(sid) is False         # already gone
     assert dlq.remove(str(uuid.uuid4())) == 0
@@ -359,7 +370,7 @@ async def _seed_toolrun(ws: str, project: str, target: str, user_id: str) -> tup
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with maker() as s:
-            await s.execute(text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": ws})
+            tenancy.bind_workspace(ws)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             now = datetime.now(timezone.utc)
             scan = Scan(workspace_id=uuid.UUID(ws), project_id=uuid.UUID(project), target_id=uuid.UUID(target),
                         initiated_by=uuid.UUID(user_id), scan_type="network", status="completed", config={},
@@ -409,7 +420,7 @@ async def _seed_asset(ws: str, project: str, target: str) -> str:
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with maker() as s:
-            await s.execute(text("SELECT set_config('app.current_workspace_id', :w, false)"), {"w": ws})
+            tenancy.bind_workspace(ws)  # Phase 0 MySQL cutover: was Postgres set_config; see apps.api.core.tenancy
             a = Asset(project_id=uuid.UUID(project), target_id=uuid.UUID(target),
                       asset_type="http_service", value="http://seed.example", metadata_={})
             s.add(a)

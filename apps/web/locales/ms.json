@@ -1,5 +1,7 @@
 {
-  "common": { "language": "Bahasa" },
+  "common": {
+    "language": "Bahasa"
+  },
   "nav": {
     "services": "Perkhidmatan",
     "agents": "Ejen AI",
@@ -22,22 +24,58 @@
   "services": {
     "title": "Keselamatan Perusahaan, Diautomasikan",
     "subtitle": "Platform penilaian spektrum penuh dipacu AI — merentasi web, API, awan, dan rangkaian.",
-    "aiPentest": { "title": "Ujian Penembusan AI", "desc": "Ejen autonomi merancang, melaksana, dan mengesahkan penilaian dari hujung ke hujung." },
-    "web": { "title": "Keselamatan Aplikasi Web", "desc": "Kesan OWASP Top 10 dan kelemahan logik perniagaan merentasi aplikasi web anda." },
-    "api": { "title": "Penilaian Keselamatan API", "desc": "Temui dan uji titik akhir REST untuk risiko pengesahan, pendedahan, dan suntikan." },
-    "cloud": { "title": "Penilaian Keselamatan Awan", "desc": "Nilai akaun awan untuk salah konfigurasi dan pendedahan merentasi AWS." },
-    "network": { "title": "Ujian Keselamatan Rangkaian", "desc": "Penemuan port, perkhidmatan, dan versi dengan peninjauan rangkaian mendalam." },
-    "vuln": { "title": "Analisis Kerentanan", "desc": "AI mengaitkan, mengutamakan, dan menyahduplikasi penemuan mengikut risiko perniagaan sebenar." },
-    "reporting": { "title": "Pelaporan Keselamatan", "desc": "Laporan eksekutif dan teknikal dengan CVSS, bukti, dan langkah pemulihan." }
+    "aiPentest": {
+      "title": "Ujian Penembusan AI",
+      "desc": "Ejen autonomi merancang, melaksana, dan mengesahkan penilaian dari hujung ke hujung."
+    },
+    "web": {
+      "title": "Keselamatan Aplikasi Web",
+      "desc": "Kesan OWASP Top 10 dan kelemahan logik perniagaan merentasi aplikasi web anda."
+    },
+    "api": {
+      "title": "Penilaian Keselamatan API",
+      "desc": "Temui dan uji titik akhir REST untuk risiko pengesahan, pendedahan, dan suntikan."
+    },
+    "cloud": {
+      "title": "Penilaian Keselamatan Awan",
+      "desc": "Nilai akaun awan untuk salah konfigurasi dan pendedahan merentasi AWS."
+    },
+    "network": {
+      "title": "Ujian Keselamatan Rangkaian",
+      "desc": "Penemuan port, perkhidmatan, dan versi dengan peninjauan rangkaian mendalam."
+    },
+    "vuln": {
+      "title": "Analisis Kerentanan",
+      "desc": "AI mengaitkan, mengutamakan, dan menyahduplikasi penemuan mengikut risiko perniagaan sebenar."
+    },
+    "reporting": {
+      "title": "Pelaporan Keselamatan",
+      "desc": "Laporan eksekutif dan teknikal dengan CVSS, bukti, dan langkah pemulihan."
+    }
   },
   "agents": {
     "title": "Lima Ejen AI Autonomi. Satu Saluran Paip.",
     "subtitle": "Setiap penilaian melalui rangkaian ejen AI khusus yang diselaraskan — dari penemuan hingga laporan sedia lembaga.",
-    "recon": { "title": "Ejen Peninjauan", "desc": "Penemuan aset, analisis domain, pengesanan teknologi, dan pemetaan permukaan serangan." },
-    "vulnAnalysis": { "title": "Ejen Analisis Kerentanan", "desc": "Menganalisis kelemahan, mengenal pasti kerentanan, dan mengutamakan mengikut risiko." },
-    "validation": { "title": "Ejen Pengesahan Keselamatan", "desc": "Mengesahkan penemuan dan mengurangkan positif palsu sebelum sampai kepada anda." },
-    "risk": { "title": "Ejen Penilaian Risiko", "desc": "Mengira risiko dan menerangkan kesan perniagaan dalam bahasa mudah." },
-    "report": { "title": "Ejen Penjanaan Laporan", "desc": "Menjana laporan keselamatan profesional yang sejajar rangka kerja secara automatik." },
+    "recon": {
+      "title": "Ejen Peninjauan",
+      "desc": "Penemuan aset, analisis domain, pengesanan teknologi, dan pemetaan permukaan serangan."
+    },
+    "vulnAnalysis": {
+      "title": "Ejen Analisis Kerentanan",
+      "desc": "Menganalisis kelemahan, mengenal pasti kerentanan, dan mengutamakan mengikut risiko."
+    },
+    "validation": {
+      "title": "Ejen Pengesahan Keselamatan",
+      "desc": "Mengesahkan penemuan dan mengurangkan positif palsu sebelum sampai kepada anda."
+    },
+    "risk": {
+      "title": "Ejen Penilaian Risiko",
+      "desc": "Mengira risiko dan menerangkan kesan perniagaan dalam bahasa mudah."
+    },
+    "report": {
+      "title": "Ejen Penjanaan Laporan",
+      "desc": "Menjana laporan keselamatan profesional yang sejajar rangka kerja secara automatik."
+    },
     "flow": {
       "target": "Sasaran",
       "recon": "Peninjauan",
@@ -51,10 +89,22 @@
   "trust": {
     "title": "Dibina untuk Perusahaan yang Tidak Mampu Tersilap dalam Keselamatan",
     "subtitle": "Keselamatan dan kepercayaan direka pada terasnya — bukan ditambah kemudian.",
-    "isolation": { "title": "Pengasingan Peringkat Pangkalan Data", "desc": "Keselamatan peringkat baris menguatkuasakan pengasingan penyewa yang ketat pada setiap rekod." },
-    "authorization": { "title": "Kebenaran Didahulukan", "desc": "Tiada imbasan berjalan tanpa bukti pemilikan sasaran yang disahkan." },
-    "evidence": { "title": "Disokong Bukti", "desc": "Setiap penemuan dijejaki kepada bukti mentah tersimpan yang dijamin dengan checksum." },
-    "frameworks": { "title": "Sejajar Rangka Kerja", "desc": "Penemuan dipetakan kepada kawalan OWASP, NIST, ISO 27001, dan PCI DSS." }
+    "isolation": {
+      "title": "Pengasingan Peringkat Pangkalan Data",
+      "desc": "Keselamatan peringkat baris menguatkuasakan pengasingan penyewa yang ketat pada setiap rekod."
+    },
+    "authorization": {
+      "title": "Kebenaran Didahulukan",
+      "desc": "Tiada imbasan berjalan tanpa bukti pemilikan sasaran yang disahkan."
+    },
+    "evidence": {
+      "title": "Disokong Bukti",
+      "desc": "Setiap penemuan dijejaki kepada bukti mentah tersimpan yang dijamin dengan checksum."
+    },
+    "frameworks": {
+      "title": "Sejajar Rangka Kerja",
+      "desc": "Penemuan dipetakan kepada kawalan OWASP, NIST, ISO 27001, dan PCI DSS."
+    }
   },
   "cta": {
     "title": "Bersedia untuk mengautomasikan penilaian keselamatan anda?",
@@ -137,7 +187,10 @@
     "back": "Projek",
     "tabTargets": "Sasaran",
     "tabScans": "Imbasan",
+    "tabAssets": "Aset",
     "tabVulnerabilities": "Kerentanan",
+    "tabRemediation": "Pemulihan",
+    "tabAssessments": "Penilaian",
     "tabReports": "Laporan"
   },
   "targets": {
@@ -160,45 +213,62 @@
     "verify": "Sahkan pemilikan"
   },
   "scans": {
-    "newScan": "Imbasan baharu",
-    "target": "Sasaran",
-    "modules": "Modul",
     "active": "aktif",
     "activeNote": "Modul aktif memerlukan sasaran dengan kebenaran ujian aktif.",
-    "useAiPlanner": "Guna perancang AI",
-    "aiPlannerHint": "Memerlukan ANTHROPIC_API_KEY; biarkan mati untuk mengimbas tanpa AI.",
-    "startScan": "Mula imbasan",
-    "starting": "Memulakan…",
     "addVerifyFirst": "Tambah dan sahkan sasaran dahulu.",
-    "noScans": "Belum ada imbasan.",
-    "progress": "Kemajuan",
+    "aiPlannerHint": "Memerlukan ANTHROPIC_API_KEY; biarkan mati untuk mengimbas tanpa AI.",
+    "clearAll": "Kosongkan semua",
+    "findsVulns": "mengesan kerentanan",
+    "fixDns": "Nama hos sasaran tidak dapat diselesaikan. Pastikan domain/hos dieja dengan betul dan boleh diselesaikan secara awam (mempunyai rekod DNS).",
+    "fixGeneric": "Semak ralat alat di atas dan konfigurasi sasaran, kemudian jalankan semula imbasan.",
+    "fixRefused": "Sasaran menolak sambungan atau tidak boleh dicapai daripada pengimbas. Sahkan ia dalam talian dan boleh dicapai.",
+    "fixTimeout": "Alat tamat masa. Sasaran mungkin perlahan, mengehadkan kadar, atau menapis trafik — cuba lagi, atau persempit skop.",
     "hide": "Sembunyi",
-    "started": "bermula",
     "live": "Langsung — dikemas kini setiap 3s",
-    "total": "Jumlah",
-    "scanFailedShort": "Imbasan gagal",
-    "scanFailed": "Imbasan Gagal",
-    "tool": "Alat",
-    "reason": "Sebab",
-    "suggestedFix": "Cadangan pembaikan",
+    "modules": "Modul",
+    "newScan": "Imbasan baharu",
+    "noScans": "Belum ada imbasan.",
     "pipelineStopped": "Saluran paip berhenti di sini — peringkat kemudian tidak berjalan dan tiada laporan dijana.",
+    "progress": "Kemajuan",
+    "progressUnavailable": "Kemajuan langsung tidak tersedia.",
+    "reason": "Sebab",
+    "sCancelled": "Tidak dijalankan (imbasan dibatalkan)",
     "sCompleted": "Selesai",
-    "sRunning": "Berjalan…",
     "sFailed": "Gagal",
-    "sWaiting": "Menunggu",
-    "sSkipped": "Dilangkau",
     "sNotApplicable": "Tidak berkenaan untuk jenis sasaran ini",
     "sNotRun": "Tidak dijalankan (peringkat awal gagal)",
+    "sPartial": "Separa — liputan tidak lengkap",
+    "sRunning": "Berjalan…",
+    "sSkipped": "Dilangkau",
     "sSkippedUnauth": "Dilangkau (tidak dibenarkan)",
-    "stageSubfinder": "Peninjauan — Subdomain",
+    "sWaiting": "Menunggu",
+    "scanCancelledShort": "Imbasan dibatalkan",
+    "scanFailed": "Imbasan Gagal",
+    "scanFailedShort": "Imbasan gagal",
+    "selectAll": "Pilih semua",
+    "stageAmass": "Peninjauan — Permukaan Serangan",
+    "stageArjun": "Penemuan Parameter",
+    "stageDnsx": "Peleraian DNS",
+    "stageFfuf": "Fuzzing Direktori",
     "stageHttpx": "Hos Hidup",
+    "stageKatana": "Penemuan Kandungan",
     "stageNaabu": "Imbasan Port",
     "stageNmap": "Pengesanan Perkhidmatan",
     "stageNuclei": "Imbasan Kerentanan",
-    "fixDns": "Nama hos sasaran tidak dapat diselesaikan. Pastikan domain/hos dieja dengan betul dan boleh diselesaikan secara awam (mempunyai rekod DNS).",
-    "fixTimeout": "Alat tamat masa. Sasaran mungkin perlahan, mengehadkan kadar, atau menapis trafik — cuba lagi, atau persempit skop.",
-    "fixRefused": "Sasaran menolak sambungan atau tidak boleh dicapai daripada pengimbas. Sahkan ia dalam talian dan boleh dicapai.",
-    "fixGeneric": "Semak ralat alat di atas dan konfigurasi sasaran, kemudian jalankan semula imbasan."
+    "stageNucleiDast": "Ujian Web Aktif",
+    "stageSubfinder": "Peninjauan — Subdomain",
+    "stageWhatweb": "Cap Jari Teknologi",
+    "startScan": "Mula imbasan",
+    "started": "bermula",
+    "starting": "Memulakan…",
+    "suggestedFix": "Cadangan pembaikan",
+    "target": "Sasaran",
+    "tool": "Alat",
+    "toolUnavailable": "tidak dipasang",
+    "toolUnavailableHint": "Binari `{binary}` tiada dalam PATH pekerja pengimbas. Memilih alat ini akan merekod larian alat yang gagal dan tidak menghasilkan sebarang penemuan.",
+    "total": "Jumlah",
+    "useAiPlanner": "Guna perancang AI",
+    "vulnToolsNote": "Hanya nuclei dan nuclei-dast boleh melaporkan kerentanan; alat lain menginventori aset (subdomain, port, URL). Imbasan tanpa keduanya selesai dengan senarai kerentanan kosong kerana tiada apa yang diuji untuk kerentanan — bukan kerana sasaran itu bersih."
   },
   "vulns": {
     "severity": "Keterukan",
@@ -322,5 +392,92 @@
     "active": "Aktif",
     "inactive": "Tidak dikonfigurasi",
     "configureHint": "Tetapkan ANTHROPIC_API_KEY untuk mendayakan AI langsung. Imbasan berfungsi tanpanya."
+  },
+  "assessment": {
+    "affectedAssets": "Aset terjejas",
+    "affectedEndpoints": "Titik akhir terjejas",
+    "comparedTo": "berbanding penilaian sebelumnya",
+    "create": "Penilaian baharu",
+    "creating": "Mencipta…",
+    "declined": "Merosot",
+    "empty": "Belum ada penilaian",
+    "endpointCount": "Titik akhir",
+    "findings": "Penemuan",
+    "frozenNote": "dibekukan pada tarikh terbitan",
+    "improved": "Bertambah baik",
+    "issue": "Terbitkan",
+    "issueHint": "Penerbitan membekukan angka secara kekal.",
+    "issuedOn": "Diterbitkan pada",
+    "issuing": "Menerbitkan…",
+    "name": "Nama penilaian",
+    "noFindings": "Tiada penemuan dalam tempoh ini",
+    "noPrevious": "Tiada penilaian terdahulu untuk dibandingkan",
+    "noTopRisks": "Tiada risiko utama direkodkan",
+    "overdue": "Lewat tempoh",
+    "periodEnd": "Akhir tempoh",
+    "periodStart": "Mula tempoh",
+    "points": "mata",
+    "preview": "Pratonton",
+    "previewHint": "Draf belum mengukur apa-apa lagi.",
+    "progressOpen": "Terbuka",
+    "progressResolved": "Selesai",
+    "progressTotal": "Jumlah",
+    "recommendations": "Saranan",
+    "remediationProgress": "Kemajuan pemulihan",
+    "riskAccepted": "Risiko diterima",
+    "securityScore": "Skor keselamatan",
+    "severityPosture": "Taburan keterukan",
+    "topRisks": "Risiko utama",
+    "trend": "Aliran",
+    "unchanged": "Tidak berubah",
+    "unresolvedIssues": "Isu belum selesai"
+  },
+  "remediation": {
+    "acceptRisk": "Terima risiko",
+    "all": "Semua",
+    "apply": "Guna",
+    "assignee": "Pemilik",
+    "conflict": "Item ini telah diubah oleh orang lain. Muat semula dan cuba lagi.",
+    "dueDate": "Tarikh akhir",
+    "empty": "Belum ada item pemulihan",
+    "evidence": "Bukti",
+    "evidenceHint": "Lampirkan bukti bahawa pembaikan telah dilaksanakan.",
+    "expiresAt": "Tamat pada",
+    "justification": "Justifikasi",
+    "liveLocations": "Lokasi aktif",
+    "noAcceptances": "Tiada penerimaan risiko",
+    "noEvidence": "Tiada bukti dilampirkan",
+    "noVerification": "Belum disahkan",
+    "notes": "Nota",
+    "notesBy": "Nota oleh",
+    "notesPlaceholder": "Tambah nota…",
+    "overdue": "Lewat tempoh",
+    "overdueOnly": "Lewat tempoh sahaja",
+    "priority": "Keutamaan",
+    "progress": "Kemajuan",
+    "progressComplete": "selesai",
+    "progressOpen": "Terbuka",
+    "progressResolved": "Selesai",
+    "progressTotal": "Jumlah",
+    "requestVerification": "Minta pengesahan",
+    "revoke": "Batalkan",
+    "riskHint": "Menerima risiko merekodkan keputusan; ia tidak membaiki isu tersebut.",
+    "riskTreatment": "Pengendalian risiko",
+    "save": "Simpan",
+    "sourceAi": "Dijana AI",
+    "sourceHuman": "Ditambah oleh seseorang",
+    "status": "Status",
+    "sync": "Segerak daripada penemuan",
+    "syncHint": "Mencipta item pemulihan daripada penemuan semasa.",
+    "syncing": "Menyegerak…",
+    "timeline": "Garis masa",
+    "transition": "Tukar status",
+    "unassigned": "Belum ditugaskan",
+    "verification": "Pengesahan",
+    "verificationFailed": "Pengesahan gagal",
+    "verificationHint": "Pengesahan menguji semula penemuan untuk mengesahkan pembaikan.",
+    "verificationPassed": "Pengesahan lulus",
+    "verificationResult": "Keputusan pengesahan",
+    "version": "Versi"
   }
 }

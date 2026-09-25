@@ -1,0 +1,254 @@
+# MBS.SC -- PRIVATE SITE WORKER POOL (Phases 10/11/14)
+#
+# ONE FILE PER PRIVATE SITE. Apply it alongside the base + production overlays:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#                  -f docker-compose.private-site.yml up -d
+#
+# WHY ONE FILE (AND ONE NETWORK, AND ONE WORKER) PER SITE
+# -------------------------------------------------------
+# RFC1918 space is not globally unique. Tenant A and tenant B may both legitimately use
+# 10.0.0.0/8, and both may have a host at 10.0.0.5. A single worker holding both tunnels
+# would have two routes for the same destination, and the routing table -- not the
+# authorization model -- would decide which customer's network a packet entered. There is
+# no way to make that safe by adding checks in the application: the ambiguity is in the
+# kernel's routing table, so the fix has to be that the two tunnels never share one.
+#
+# Hence: each private site gets its own worker container, its own network namespace and its
+# own WireGuard interface. Overlapping ranges then cannot collide, because they never
+# coexist in one routing table.
+#
+# NOTE ON QUEUES: the per-site Celery queue (`scans.private.<site-id>`) still exists and is
+# still what the CONTROL plane routes to, but this worker does not consume it -- it cannot
+# reach Redis. It leases from the scanner-manager, which only ever hands it jobs for the
+# site named in SCANNER_SITE_ID below. The isolation no longer depends on a worker being
+# pointed at the right queue name, which is a stronger guarantee than the queue gave.
+#
+# The worker below is a CLIENT/initiator; the customer is the peer/server. It terminates
+# WireGuard INSIDE ITS OWN namespace -- never on the control-plane host -- so a tunnel
+# compromise reaches one customer's worker, not the platform.
+#
+# ---------------------------------------------------------------------------------------
+# TO INSTANTIATE
+#   1. Replace SITE_SLUG with the site's slug and SITE_UUID with its private_sites.id.
+#   2. Register the worker (a `scanner_workers` row with site_id set) and put its token in
+#      infra/secrets/scanner_worker_token_SITE_SLUG.txt.
+#   3. Generate the WireGuard keypair INSIDE the worker (`wg genkey`), upload only the
+#      PUBLIC half. The private key must never leave this container -- do not add it to
+#      any secret consumed by the control plane, and do not put it in the database.
+#   4. Set the site ACTIVE only after preflight passes.
+#
+# DO NOT copy this file for a second site by adding another service to the SAME network.
+# Each site needs its own `mbs-site-<slug>` network, or the isolation above is lost.
+# ---------------------------------------------------------------------------------------
+
+networks:
+  # Dedicated to THIS site. `internal: true` is deliberately NOT set: the worker must
+  # reach the customer's WireGuard endpoint over the internet. Egress is restricted by the
+  # container's firewall + the application egress guard, not by making the network
+  # internal (which would also block the tunnel itself).
+  mbs-site-SITE_SLUG:
+    driver: bridge
+
+services:
+  worker-site-SITE_SLUG:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+    restart: unless-stopped
+    # MBS.SC P7-1 -- PRIVILEGE DROP WITH A RETAINED AMBIENT CAPABILITY.
+    #
+    # THE DEFECT THIS FIXES. This service used to declare `user: "10001:10001"` alongside
+    # `cap_add: [NET_ADMIN]`, and that combination CANNOT create a WireGuard interface. On
+    # execve the kernel computes the new permitted set as
+    #     P'(permitted) = (P(inheritable) & F(inheritable)) | (F(permitted) & P(bounding))
+    # and Docker gives a non-root user CapInh=0 and CapAmb=0, while a plain binary carries no
+    # file capabilities. So `cap_add` lands in the BOUNDING set only and the process starts
+    # with an EMPTY effective set. Measured on this exact image:
+    #     root       CapPrm=0000000000001000  CapEff=0000000000001000
+    #     uid 10001  CapPrm=0000000000000000  CapEff=0000000000000000  (CapBnd=...1000)
+    # `ip link add dev wg0 type wireguard` therefore failed with EPERM and the worker refused
+    # to start -- correctly, but it meant the shipped template could never run a private site.
+    #
+    # THE FIX (smallest that works). Start as root holding only the capabilities below, then
+    # hand straight to `setpriv`, which switches to 10001:10001 and RAISES CAP_NET_ADMIN into
+    # the ambient set so it survives the transition into a non-root process. Python -- and
+    # therefore the whole lease loop, the tunnel setup it performs, and every scanner tool it
+    # spawns -- runs as uid 10001. The container never runs a long-lived process as root.
+    #
+    # WHY CAP_NET_ADMIN IS RETAINED RATHER THAN DROPPED AFTER SETUP. `SystemTunnelProbe` runs
+    # `wg show <iface> latest-handshakes` on EVERY private job (scanner_engine/wireguard.py),
+    # and that read requires CAP_NET_ADMIN. Dropping the capability after bring-up was tested
+    # and makes the probe return rc=1 forever, which the fail-closed gate turns into
+    # NO_HANDSHAKE and every private scan is refused permanently. Retaining exactly this one
+    # capability is what keeps the health gate honest.
+    #
+    # WHY SETUID/SETGID ARE ADDED. `setpriv` calls setresuid/setresgid to perform the drop;
+    # with `cap_drop: ALL` and nothing else they fail with EPERM (verified). They are consumed
+    # by the drop itself and are NOT in the ambient set afterwards, so the worker cannot use
+    # them to change identity again -- see --ambient-caps below, which names net_admin only.
+    #
+    # `exec` matters: setpriv replaces this shell, so PID 1 is the worker and Docker's stop
+    # signal reaches it directly (stop_grace_period below stays meaningful).
+    #
+    # This is the same shape the production `redis` and `nginx` services already use in
+    # docker-compose.prod.yml: privileged setup in an inline entrypoint, then exec into the
+    # real process at a lower privilege.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        command -v setpriv >/dev/null 2>&1 || {
+          echo "FATAL: setpriv (util-linux) is missing from this image. The private worker
+        must drop from root to uid 10001 while retaining ambient CAP_NET_ADMIN, and setpriv is
+        what performs that drop. It is pinned in infra/docker/Dockerfile.worker; a base-image
+        change has removed it." >&2
+          exit 1
+        }
+        exec setpriv \
+          --reuid=10001 --regid=10001 --clear-groups \
+          --inh-caps=+net_admin --ambient-caps=+net_admin \
+          -- "$@"
+      - --
+    # The lease loop (see docker-compose.yml's `worker` for why this is not `celery worker`).
+    # The site binding comes from SCANNER_SITE_ID below, and the manager only ever leases this
+    # worker jobs for THAT site -- there is no queue name to get wrong, and no way for this
+    # worker to ask for another customer's work.
+    #
+    # Passed to the entrypoint above as "$@", so it is still the process that ends up running
+    # -- just as uid 10001 rather than root.
+    command: ["python", "-m", "apps.api.scanner_worker.main"]
+    # The scanner env file only -- NO control-plane credentials (see .env.scanner.example).
+    env_file:
+      - ../.env.scanner
+    environment:
+      ENVIRONMENT: production
+      SCANNER_EXECUTION_PLANE: "true"
+      SCANNER_MANAGER_URL: http://scanner-manager:8100
+      # Identity. The manager authorizes every request against the row for THIS id, so a
+      # mismatch between these and the registered row simply fails closed.
+      SCANNER_WORKER_ID: worker-site-SITE_SLUG
+      SCANNER_POOL_ID: private-SITE_SLUG
+      SCANNER_SITE_ID: SITE_UUID
+      # Delivered as a Docker secret, not an inline value -- an inline token would sit in
+      # `docker inspect` output for anyone who can read the daemon.
+      SCANNER_WORKER_TOKEN_FILE: /run/secrets/scanner_worker_token_SITE_SLUG
+      # Site resolvers are applied PER LOOKUP (scanner_engine/site_dns.py), never by
+      # rewriting the namespace resolver -- so public names and the manager's own name are
+      # not sent to the customer's DNS.
+      SCANNER_WIREGUARD_INTERFACE: wg0
+      # This worker's address ON the tunnel. Assigned when the site is provisioned; not a
+      # secret, and it must match the AllowedIPs the customer configured for this peer.
+      SCANNER_WIREGUARD_ADDRESS: 10.99.0.2/32
+      # THE PRIVATE KEY, delivered as a FILE. Never an env value: an env var shows up in
+      # `docker inspect`, in crash dumps, and in every child process's environment.
+      # See the secret-injection contract at the bottom of this file.
+      SCANNER_WIREGUARD_PRIVATE_KEY_FILE: /run/secrets/wg_private_key_SITE_SLUG
+    networks:
+      # This site's network + the dispatch plane (to reach the manager). NOT mbs-core:
+      # no database, no broker, no object store.
+      - mbs-site-SITE_SLUG
+      - mbs-dispatch
+    secrets:
+      - scanner_worker_token_SITE_SLUG
+      - wg_private_key_SITE_SLUG
+    # MBS.SC Phase 14 + P7-1. Deny everything, then grant back exactly three capabilities --
+    # one for the tunnel, two consumed by the privilege drop that gets us off root.
+    # NET_RAW is deliberately NOT granted, and neither is anything else.
+    cap_drop:
+      - ALL
+    cap_add:
+      # Creates the wg interface and installs the split-tunnel routes, and is ALSO what
+      # `wg show` needs to read the handshake -- which the per-job health probe does on
+      # every private scan. This is the one capability kept in the ambient set after the
+      # drop (see the entrypoint above).
+      - NET_ADMIN
+      # Consumed by `setpriv`'s setresuid/setresgid ONLY. With cap_drop: ALL and these two
+      # absent the drop itself fails with EPERM, so the container would be forced to stay
+      # root -- the opposite of the intent. They are NOT raised into the ambient set, so the
+      # worker cannot change identity again once it is uid 10001.
+      - SETUID
+      - SETGID
+    security_opt:
+      # Retained. Verified compatible with the ambient-capability drop above: setpriv raises
+      # a capability the process ALREADY holds in its bounding set, which is not a privilege
+      # GAIN and is therefore unaffected by no-new-privileges.
+      - no-new-privileges:true
+    # NOT privileged, and NO docker socket -- either would let a tunnel compromise become a
+    # host compromise.
+    read_only: true
+    tmpfs:
+      # WireGuard's private key lives here: tmpfs only, so it exists in RAM for the life of
+      # the container and is never written to a persistent layer or volume.
+      # uid/gid 10001 because the worker drops to that user before tunnel_setup writes
+      # its ephemeral 0600 key file here. mode=0700 is retained, so the directory stays
+      # private to the scanner user and is still RAM-only -- the key never reaches a
+      # persistent layer. Without the uid= option the tmpfs is root-owned and the dropped
+      # worker cannot create the file (observed: PermissionError on /run/wireguard).
+      - /run/wireguard:rw,noexec,nosuid,mode=0700,uid=10001,gid=10001,size=1m
+      - /tmp:rw,noexec,nosuid,size=2g
+      - /run/prometheus-multiproc:rw,nosuid,mode=1777,size=64m
+    # `user: "0:0"` IS THE SETUP PHASE ONLY -- the long-lived worker does NOT run as root.
+    #
+    # This looks like the opposite of the P7-1 fix and is in fact the mechanism of it. Docker
+    # applies `user:` at process start, BEFORE any capability can be raised into the ambient
+    # set, so the value here decides what the ENTRYPOINT starts with -- not what the worker
+    # ends up as. `user: "10001:10001"` gave the entrypoint an empty effective set (that was
+    # the defect); it must therefore start privileged and hand down.
+    #
+    # The explicit `0:0` is required rather than merely conventional: Dockerfile.worker ends
+    # with `USER appuser`, so WITHOUT this key the container starts as uid 10001 with
+    # CapPrm=CapEff=0 and `setpriv` fails with "setgroups failed: Operation not permitted" --
+    # observed exactly that way on the first run of the fixed template.
+    #
+    # What actually runs long-lived is uid 10001: the entrypoint above execs
+    #     setpriv --reuid=10001 --regid=10001 --clear-groups --ambient-caps=+net_admin
+    # so Python, the lease loop, and every scanner tool it spawns are unprivileged. Root
+    # exists only for the microseconds between container start and that exec.
+    #
+    # Verified at runtime: `id -u` inside the running worker returns 10001, with
+    # CapEff=0000000000001000 (CAP_NET_ADMIN alone).
+    user: "0:0"
+    sysctls:
+      # No IP forwarding: this container is a tunnel ENDPOINT, not a router. Without this
+      # a compromised worker could forward traffic between the customer's network and
+      # anything else it can reach.
+      net.ipv4.ip_forward: "0"
+    stop_grace_period: 120s
+    depends_on:
+      scanner-manager:
+        condition: service_started
+
+# ---------------------------------------------------------------------------------------
+# SECRET-INJECTION CONTRACT
+#
+# Two secrets, both delivered as FILES (Docker secret today; a Vault-templated file drops in
+# unchanged, because the worker only ever reads a path).
+#
+#   scanner_worker_token_<slug>   the worker's manager credential. Scoped to this ONE
+#                                 worker id -- presenting it authorizes nothing beyond this
+#                                 worker's own pool/site, because the manager re-derives
+#                                 every permission from the worker's persisted row.
+#
+#   wg_private_key_<slug>         the WireGuard private key. GENERATE IT INSIDE THIS
+#                                 CONTAINER and never anywhere else:
+#
+#                                     docker compose exec worker-site-<slug> sh -c #                                       'umask 077; wg genkey | tee /run/wireguard/private.key | wg pubkey'
+#
+#                                 Send ONLY the printed public key to the customer and store
+#                                 it as private_sites.worker_public_key. The control plane
+#                                 must never hold the private half -- one database
+#                                 compromise would otherwise yield authenticated access
+#                                 inside every customer network at once.
+#
+# The key file must be mode 0600 and owned by uid 10001 (the scanner user). tunnel_setup
+# reads it once at startup, copies it to a 0600 temp file for the single `wg set` call, and
+# unlinks that immediately -- the key never reaches argv (world-readable via /proc) and is
+# never logged.
+# ---------------------------------------------------------------------------------------
+secrets:
+  scanner_worker_token_SITE_SLUG:
+    file: ./secrets/scanner_worker_token_SITE_SLUG.txt
+  wg_private_key_SITE_SLUG:
+    file: ./secrets/wg_private_key_SITE_SLUG.txt

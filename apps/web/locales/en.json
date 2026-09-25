@@ -1,5 +1,7 @@
 {
-  "common": { "language": "Language" },
+  "common": {
+    "language": "Language"
+  },
   "nav": {
     "services": "Services",
     "agents": "AI Agents",
@@ -22,22 +24,58 @@
   "services": {
     "title": "Enterprise Security, Automated",
     "subtitle": "A full-spectrum assessment platform driven by AI — across web, API, cloud, and network.",
-    "aiPentest": { "title": "AI Penetration Testing", "desc": "Autonomous agents plan, execute, and validate assessments from end to end." },
-    "web": { "title": "Web Application Security", "desc": "Detect OWASP Top 10 and business-logic flaws across your web applications." },
-    "api": { "title": "API Security Assessment", "desc": "Discover and test REST endpoints for authentication, exposure, and injection risks." },
-    "cloud": { "title": "Cloud Security Assessment", "desc": "Assess cloud accounts for misconfiguration and exposure across AWS." },
-    "network": { "title": "Network Security Testing", "desc": "Port, service, and version discovery with deep network reconnaissance." },
-    "vuln": { "title": "Vulnerability Analysis", "desc": "AI correlates, prioritizes, and de-duplicates findings by real business risk." },
-    "reporting": { "title": "Security Reporting", "desc": "Executive and technical reports with CVSS, evidence, and remediation steps." }
+    "aiPentest": {
+      "title": "AI Penetration Testing",
+      "desc": "Autonomous agents plan, execute, and validate assessments from end to end."
+    },
+    "web": {
+      "title": "Web Application Security",
+      "desc": "Detect OWASP Top 10 and business-logic flaws across your web applications."
+    },
+    "api": {
+      "title": "API Security Assessment",
+      "desc": "Discover and test REST endpoints for authentication, exposure, and injection risks."
+    },
+    "cloud": {
+      "title": "Cloud Security Assessment",
+      "desc": "Assess cloud accounts for misconfiguration and exposure across AWS."
+    },
+    "network": {
+      "title": "Network Security Testing",
+      "desc": "Port, service, and version discovery with deep network reconnaissance."
+    },
+    "vuln": {
+      "title": "Vulnerability Analysis",
+      "desc": "AI correlates, prioritizes, and de-duplicates findings by real business risk."
+    },
+    "reporting": {
+      "title": "Security Reporting",
+      "desc": "Executive and technical reports with CVSS, evidence, and remediation steps."
+    }
   },
   "agents": {
     "title": "Five Autonomous AI Agents. One Pipeline.",
     "subtitle": "Every assessment runs through a coordinated chain of specialized AI agents — from discovery to a board-ready report.",
-    "recon": { "title": "Reconnaissance Agent", "desc": "Asset discovery, domain analysis, technology detection, and attack-surface mapping." },
-    "vulnAnalysis": { "title": "Vulnerability Analysis Agent", "desc": "Analyzes weaknesses, identifies vulnerabilities, and prioritizes by risk." },
-    "validation": { "title": "Security Validation Agent", "desc": "Validates findings and reduces false positives before they reach you." },
-    "risk": { "title": "Risk Assessment Agent", "desc": "Calculates risk and explains the business impact in plain language." },
-    "report": { "title": "Report Generation Agent", "desc": "Generates professional, framework-aligned security reports automatically." },
+    "recon": {
+      "title": "Reconnaissance Agent",
+      "desc": "Asset discovery, domain analysis, technology detection, and attack-surface mapping."
+    },
+    "vulnAnalysis": {
+      "title": "Vulnerability Analysis Agent",
+      "desc": "Analyzes weaknesses, identifies vulnerabilities, and prioritizes by risk."
+    },
+    "validation": {
+      "title": "Security Validation Agent",
+      "desc": "Validates findings and reduces false positives before they reach you."
+    },
+    "risk": {
+      "title": "Risk Assessment Agent",
+      "desc": "Calculates risk and explains the business impact in plain language."
+    },
+    "report": {
+      "title": "Report Generation Agent",
+      "desc": "Generates professional, framework-aligned security reports automatically."
+    },
     "flow": {
       "target": "Target",
       "recon": "Recon",
@@ -51,10 +89,22 @@
   "trust": {
     "title": "Built for Enterprises That Can't Afford to Get Security Wrong",
     "subtitle": "Security and trust are engineered into the core — not bolted on afterward.",
-    "isolation": { "title": "Database-Level Isolation", "desc": "Row-level security enforces strict tenant isolation on every single record." },
-    "authorization": { "title": "Authorization-First", "desc": "No scan ever runs without verified proof of target ownership." },
-    "evidence": { "title": "Evidence-Backed", "desc": "Every finding traces to stored raw evidence secured with checksums." },
-    "frameworks": { "title": "Framework-Aligned", "desc": "Findings map to OWASP, NIST, ISO 27001, and PCI DSS controls." }
+    "isolation": {
+      "title": "Database-Level Isolation",
+      "desc": "Row-level security enforces strict tenant isolation on every single record."
+    },
+    "authorization": {
+      "title": "Authorization-First",
+      "desc": "No scan ever runs without verified proof of target ownership."
+    },
+    "evidence": {
+      "title": "Evidence-Backed",
+      "desc": "Every finding traces to stored raw evidence secured with checksums."
+    },
+    "frameworks": {
+      "title": "Framework-Aligned",
+      "desc": "Findings map to OWASP, NIST, ISO 27001, and PCI DSS controls."
+    }
   },
   "cta": {
     "title": "Ready to automate your security assessments?",
@@ -137,7 +187,10 @@
     "back": "Projects",
     "tabTargets": "Targets",
     "tabScans": "Scans",
+    "tabAssets": "Assets",
     "tabVulnerabilities": "Vulnerabilities",
+    "tabRemediation": "Remediation",
+    "tabAssessments": "Assessments",
     "tabReports": "Reports"
   },
   "targets": {
@@ -160,45 +213,62 @@
     "verify": "Verify ownership"
   },
   "scans": {
-    "newScan": "New scan",
-    "target": "Target",
-    "modules": "Modules",
     "active": "active",
     "activeNote": "Active modules require a target with active-testing authorization.",
-    "useAiPlanner": "Use AI planner",
-    "aiPlannerHint": "Requires an ANTHROPIC_API_KEY; leave off to scan without AI.",
-    "startScan": "Start scan",
-    "starting": "Starting…",
     "addVerifyFirst": "Add and verify a target first.",
-    "noScans": "No scans yet.",
-    "progress": "Progress",
+    "aiPlannerHint": "Requires an ANTHROPIC_API_KEY; leave off to scan without AI.",
+    "clearAll": "Clear all",
+    "findsVulns": "finds vulnerabilities",
+    "fixDns": "The target hostname could not be resolved. Check the domain/host is spelled correctly and is publicly resolvable (has DNS records).",
+    "fixGeneric": "Review the tool error above and the target configuration, then re-run the scan.",
+    "fixRefused": "The target refused the connection or is unreachable from the scanner. Confirm it is online and reachable.",
+    "fixTimeout": "The tool timed out. The target may be slow, rate-limiting, or filtering traffic — retry, or narrow the scope.",
     "hide": "Hide",
-    "started": "started",
     "live": "Live — updating every 3s",
-    "total": "Total",
-    "scanFailedShort": "Scan failed",
-    "scanFailed": "Scan Failed",
-    "tool": "Tool",
-    "reason": "Reason",
-    "suggestedFix": "Suggested fix",
+    "modules": "Modules",
+    "newScan": "New scan",
+    "noScans": "No scans yet.",
     "pipelineStopped": "The pipeline stopped here — later stages did not run and no report was generated.",
+    "progress": "Progress",
+    "progressUnavailable": "Live progress is unavailable.",
+    "reason": "Reason",
+    "sCancelled": "Did not run (scan cancelled)",
     "sCompleted": "Completed",
-    "sRunning": "Running…",
     "sFailed": "Failed",
-    "sWaiting": "Waiting",
-    "sSkipped": "Skipped",
     "sNotApplicable": "Not applicable to this target type",
     "sNotRun": "Did not run (earlier stage failed)",
+    "sPartial": "Partial — incomplete coverage",
+    "sRunning": "Running…",
+    "sSkipped": "Skipped",
     "sSkippedUnauth": "Skipped (not authorized)",
-    "stageSubfinder": "Recon — Subdomains",
+    "sWaiting": "Waiting",
+    "scanCancelledShort": "Scan cancelled",
+    "scanFailed": "Scan Failed",
+    "scanFailedShort": "Scan failed",
+    "selectAll": "Select all",
+    "stageAmass": "Recon — Attack Surface",
+    "stageArjun": "Parameter Discovery",
+    "stageDnsx": "DNS Resolution",
+    "stageFfuf": "Directory Fuzzing",
     "stageHttpx": "Live Hosts",
+    "stageKatana": "Content Discovery",
     "stageNaabu": "Port Scan",
     "stageNmap": "Service Detection",
     "stageNuclei": "Vulnerability Scan",
-    "fixDns": "The target hostname could not be resolved. Check the domain/host is spelled correctly and is publicly resolvable (has DNS records).",
-    "fixTimeout": "The tool timed out. The target may be slow, rate-limiting, or filtering traffic — retry, or narrow the scope.",
-    "fixRefused": "The target refused the connection or is unreachable from the scanner. Confirm it is online and reachable.",
-    "fixGeneric": "Review the tool error above and the target configuration, then re-run the scan."
+    "stageNucleiDast": "Active Web Testing",
+    "stageSubfinder": "Recon — Subdomains",
+    "stageWhatweb": "Technology Fingerprint",
+    "startScan": "Start scan",
+    "started": "started",
+    "starting": "Starting…",
+    "suggestedFix": "Suggested fix",
+    "target": "Target",
+    "tool": "Tool",
+    "toolUnavailable": "not installed",
+    "toolUnavailableHint": "The `{binary}` binary is not on the scanner worker's PATH. Selecting this tool will record a failed tool run and produce no findings.",
+    "total": "Total",
+    "useAiPlanner": "Use AI planner",
+    "vulnToolsNote": "Only nuclei and nuclei-dast can report vulnerabilities; the other tools inventory assets (subdomains, ports, URLs). A scan without them completes with an empty vulnerability list because nothing tested for vulnerabilities — not because the target is clean."
   },
   "vulns": {
     "severity": "Severity",
@@ -322,5 +392,92 @@
     "active": "Active",
     "inactive": "Not configured",
     "configureHint": "Set ANTHROPIC_API_KEY to enable live AI. Scanning works without it."
+  },
+  "assessment": {
+    "affectedAssets": "Affected assets",
+    "affectedEndpoints": "Affected endpoints",
+    "comparedTo": "compared with the previous assessment",
+    "create": "New assessment",
+    "creating": "Creating…",
+    "declined": "Declined",
+    "empty": "No assessments yet",
+    "endpointCount": "Endpoints",
+    "findings": "Findings",
+    "frozenNote": "frozen as of the issue date",
+    "improved": "Improved",
+    "issue": "Issue",
+    "issueHint": "Issuing freezes the figures permanently.",
+    "issuedOn": "Issued on",
+    "issuing": "Issuing…",
+    "name": "Assessment name",
+    "noFindings": "No findings in this period",
+    "noPrevious": "No earlier assessment to compare against",
+    "noTopRisks": "No top risks recorded",
+    "overdue": "Overdue",
+    "periodEnd": "Period end",
+    "periodStart": "Period start",
+    "points": "points",
+    "preview": "Preview",
+    "previewHint": "A draft has not measured anything yet.",
+    "progressOpen": "Open",
+    "progressResolved": "Resolved",
+    "progressTotal": "Total",
+    "recommendations": "Recommendations",
+    "remediationProgress": "Remediation progress",
+    "riskAccepted": "Risk accepted",
+    "securityScore": "Security score",
+    "severityPosture": "Severity posture",
+    "topRisks": "Top risks",
+    "trend": "Trend",
+    "unchanged": "Unchanged",
+    "unresolvedIssues": "Unresolved issues"
+  },
+  "remediation": {
+    "acceptRisk": "Accept risk",
+    "all": "All",
+    "apply": "Apply",
+    "assignee": "Owner",
+    "conflict": "This item was changed by someone else. Reload and try again.",
+    "dueDate": "Due date",
+    "empty": "No remediation items yet",
+    "evidence": "Evidence",
+    "evidenceHint": "Attach proof that the fix is in place.",
+    "expiresAt": "Expires at",
+    "justification": "Justification",
+    "liveLocations": "Live locations",
+    "noAcceptances": "No risk acceptances",
+    "noEvidence": "No evidence attached",
+    "noVerification": "Not yet verified",
+    "notes": "Notes",
+    "notesBy": "Note by",
+    "notesPlaceholder": "Add a note…",
+    "overdue": "Overdue",
+    "overdueOnly": "Overdue only",
+    "priority": "Priority",
+    "progress": "Progress",
+    "progressComplete": "complete",
+    "progressOpen": "Open",
+    "progressResolved": "Resolved",
+    "progressTotal": "Total",
+    "requestVerification": "Request verification",
+    "revoke": "Revoke",
+    "riskHint": "Accepting a risk records a decision; it does not fix the issue.",
+    "riskTreatment": "Risk treatment",
+    "save": "Save",
+    "sourceAi": "AI-generated",
+    "sourceHuman": "Added by a person",
+    "status": "Status",
+    "sync": "Sync from findings",
+    "syncHint": "Creates remediation items from current findings.",
+    "syncing": "Syncing…",
+    "timeline": "Timeline",
+    "transition": "Change status",
+    "unassigned": "Unassigned",
+    "verification": "Verification",
+    "verificationFailed": "Verification failed",
+    "verificationHint": "Verification re-tests the finding to confirm the fix.",
+    "verificationPassed": "Verification passed",
+    "verificationResult": "Verification result",
+    "version": "Version"
   }
 }
