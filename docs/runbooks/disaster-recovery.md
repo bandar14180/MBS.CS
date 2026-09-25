@@ -106,6 +106,68 @@ The runtime must have the MySQL client tools (`mysqldump` / `mysql`) on `PATH`, 
 installs `default-mysql-client` (Debian's MariaDB-client-backed package) for this. Object storage
 uses the app's existing `S3_*` credentials (never logged, never passed on argv).
 
+## Object-storage image availability (`minio/minio` withdrawn upstream)
+**Read this before rebuilding a host or bringing the stack up on fresh hardware.**
+
+`infra/docker-compose.yml` pins object storage to
+`minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`
+(tag `RELEASE.2025-09-07T16-13-09Z`). That image **can no longer be pulled.** The
+`minio/minio` Docker Hub repository has been withdrawn: the Hub API returns
+`404 object not found` for the repository, and the registry returns
+`401 UNAUTHORIZED - authentication required` for an anonymous pull of **any** reference,
+including this exact digest. Checked and also unavailable anonymously: `quay.io/minio/minio`
+(401), `bitnami/minio` (zero tags), `mirror.gcr.io` (404 by tag and by digest),
+`public.ecr.aws` (404), and the community continuations `openmaxio/*` / `minio/minio-core`
+(401/403). **Re-pinning cannot fix this — there is no reachable copy in any public registry.**
+
+Why the stack still runs today: every host that already has the image keeps serving from its
+local image cache. Nothing re-pulls a digest that is already present. The breakage appears only
+on a cold host — a rebuild, a new machine, or after `docker system prune -a`.
+
+This is not merely an availability problem. The `minio_data` volume holds live scan evidence and
+generated reports in **MinIO's own on-disk layout** (~10.3k objects / 1.3 GB in `mbs-evidence`,
+~1.7k / 65 MB in `mbs-reports` at the time of writing). No other S3 server reads that layout, so
+swapping the image without migrating data first orphans all of it.
+
+### Recovery: load the archived image
+A `docker save` of the pinned image is kept **outside this repository** (62 MB, too large to
+track here — this repo uses no Git LFS and its largest tracked file is ~340 KB):
+
+    archive : MBS/image-archive/minio-minio-sha256-14cea493.tar
+    sha256  : ff5c117e1c9bb62adb75c040abdcaa7501f0810c3ec4f18098501ba669516ace
+
+Restore it on the target host **before** `docker compose up`:
+
+```sh
+sha256sum minio-minio-sha256-14cea493.tar   # must match the sha256 above
+docker load --input minio-minio-sha256-14cea493.tar
+docker images --digests minio/minio         # expect sha256:14cea493...
+```
+
+Verified: the archive loads cleanly, resolves to the same pinned digest the compose file
+references, and serves S3 (`/minio/health/live` returns 200). Once loaded, compose resolves the
+pinned digest from the local cache and the stack starts unchanged.
+
+> Keep a copy of this archive wherever your other deployment artifacts live. While it exists it
+> is the only recoverable copy of this image; if it is lost, the pinned digest is unobtainable.
+
+### Migrating off MinIO (deferred, NOT done)
+Moving to a maintained S3 server (CI now uses the SeaweedFS S3 gateway — see
+`.github/workflows/ci.yml`) is the durable fix, but it is a deliberate project, not an image
+swap, because it must also:
+1. **Migrate the data through the S3 API.** `apps/api/dr/objects.py` already does exactly this —
+   it copies objects via the API and preserves content-type and user metadata, so it is
+   independent of on-disk format. Back up, switch, restore, verify.
+2. **Rewire production credentials.** The prod overlay feeds MinIO
+   `MINIO_ROOT_USER_FILE` / `MINIO_ROOT_PASSWORD_FILE` from Docker Secrets. SeaweedFS has no
+   `_FILE` convention; it takes a `-s3.config` JSON identities file, so the secrets and their
+   mount change shape.
+3. **Update the deployment assertions.** `apps/api/tests/test_deployment_config.py` asserts the
+   `MINIO_ROOT_USER_FILE` / `MINIO_ROOT_PASSWORD_FILE` paths and the `minio_root_user` /
+   `minio_root_password` secrets by name, and the healthcheck is `mc ready local`. These encode
+   real production guarantees, so they must be rewritten to assert the equivalent guarantee for
+   the replacement — never relaxed to make a swap pass.
+
 ---
 
 # Production hardening (DR-1 … DR-4)

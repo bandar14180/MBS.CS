@@ -129,6 +129,20 @@ services:
     # The tag is kept in the comment for human readability; the digest is what is deployed.
     # To update: `docker buildx imagetools inspect <image>:<tag>` and replace BOTH.
     # minio/minio:RELEASE.2025-09-07T16-13-09Z (was the MUTABLE tag `latest`)
+    # !! UPSTREAM WITHDRAWAL -- THIS DIGEST CANNOT BE PULLED ANY MORE !!
+    # The `minio/minio` Docker Hub repository has been withdrawn: the Hub API returns 404 for
+    # the repository and the registry returns 401 (authentication required) for an anonymous
+    # pull of ANY reference, including this digest. quay.io, bitnami/minio, mirror.gcr.io and
+    # public.ecr.aws have no anonymously reachable copy either, so re-pinning fixes nothing.
+    # The digest below is still CORRECT and is deliberately left unchanged -- it is what the
+    # minio_data volume's contents were written by, and hosts that already cached the image
+    # keep running from that cache. A COLD host cannot start this service until the archived
+    # image is loaded first:
+    #   docker load --input minio-minio-sha256-14cea493.tar
+    # Archive location, checksum and the full explanation (including why this is not a simple
+    # image swap -- the volume holds ~12k live objects in MinIO's own on-disk layout, and the
+    # prod overlay feeds MINIO_ROOT_USER_FILE/MINIO_ROOT_PASSWORD_FILE from Docker Secrets):
+    #   docs/runbooks/disaster-recovery.md -> "Object-storage image availability"
     image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
     command: server /data --console-address ":9001"
