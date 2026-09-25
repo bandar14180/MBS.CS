@@ -169,6 +169,17 @@ Verified against the code and the test suite at the time of writing. Nothing bel
   (reporting redesign, remediation catalogue, product rename); that work sits on
   `chore/untangle-phase0`.
 
+### Known limitations
+
+- **Scanner-tool CVEs** — the scanner-tool container still reports CRITICAL CVEs originating
+  in the Go dependencies that upstream statically links into its release binaries: `dnsx`,
+  `naabu` and `subfinder` (Go stdlib `crypto/tls`, CVE-2025-68121) and `katana`
+  (`github.com/jackc/pgx/v5`, CVE-2026-33815 / CVE-2026-33816). The fix is not ours to apply —
+  it lands when each tool's maintainers rebuild against the patched module — so these are
+  individually triaged in `.trivyignore` with the reason each is not reachable in this image,
+  pending a tool-version upgrade. The CRITICAL gate itself stays active: any CVE **not** on
+  that list still fails CI.
+
 ### Not implemented (explicitly out of scope so far)
 
 - Payment processing (plan enforcement exists; no payment processor is wired in).
