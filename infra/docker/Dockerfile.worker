@@ -12,6 +12,16 @@ WORKDIR /srv
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Apply Debian security updates on top of the digest-pinned base -- same rationale as
+# Dockerfile.api: the digest pin (AUDIT-005) freezes OS packages, so CVEs published
+# against them after the pin was taken would ship forever and fail the Trivy
+# CRITICAL+fixed gate. `upgrade`, not `dist-upgrade`: security fixes within the
+# pinned release only, so the pin keeps its meaning.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # Security tool binaries (recon phase per build order §12). Versions are pinned
 # to match each runner's `.version` in scanner_engine/tool_runners/. The three
 # ProjectDiscovery tools (naabu/subfinder/httpx) install the same way (release

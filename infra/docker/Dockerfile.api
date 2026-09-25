@@ -9,6 +9,21 @@ FROM python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e18
 
 WORKDIR /srv
 
+# Apply Debian security updates on top of the digest-pinned base.
+#
+# The digest pin above is deliberate (AUDIT-005) and stays: it guarantees a reproducible,
+# scanned base. But a frozen layer also freezes its OS packages, so any CVE published against
+# them after the pin was taken ships forever. Trivy gates on CRITICAL+fixed, and perl-base
+# 5.40.1-6 carried three such CVEs (CVE-2026-13221, CVE-2026-42496, CVE-2026-8376), all fixed
+# in 5.40.1-6+deb13u1 -- so the gate failed on a base package this image never installs
+# directly and does not use at runtime.
+#
+# `upgrade` (not `dist-upgrade`) applies security fixes within the pinned release without
+# pulling in new packages or changing the distro version, which keeps the pin meaningful.
+# Bumping the digest instead would fix today's three CVEs and silently re-accumulate the next
+# ones; this step re-applies current fixes on every build.
+RUN apt-get update     && apt-get upgrade -y --no-install-recommends     && apt-get clean     && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UVICORN_WORKERS=2
