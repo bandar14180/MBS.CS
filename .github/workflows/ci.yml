@@ -47,10 +47,16 @@ jobs:
       MBS_ALLOW_DB_WIPE: "1"
       REDIS_URL: redis://localhost:6379/0
       # Object storage for the storage-dependent tests (report generation + scan
-      # evidence). Mirrors docker-compose's MinIO; without it those tests fail on a
-      # connection error / evidence-upload failure. MinIO is started as a step below and
-      # reachable on localhost (the job runs on the runner, not in a container).
-      S3_ENDPOINT_URL: http://localhost:9000
+      # evidence). Without it those tests fail on a connection error / evidence-upload
+      # failure. The server is started as a step below and is reachable on localhost (the
+      # job runs on the runner, not in a container).
+      #
+      # This endpoint is S3-compatible but is deliberately NOT MinIO any more -- the step
+      # below documents why. The app only ever speaks S3 (boto3 with
+      # signature_version=s3v4), so whatever serves this URL is an implementation detail
+      # and these three variables are the whole contract. 8333 is the SeaweedFS S3
+      # gateway's default port; the old value was MinIO's 9000.
+      S3_ENDPOINT_URL: http://localhost:8333
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
       # Coverage gate (Phase 1.7). Configurable per-run; default 80% (also set in
@@ -61,20 +67,46 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - name: Start MinIO (object storage)
-        # Run via `docker run` (not a service container) because the minio image needs a
-        # `server /data` command, which service containers can't set. Buckets are created
+      - name: Start object storage (S3-compatible)
+        # Run via `docker run` (not a service container) because the image needs a
+        # `server -s3` command, which service containers can't set. Buckets are created
         # automatically by the application's storage layer on first use.
+        #
+        # WHY NOT MinIO: this step used to run `minio/minio:latest`, and it broke every run of
+        # this job -- `docker run` exited 125 in under a second, before the image pull moved a
+        # single byte, which skipped every step after it (migrations, the test run, the
+        # coverage gate) and surfaced as a ~25s "test failure" that reproduced nowhere else.
+        # The cause is not in this repository: the `minio/minio` Docker Hub repository has
+        # been withdrawn. Docker Hub's API returns `404 object not found` for the repo itself,
+        # and the registry answers `401 UNAUTHORIZED - authentication required` for an
+        # anonymous pull of ANY tag, including previously published pinned `RELEASE.*` tags.
+        # quay.io's `minio/minio` is gated identically and `bitnami/minio` now has zero tags,
+        # so no tag, digest or mirror of MinIO is reachable from an unauthenticated runner --
+        # the fix has to be a different image, not a different pin.
+        #
+        # This is also exactly why it passed locally: a developer machine (like this job
+        # before the withdrawal) already holds minio/minio in its local image cache, so
+        # nothing re-pulls it. Only a cold runner must fetch it, and only a cold runner fails.
+        #
+        # SeaweedFS's S3 gateway is the replacement: a real S3 server (not a mock), still
+        # anonymously pullable, and it accepts any access key when no identity config is
+        # supplied -- so S3_ACCESS_KEY/S3_SECRET_KEY above keep working unchanged and no
+        # registry credentials are added to CI. Verified against this exact digest with
+        # boto3 1.35.24 + signature_version=s3v4 over the operations the app actually issues
+        # (apps/api/scanner_engine/evidence_store.py and friends): head_bucket -> 404 ->
+        # create_bucket, put_object, get_object with a SHA-256 roundtrip for both text and
+        # binary/PNG bodies, list_objects_v2, and delete_object. Pinned by digest per
+        # AUDIT-005, the same discipline as every `uses:` in this file.
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+          docker run -d --name objectstore -p 8333:8333 \
+            chrislusf/seaweedfs:3.99@sha256:8d5b323911a996d5ea152115306bed468d9a849d72bcbb3800ea8d91b7728563 \
+            server -s3 -dir=/data
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then echo "MinIO is up"; exit 0; fi
+            if curl -sf http://localhost:8333/ >/dev/null; then echo "Object storage is up"; exit 0; fi
             sleep 2
           done
-          echo "MinIO did not become healthy" >&2
-          docker logs minio || true
+          echo "Object storage did not become healthy" >&2
+          docker logs objectstore || true
           exit 1
       - name: Set MySQL session isolation level (READ COMMITTED)
         # NOT cosmetic. MySQL defaults to REPEATABLE READ; this codebase's atomic-claim /
